@@ -8,7 +8,7 @@ Each player runs the game on their own PC. The host's save is the town.
 | **Mod version** | 0.2.2 (v1, with the **Make Bug Report** button) |
 | **Status** | **Beta**: for testing with friends |
 | **Game version** | Manor Lords **0.8.117** on Steam, exactly |
-| **Players** | a host and up to 4 friends |
+| **Players** | up to 8: a host and 7 friends (tested: 5 copies on one PC, 2 players for real) |
 | **Download** | Nexus Mods: `<NEXUS_PAGE>` |
 | **Help and bug reports** | Discord: `https://discord.gg/cK9HzVxzaY` · GitHub issues: https://github.com/fmgk-labs/manor-lords-coop/issues |
 
@@ -42,7 +42,7 @@ Manor Lords has no multiplayer. This mod adds co-op.
 - **Everyone plays the same lord and the same town.** You use the game's own screens. Nothing new to learn.
 - **The host decides.** A friend's action goes to the host. The host's game carries it out and tells everybody the result.
 - **Only the host saves.** A friend can keep a copy of the town for solo play.
-- **Host and up to 4 friends.** (The Steam lobby takes up to 8 players, but more than 5 copies never ran. See [Known issues](docs/KNOWN_ISSUES.md).)
+- **Up to 8 players: a host and 7 friends.** (Tested with up to 5 copies of the game; 6 to 8 never ran. See [Known issues](docs/KNOWN_ISSUES.md).)
 
 ### What is shared
 

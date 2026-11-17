@@ -83,7 +83,7 @@ Suggested settings:
 
 - `#suggestions`: slowmode 1 minute.
 - `#crash-reports`: slowmode 30 seconds.
-- Voice channels: user limit 5 (a host and up to 4 friends).
+- Voice channels: user limit 8 (the most players a session can have).
 
 ---
 
@@ -165,7 +165,7 @@ Each text is under Discord's 2,000-character limit.
 
 This server is for **Manor Lords Co-op**, a fan-made mod that lets you play **one Manor Lords town together** with your friends.
 
-**How it works:** every player runs the game on their own PC. The host's save is the town. Friends join through a Steam invite. A host and up to 4 friends.
+**How it works:** every player runs the game on their own PC. The host's save is the town. Friends join through a Steam invite. Up to 8 players: a host and 7 friends.
 
 **Status:** beta, version **0.2.2**. Manor Lords **0.8.117** only. Windows and Steam only.
 
@@ -208,7 +208,7 @@ Breaking the rules can lead to a warning, a timeout or a ban.
 ```md
 # Manor Lords Co-op 0.2.1 is out (v1, beta)
 
-Play **one Manor Lords town together**. Every player runs the game; the host's save is the town. A host and up to 4 friends.
+Play **one Manor Lords town together**. Every player runs the game; the host's save is the town. Up to 8 players: a host and 7 friends.
 
 **Download:** <NEXUS_PAGE>
 **Needs:** Manor Lords **0.8.117** on Steam, Windows. The mod loader is included. Everyone installs the **same** zip.
