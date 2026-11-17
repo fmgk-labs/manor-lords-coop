@@ -12,7 +12,7 @@ Replace these before you post anything.
 | `<NEXUS_PAGE>` | the mod's Nexus Mods page |
 | `<RELEASE_DATE>` | the date 0.2.1 goes public |
 
-The GitHub links are already filled in: the repository is https://github.com/manor-lords-coop/manor-lords-coop.
+The GitHub links are already filled in: the repository is https://github.com/fmgk-labs/manor-lords-coop.
 
 **Tip:** when you paste a text, Discord does not link `#channel` names by itself. Type each `#` name again and pick the channel from the list.
 
@@ -175,7 +175,7 @@ This server is for **Manor Lords Co-op**, a fan-made mod that lets you play **on
 
 **Links**
 Download (Nexus Mods): <NEXUS_PAGE>
-Source code (GitHub): https://github.com/manor-lords-coop/manor-lords-coop
+Source code (GitHub): https://github.com/fmgk-labs/manor-lords-coop
 
 This mod is not made by, and not connected to, Slavic Magic or Hooded Horse. Please do not report mod bugs to them.
 ```
@@ -190,7 +190,7 @@ This mod is not made by, and not connected to, Slavic Magic or Hooded Horse. Ple
 3. **No piracy.** Only the Steam version of Manor Lords is supported. No links to cracked games, and no help with them.
 4. **Do not report mod bugs to the game's developer or publisher.** Report them here. The developer asked players not to report bugs while they use mods.
 5. **Protect privacy.** Log files and crash records can hold your Windows user name and Steam names. Check them before you post. Never post other people's personal data.
-6. **Download only from the official pages:** <NEXUS_PAGE> or https://github.com/manor-lords-coop/manor-lords-coop. Do not share other builds or re-uploads.
+6. **Download only from the official pages:** <NEXUS_PAGE> or https://github.com/fmgk-labs/manor-lords-coop. Do not share other builds or re-uploads.
 7. **One bug per post** in #bug-reports. Use the template.
 8. **No spam and no ads.** No self-promotion, no advertising in DMs.
 9. **No NSFW content.**
@@ -232,7 +232,7 @@ Thank you for testing!
 ```md
 # Known issues in 0.2.1
 
-Full list, with numbers: https://github.com/manor-lords-coop/manor-lords-coop/blob/HEAD/docs/KNOWN_ISSUES.md
+Full list, with numbers: https://github.com/fmgk-labs/manor-lords-coop/blob/HEAD/docs/KNOWN_ISSUES.md
 
 - **Never tested:** 3 or more players, sessions of hours, a late-game town.
 - **Manor Lords 0.8.117 only.** After a game update the mod may stop working.
@@ -300,7 +300,7 @@ Did it happen again?
 Did the game close?
 Did "Syncing with the host" show?
 
-Full guide: https://github.com/manor-lords-coop/manor-lords-coop/blob/HEAD/docs/REPORTING_BUGS.md
+Full guide: https://github.com/fmgk-labs/manor-lords-coop/blob/HEAD/docs/REPORTING_BUGS.md
 ```
 
 ### 6.7 How to join a test session (post in `#test-sessions` as a pinned post, or in `#welcome`)

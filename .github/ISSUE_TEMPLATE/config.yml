@@ -6,8 +6,8 @@ contact_links:
     url: <DISCORD_INVITE>
     about: Install help, how to play, finding people to play with. Please ask questions there, not as an issue.
   - name: Known issues
-    url: https://github.com/manor-lords-coop/manor-lords-coop/blob/HEAD/docs/KNOWN_ISSUES.md
+    url: https://github.com/fmgk-labs/manor-lords-coop/blob/HEAD/docs/KNOWN_ISSUES.md
     about: Read this before you report a bug. Your bug may be there already.
   - name: Security problem or crash records
-    url: https://github.com/manor-lords-coop/manor-lords-coop/blob/HEAD/SECURITY.md
+    url: https://github.com/fmgk-labs/manor-lords-coop/blob/HEAD/SECURITY.md
     about: Report security problems privately. Never post crash records or logs with personal paths in public.
