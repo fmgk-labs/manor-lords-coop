@@ -1,0 +1,137 @@
+name: Bug report
+description: Something went wrong in a co-op game.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. Please read the [known issues](https://github.com/fmgk12/manor-lords-coop/blob/HEAD/docs/KNOWN_ISSUES.md) first: your bug may be there already.
+
+        **Please do not report mod bugs to Slavic Magic or Hooded Horse.** Report them here.
+
+        **Privacy warning:** log files can contain your **Windows user name** (in folder paths) and **Steam names and Steam IDs**.
+        Open each file in a text editor and replace names with `<me>` or `<friend>` before you attach it.
+        The game's crash records always contain your Windows user name: **never attach them here**. Send them privately (see SECURITY.md).
+
+  - type: input
+    id: game_version
+    attributes:
+      label: Game version
+      description: Bottom right of the title screen.
+      value: "0.8.117"
+    validations:
+      required: true
+
+  - type: input
+    id: mod_version
+    attributes:
+      label: Mod version
+      value: "0.2.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: role
+    attributes:
+      label: I was
+      options:
+        - the host
+        - a friend (joined by invite)
+    validations:
+      required: true
+
+  - type: input
+    id: players
+    attributes:
+      label: Players and PCs
+      description: How many players, and were you on different PCs?
+      placeholder: "2 players, 2 PCs"
+    validations:
+      required: true
+
+  - type: input
+    id: other_mods
+    attributes:
+      label: Other mods installed
+      placeholder: "none"
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: One or two sentences.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What I expected
+
+  - type: input
+    id: when
+    attributes:
+      label: When
+      description: Date and time on your PC's clock. The logs use it. Game day and speed if you know them.
+      placeholder: "2026-11-20 21:14, game day 310, speed 4"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: What I did just before
+      value: |
+        1.
+        2.
+        3.
+
+  - type: dropdown
+    id: again
+    attributes:
+      label: Did it happen again?
+      options:
+        - once
+        - sometimes
+        - every time
+
+  - type: dropdown
+    id: crash
+    attributes:
+      label: Did the game close (crash)?
+      options:
+        - "no"
+        - yes, on the host
+        - yes, on a friend
+
+  - type: dropdown
+    id: syncing
+    attributes:
+      label: Did "Syncing with the host" show?
+      options:
+        - "no"
+        - yes, once
+        - yes, many times
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log files
+      description: |
+        Copy the files BEFORE you start the game again. Drag them into this box.
+        `Win64` is the folder with ManorLords-Win64-Shipping.exe.
+        Always: `Win64\ue4ss\Mods\ManorLordsCoop\patch_status.txt`, `Win64\ue4ss\Mods\ManorLordsCoop\coop_patch.log`,
+        and `Win64\ue4ss\Mods\ManorLordsCoop\link\host_log.txt` (host) or `friend<N>_log.txt` (friend; N is your slot).
+        Also useful: `Win64\ue4ss\UE4SS.log`; for invite or join problems `link\coop_steam.log`.
+        Files from the host AND the friend help most.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I checked the files for my Windows user name and Steam names, and did not attach crash records.
+          required: true

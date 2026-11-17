@@ -1,0 +1,82 @@
+MANOR LORDS CO-OP  -  INSTALL AND PLAY  (Nexus Mods package, WITH the mod loader it was tested on)
+==============================================================================================
+
+Up to 8 players control the same lord and the same town, on the host's save.
+Every player runs the game on their own PC. Nobody needs a server.
+
+WHAT YOU NEED
+- Manor Lords on Steam, game version 0.8.117 (shown at the bottom right of the title screen).
+- Nothing else to download. This zip carries the mod loader (RE-UE4SS, "UE4SS", MIT licence, its licence
+  file is in  ue4ss\LICENSE ), build 3.0.1-1218 (git 560411f1). This is the build the mod was tested on.
+- Every player needs the same game version and the same version of this mod (the mod checks it at the join).
+
+WHAT THIS ZIP DOES TO A LOADER YOU ALREADY HAVE
+- It REPLACES these three files of a loader that is already installed:
+    dwmapi.dll   (next to the game exe)
+    ue4ss\UE4SS.dll
+    ue4ss\UE4SS-settings.ini   (your own settings in it are lost; in this one the loader's console windows are off)
+  If you changed UE4SS-settings.ini, copy it to another place first.
+- It does NOT touch your ue4ss\Mods\mods.txt, your mods.json, or the folders of your other mods. The mod switches
+  itself on with a file in its own folder.
+- Why the loader is in the zip: older loader builds (before 13 October 2026; among them the file on the loader's
+  Nexus page when this was written) close the game as soon as this mod reads a squad. The loader's own project
+  fixed that: issue https://github.com/UE4SS-RE/RE-UE4SS/issues/1461, fix
+  https://github.com/UE4SS-RE/RE-UE4SS/pull/1462.
+- NOT KNOWN: whether other mods made for the older loader build all still run on this one. Only this mod was
+  tested. If you rely on other mods, keep a copy of your old  dwmapi.dll  and  ue4ss  folder first, or do not
+  install this zip over them.
+- An install on a game that has no loader at all (so no mods.txt file) was tested once on a copy of the game,
+  up to the title screen: the mod starts and the Co-op button shows. If there is no Co-op button, tell us on the mod page.
+
+INSTALL (about 2 minutes)
+1. Close the game.
+2. In Steam: right-click Manor Lords > Manage > Browse local files.
+3. Open the folders  ManorLords > Binaries > Win64.
+   You are in the right place when you see  ManorLords-Win64-Shipping.exe.
+4. Unzip everything from this zip into that folder. Say yes if Windows asks to replace the three files above.
+   The zip adds the loader (dwmapi.dll, and in the folder ue4ss: UE4SS.dll, UE4SS-settings.ini, LICENSE, Mods\shared)
+   and the folder  ue4ss\Mods\ManorLordsCoop  (and this note).
+5. Start the game from Steam. The title menu has a new button: Co-op.
+   If there is no Co-op button, see PROBLEMS.
+
+PLAY
+The host (the player whose save is used):
+1. Title screen > Co-op > Host From Save  (or Host New Game). Load or start the game as usual.
+2. In the game: Esc > Co-op > Invite Friends. Pick your friends in the Steam window.
+
+A friend:
+1. Start the game from Steam and wait at the title screen.
+2. Accept the Steam invite. The host's game loads by itself.
+   If you are in a solo game, save it first: accepting the invite leaves it.
+
+GOOD TO KNOW
+- This is a first test version. It was tested with 2 to 4 copies of the game on one PC and once between two PCs,
+  not yet with more players on different PCs. Please tell the host about anything odd.
+- Each player's villagers walk and work on their own copy, so they are not in the same place on every screen.
+  The numbers a player reads (stock, treasury, buildings) are kept in line; the villagers are not.
+- Only the host saves. A friend can keep a copy:  Esc > Co-op > Keep a Copy of This Save.
+  The copy then shows under Load Game.
+- A "Syncing" banner means your copy is reloading the host's state. The game pauses for about 10 seconds.
+- A tutorial window on anyone's screen pauses the game for everyone until it is closed.
+  Tip: tick "Skip all future tutorials".
+- Your solo games are not changed. The mod only acts in a game started from the Co-op menu or joined by invite.
+- To leave:  Esc > Co-op > Leave Co-op.
+- The mod goes online only through Steam, inside the game, to your friends in an invite-only lobby.
+  It does not check for updates and sends nothing anywhere else.
+
+REMOVE
+Close the game. Delete the folder  ue4ss\Mods\ManorLordsCoop  in the Win64 folder.
+Leave the loader (dwmapi.dll and the ue4ss folder) alone if you use it for other mods. The mod does not change your
+own save files. To remove the loader too (only if no other mod needs it): delete  dwmapi.dll  and the  ue4ss  folder.
+
+PROBLEMS
+- No Co-op button: the loader is not working, the folder is in the wrong place, or the game was not restarted.
+  The file must end up as  ...\Win64\ue4ss\Mods\ManorLordsCoop\Scripts\main.lua  and the file
+  ...\Win64\dwmapi.dll  must be there.
+- The invite does nothing: start the game through Steam, not by double-clicking the .exe.
+- "A player's co-op mod version differs": someone has another version. Everyone installs the same one.
+- After a game update the mod's own memory changes switch themselves off until a new version of the mod is out.
+- Please do NOT report bugs to the game's developer while you use mods. Report them on the mod page instead.
+- For a bug report, send these files:
+    ue4ss\UE4SS.log
+    ue4ss\Mods\ManorLordsCoop\link\  (the files ending in _log.txt)

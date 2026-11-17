@@ -1,0 +1,13 @@
+# Replace <DISCORD_INVITE> with the real invite link before the repository goes public.
+# GitHub refuses a contact link whose url is not a real URL.
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and help (Discord)
+    url: <DISCORD_INVITE>
+    about: Install help, how to play, finding people to play with. Please ask questions there, not as an issue.
+  - name: Known issues
+    url: https://github.com/fmgk12/manor-lords-coop/blob/HEAD/docs/KNOWN_ISSUES.md
+    about: Read this before you report a bug. Your bug may be there already.
+  - name: Security problem or crash records
+    url: https://github.com/fmgk12/manor-lords-coop/blob/HEAD/SECURITY.md
+    about: Report security problems privately. Never post crash records or logs with personal paths in public.

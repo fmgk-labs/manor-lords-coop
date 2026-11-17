@@ -1,0 +1,56 @@
+name: Feature request
+description: An idea for the mod.
+title: "[Idea]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. The mod keeps the game as vanilla as possible: it carries what the game already has between players.
+        Ideas that fit best: something in the game that is not shared yet, or a way to make co-op easier to start or to follow.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - town and buildings
+        - trade
+        - lord and realm
+        - army and battles
+        - events and quests
+        - joining, hosting, leaving
+        - speed and saving
+        - install
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is the problem?
+      description: What happens now, and why is it a problem in a co-op game?
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: What should happen instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Other ways you thought of
+
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: Before you send
+      options:
+        - label: I read the known issues (docs/KNOWN_ISSUES.md) and searched the open issues.
+          required: true

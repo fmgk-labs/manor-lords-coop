@@ -1,0 +1,81 @@
+TESTPLAN - town actions module (mod/ManorLordsCoop/Scripts/coop_town.lua)
+
+None of these files has been run. They were written without a game and without a Lua interpreter; a home-made Lua 5.4
+syntax checker (tokenizer + recursive-descent parser) accepts all of them, nothing more.
+
+== Setup for every one-copy test ==
+- Test copies only: start the game with -saveddirsuffix=Coop (README session 14) and load coop_test_1 by name.
+- The probe helper library is prepended to every test (eng, p1, sc, nm, v3, un, out). Load coop.lua, then
+  Coop.start("host", "host", {}) (host with no friends: nothing follows the host's speed, no enemy switch), then load
+  coop_town.lua. Check the log line "coop town ... loaded".
+- t05 to t07 leave the game paused (pauseGame); the placement tests (t02, t04, t08, t09) un-pause and set speed 0, the
+  only state placements were proven in.
+- Never save. The core stops the helper's autosave timer (A.helper()); the tests never spawn a pawn themselves.
+- Staged tests keep their state in _G.__tt; to abort one, run  _G.__tt = nil; Coop.town.test.uncap()  in the console.
+- After any crash or a world reload: reload coop_test_1, start again from t00.
+
+== Order, pass criteria, risk ==
+ #  file                         runs  what it checks                                         pass means                                                  risk
+ 1  t00_status.lua               1     module registered, default actions and their hooks     BUILD ROAD FIELD + the live1 actions on, their hooks         none
+                                                                                              registered, 0 hook errors, index about world size
+ 2  t01_identity.lua             1     type+position, region tag, road ends, family index     every "same" true, region keys are tags, no duplicate key    none
+ 3  t05_region_setters.lua       1     PLIM PUNLIM TTARGET TGLOBAL TRULE TPART (live1),        per action: one SEE line with the right args, replay ok,     low (values change for an
+                                       TAX (static)                                           value back true, extra lines 0                              instant; merchant tasks start)
+ 4  t06_building_setters.lua     1     SLEEP PRIO MAINT (live1), CPAUSE PROTECT FERTILIZE     same as above; MAINT also proves the owner lookup by        low (builders drop their task
+                                       RECIPE (static), CROP only with DO_CROP                index scan                                                  on PRIO; sleep on a site only)
+ 5  t07_families.lua             1     REMW SEE, ADDW replay on the host (forward + FAMS),    one REMW line; ADDW ok with forwarded ADDW and FAMS lines;   medium-low (assignments move
+                                       FAMS correction, full region restore                   FAMS ok with the original list; restore 0 differences       for a moment)
+ 6  t02_build.lua                4     BUILD SEE on the lord; replay through the FUNDED       one BUILD line; replay ok, building at spot B owned by the  medium: type 52 is costed; an
+                                       helper; host affordability check; T14 charge            lord; lord silver lower by the cost once more; helper 0;    UNFUNDED helper placement
+                                       (ChangeTreasury on the host); cleanup via the          both buildings gone at stage 4                              crashed twice. The module
+                                       helper's demolishRequests                                                                                          funds it with EXACTLY the cost (the live run used cost + 100): t02 settles that;
+                                                                                                                                                          TYPE = 4 is a cost-free run
+ 7  t03_road.lua                 1     ROAD SEE (new road read in the next tick) + replay      one ROAD line with 3 points; replay ok; shifted road        low; cleanup uses removeRoad
+                                                                                              exists; forwarded line; no second ROAD line                 (static T5b)
+ 8  t04_field.lua                2     FIELD SEE in two phases (draft in the hook, corners    one FIELD line with corners not "-"; replay ok; replica      medium with MANUAL = false (the
+                                       from the committed building) + replay; PASTURE = true  at the shifted centre, owner lord, corners equal the         lord's per-frame draft update
+                                       for type 10 (static)                                   shifted ones                                                may overwrite a scripted draft:
+                                                                                                                                                          use MANUAL = true then)
+ 9  t08_demolish_roaddel.lua     5     DEMOLISH (deselectBuilding / confirmDemolish SEE;      stage 3: DEMOLISH and ROADDEL lines with X's keys, X gone;  medium-low: throwaway objects
+                                       replay = helper.demolishRequests) and ROADDEL          stage 5: both replays ok, Y gone, no extra line             only; refund pile type 88
+                                       (removeRoad SEE; helper:removeRoad)
+10  t09_move.lua                 5     MOVE SEE (playBuildEffects with movedBuilding) and     stage 3: exactly one MOVE line and NO BUILD line, one camp  medium: movedBuilding writes;
+                                       replay through the helper                              at P1 none at P0; stage 5: ok, one camp at Q1 none at Q0    a failed move blocks helper
+                                                                                                                                                          placements until a reload
+11  t10_upgrades.lua             2+    UPGRADE EXT ARTISAN SEE with real clicks; DO_APPLY:    one line per click naming the building and id; DO_APPLY:    watch: none; DO_APPLY changes
+                                       host canUpgrade check + BeginUpgrade                   ok, upgradesDone grows, silver and wealth drop by the cost  the world: reload after
+12  t12_purchases.lua            1     TROUTE and LIVESTOCK SEE behind flags                  one line per purchase; wealth lower by the printed price    changes the world: reload after
+13  t11_house_plot.lua           2     HOUSE SEE with one real residential plot; DO_REPLAY:   one HOUSE line with the plot's lot count; DO_REPLAY: ok and HIGH for DO_REPLAY: nested struct
+                                       extractedPlots written on the helper + commitField     as many new type-3 buildings at the shifted spots           writes from Lua are untried and
+                                                                                                                                                          could crash: run last
+
+== Then two copies (host + one friend, both from coop_test_1, both with the separate save folder) ==
+14  Real clicks on the FRIEND, one at a time: a cost-free building, a costed building (52), a road, a field, pause
+    construction, priority, a production limit, a trade rule, family plus and minus, maintenance slider.
+    Pass: the host's log shows "TOWN APPLIED <ACT> <friend>:<n>" for each and the same object on the host (type + position);
+    the friend's log shows no "refused"; the host's link file shows the forwarded line; the friend never sends a second line
+    for the same action (its own action comes back from the host and is ignored).
+15  The same clicks on the HOST. Pass: the friend's log shows APPLIED for each; the host's link file has no line caused by a
+    replay on the friend (friends never send replays: check the friend's link file has only its own lines).
+16  Echo, delayed: on the friend, place a building, then within 1 s set its priority. Pass: two lines from the friend, the
+    host applies BUILD then PRIO in that order (PRIO waits for the building: "retry"), no line from either side for the
+    replays.
+17  Referee: lower the host lord's silver below the cost of type 52 (console), place type 52 on the friend. Pass: the host
+    log "FAILED BUILD ... cannot afford", the friend log "the host refused our action ... reload". (The friend's copy now
+    has the building and the host not: that is the expected divergence; reload to repair.)
+18  Switch an action off on the host only (Coop.town.enable("SLEEP", false)) and pause construction on the friend.
+    Pass: host NAK "switched off here", the friend logs "refused". Switch it on again.
+19  Static actions, one at a time on BOTH copies (Coop.town.enable(name, true) on each), in this order after their one-copy
+    test passed: MOVE, DEMOLISH, ROADDEL, CPAUSE, RECIPE_ON/OFF, PROTECT, FERTILIZE, TAX, UPGRADE, EXT, ARTISAN, PASTURE,
+    HOUSE (last). Pass for each: the action done by real click on the friend appears on the host and on a second friend
+    (if any) with the same result; the drift fingerprint (world-state lane) shows no new difference.
+20  A friend places a cost-free building while the HOST is paused (pauseGame). Pass: the host replays it after it is
+    un-paused at the latest (its timeouts do not run while paused), no "timed out" in the host log, no crash.
+21  A join or repair (Coop.join) while actions are being clicked. Pass: during the hold the module logs "dropped a T line
+    during a join/repair hold" or nothing, after the reload "TOWN world reset", no errors, and the next click relays again.
+
+== Known gaps the tests cannot close on one copy ==
+- Which pawn the UI's demolish confirm and remove-road button call (DEMOLISH / ROADDEL SEE), whether the scripted append to
+  p1.demolishRequests behaves like the button: only real clicks in step 19 settle it.
+- Field border shrubs after a replay (lane_t1 T3: unresolved contradiction; the replica renders without them in session 7c).
+- A family plus/minus can also refill vacancies elsewhere in the region; only the clicked building is corrected.

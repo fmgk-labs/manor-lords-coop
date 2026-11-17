@@ -1,0 +1,100 @@
+TESTPLAN - world state module (Scripts/coop_world.lua, message kind "W", host -> friends)
+
+Before every step
+- Load coop.lua, then coop_world.lua (it answers "coop_world 0.1-dev loaded"; "load coop.lua first" means the order was wrong).
+- The probe helper library is prepended to each test file (eng, p1, out, un, nm, v3).
+- Autosave timer paused (p1.autosaveHandle), as in every probe. No test saves the game. The module spawns no pawn.
+- Status at any time: Coop.world.status() (also shows dry=... capturing=...; both must be false in play).
+  Switch an item: Coop.world.set("weather", true). Back to defaults (also clears a dry run or capture left by a
+  test that stopped): Coop.world.defaults().
+- Items on by default:
+    stock, silver, wealth            proven live with two copies (README session 9), home region
+    bstock, holdRaid, holdCamp       proven live on ONE copy (README session 14); two-copy behaviour not measured
+    events, fp                       read only on the host / log only on the friend
+  Everything else is off, including everything that spawns or removes things (fire, merch) and driftHook.
+  Each item must be set the same way on every copy (the host sends it only when its own switch is on; the friend
+  applies it only when its own switch is on).
+- Starting Coop as "friend" on the test copy also runs the core's friendUpkeep there (disableAI flag, soldier stat
+  writes). Use a throwaway load.
+
+== Part A: one copy, paused ==
+
+0. Compile check. The files were never parsed by a real Lua (none on the build PC; only a block/bracket balance check
+   was run). In the console: for each of Scripts/coop_world.lua and tests/world/t1..t7, run
+     local f, e = loadfile([[<path>]]); return f and "ok" or e
+   Pass: "ok" for all eight. Risk: none (loadfile does not run the file).
+
+1. t1_ids.lua                   READ ONLY. Risk: none.
+   Pass: region keys unique and one word; the lord's building keys unique; lookups by key and 10 cm off find the
+   same building. Also the first live read of Region.regionUniqueTag: note whether keys came from the tag or the
+   "n_" name fallback.
+
+2. t3_host_scan.lua             READ ONLY (captures what the host would send). Risk: none; reads of unverified
+   properties (merchant arrays, scenario_nextActionDay, weather fields) can only error, and errors are printed.
+   Pass: every line under 3800 characters; max step about 2.5 ms or less; second region scan sends 0 lines; no error.
+   Record: bytes per region scan, per building scan, per day; max step time and which job.
+
+3. t4_fingerprint.lua           READ ONLY. Risk: none.
+   Pass: no "ERR" section, under ~400 bytes, the four comparisons as described in the file.
+
+4. t2_stock_fake.lua            WRITES (stock +1/-1, silver +7/-7, wealth +3/-3), restores. Calls proven in session 9.
+   Run with Coop started as "friend" so the lines go through Coop.dispatch -> onMessage and the two negatives
+   (stale line, foreign sender) run. Risk: low; a failed consumeGood leaves +1 of one good (the test then puts it
+   back directly and prints the final value).
+   Pass: v -> v+1 -> v, s -> s+7 -> s, w -> w+3 -> w, w_stale +1, w_ignored +1.
+
+5. t6_holds.lua                 WRITES raid / camp / director timers and spawnMerchants, restores.
+   Risk: low while paused (no day passes). If the copy were running, a wrong timer could start or skip a raid.
+   Pass: values as listed in the file, all restored, no item switched itself off.
+
+6. t7_events_dry.lua            DRY RUN, nothing written. Risk: none.
+   Pass: dry log shows raid timers, StartFire, weather rainMeter, spawnFreeMerchant; one drift report for the camp.
+
+7. t5_building_stock.lua        WRITES one storage building's stock +1/-1, restores (session 14 did the same by hand).
+   Risk: low. Pass: building a -> a+1 -> a AND region total r -> r+1 -> r, through the module's key lookup.
+
+== Part B: two copies (host + one friend), same save, defaults ==
+
+8. Session-9 repeat with the module. Both copies load the same save; Coop.start("host", ...) / ("friend", ...); load
+   coop_world.lua on both; speed 4 on the host; run 8 game days.
+   Pass: home-region stock within 2 per good at the end (session 9: 1 of 17 goods off by 2); treasury and wealth equal
+   after a pause; storage and site inventories within 2 (bstock); construction sites finish on both copies;
+   friend's daysUntilNextRaid = host + 1 and lastBanditCampSpawnedDay = its today; Coop.status() shows w_stockFix
+   and w_bldFix settling (not climbing every pass), w_err = 0; Coop.world.status() maxTick about 2 ms or less.
+   If w_stockFix and w_bldFix both climb every pass without settling, the region pass and the per-building pass are
+   pushing against each other: switch bstock off and report.
+   Record from the friend's log: "fingerprint day N equal / differs: ..." lines (driftHook is off, nothing reacts).
+   Risk: as session 9 (none seen); a held raid timer that does not hold would give a friend-only raid (reload).
+
+9. Fingerprint stability. Both copies freshly loaded from the same save, both paused: run t4_fingerprint.lua on each.
+   Pass: the two "FP" lines are identical. Session 14 found the lane_w owner section differing (object names); this
+   module names owners P (our lord) / B (bandit) / A<setup index> / - instead; check O now matches. Any section that
+   still differs on fresh loads holds noise: drop it from W.compareFp before step 18. Risk: none.
+
+10. Join keyframe. With the join module: after a friend finished loading, call Coop.world.keyframe() on the host.
+    Pass: the friend's first R/L/B lines arrive within 2-15 s instead of up to 30 s. Risk: none.
+
+== Part C: switch on one item at a time (two copies, 4-8 game days each, the friend's log open) ==
+After each: Coop.world.status() on both; check the item did not switch itself off ("item X switched off" in the log).
+
+11. holdMerchants  Friend: spawnMerchants stays false. Pass: no new free merchant on the friend. Risk: low.
+12. holdDirector   Only matters in the "baron" scenario. Pass: scenario_nextActionDay = 2^30 on the friend. Risk: low.
+13. weather        Pass: friend's rain/snow targets equal the host's within a second after each day change, and the
+                   W section of the fingerprint now matches. Risk: low (visual; rain feeds fertility).
+14. otherRegions   Only with a second owned region. Pass: that region's stock within 2. Risk: low (same calls).
+15. lordExtra      Pass: influence and king's favour equal. Risk: low.
+16. merch          Spawns a merchant. Pass: friend gets a free merchant when the host does (region: home, a guess).
+                   Risk: low-medium (a merchant only on one copy until reload).
+17. fire           Spawns a fire; needs a real fire on the host (throwaway save). Pass: the same building starts
+                   burning on the friend. Risk: HIGH: a fire cannot be undone by name; the friend may lose a building.
+18. fireOut        GUESS (fireAmt = 0.001). Pass: the friend's fire ends when the host's does. Risk: medium.
+19. driftHook      Only after step 9 shows a stable fingerprint, and when the join/reload module defines
+                   Coop.onDrift (called inside the tick: the hook should only record and reload from its own tick).
+                   Pass: a forced mismatch (e.g. build something on the host with the town relay off) calls
+                   Coop.onDrift(reason) after 2 days; normal play does not. Risk: reload loops if a section is noisy.
+20. clockDrift     Leave off. A reload restarts the friend's day at its start (README session 8), so a gap of up to a
+                   day after a reload is normal and would trigger another reload.
+21. ignoreRaiders  Alternative to holdRaid; drops the raider quest on the friend. Only if holdRaid fails.
+
+What cannot be corrected by name (lane_w; the fingerprint sections B, F, O catch them and a reload repairs them):
+births, emigration, cold and maintenance deaths of villagers, bandit camp placement, AI economy, exact time of day.
