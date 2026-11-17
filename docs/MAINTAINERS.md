@@ -13,9 +13,7 @@ How the GitHub repository is run, for the owner and for helpers who look after i
 
 How to add someone: repository **Settings** > **Collaborators and teams** > **Add people** > pick the role.
 
-**Note:** the roles Triage and Maintain exist only for repositories owned by a GitHub **organization**.
-On a personal account every collaborator gets the same access (about Write).
-To use these roles, create a free organization and move the repository there (**Settings** > **Transfer**). The owner stays Admin.
+**Note:** the repository is owned by the GitHub organization `manor-lords-coop`, so all these roles are available. The owner is the organization's Owner and stays Admin.
 
 ## Private security reports
 
