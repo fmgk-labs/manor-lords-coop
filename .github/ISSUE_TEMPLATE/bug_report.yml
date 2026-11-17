@@ -10,8 +10,12 @@ body:
 
         **Please do not report mod bugs to Slavic Magic or Hooded Horse.** Report them here.
 
-        **Privacy warning:** log files can contain your **Windows user name** (in folder paths) and **Steam names and Steam IDs**.
-        Open each file in a text editor and replace names with `<me>` or `<friend>` before you attach it.
+        **How to report:** right after the problem, open the **Co-op** menu (title screen: the **Co-op** button;
+        in a game: **Esc**, then **Co-op**) and press **Make Bug Report**. A folder opens with `report_<date>_<time>.zip`.
+        Fill in this form and drag the zip into "Bug report zip" below.
+        After a crash: start the game again and press **Make Bug Report** at the title screen. The crashed session is kept.
+
+        **Privacy:** the zip has no Windows user name and no Steam names. **Do not attach the raw log files.**
         The game's crash records always contain your Windows user name: **never attach them here**. Send them privately (see SECURITY.md).
 
   - type: input
@@ -27,7 +31,7 @@ body:
     id: mod_version
     attributes:
       label: Mod version
-      value: "0.2.1"
+      value: "0.2.2"
     validations:
       required: true
 
@@ -117,14 +121,13 @@ body:
   - type: textarea
     id: logs
     attributes:
-      label: Log files
+      label: Bug report zip
       description: |
-        Copy the files BEFORE you start the game again. Drag them into this box.
-        `Win64` is the folder with ManorLords-Win64-Shipping.exe.
-        Always: `Win64\ue4ss\Mods\ManorLordsCoop\patch_status.txt`, `Win64\ue4ss\Mods\ManorLordsCoop\coop_patch.log`,
-        and `Win64\ue4ss\Mods\ManorLordsCoop\link\host_log.txt` (host) or `friend<N>_log.txt` (friend; N is your slot).
-        Also useful: `Win64\ue4ss\UE4SS.log`; for invite or join problems `link\coop_steam.log`.
-        Files from the host AND the friend help most.
+        Press **Make Bug Report** in the Co-op menu, then drag `report_<date>_<time>.zip` into this box.
+        If no folder opened: the zip is in `Win64\ue4ss\Mods\ManorLordsCoop\link\reports\`
+        (`Win64` is the folder with ManorLords-Win64-Shipping.exe).
+        Zips from the host AND the friend help most.
+        No Co-op button (the mod did not start)? Attach `Win64\ue4ss\UE4SS.log` instead, with your Windows user name replaced by `<me>`.
     validations:
       required: true
 
@@ -133,5 +136,5 @@ body:
     attributes:
       label: Privacy
       options:
-        - label: I checked the files for my Windows user name and Steam names, and did not attach crash records.
+        - label: I attached the zip from Make Bug Report (not the raw log files), and did not attach crash records.
           required: true

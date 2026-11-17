@@ -164,7 +164,7 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 - **You see:** the friend's game closed.
 - **Numbers:** once, on a private build before 0.2.x. The friend's crash report was never received.
 - **Basis:** owner's live play.
-- **Workaround:** none. If your game closes, send the files in [REPORTING_BUGS.md](REPORTING_BUGS.md).
+- **Workaround:** none. If your game closes, start it again, press **Make Bug Report** in the Co-op menu and send the zip (see [REPORTING_BUGS.md](REPORTING_BUGS.md)).
 
 ### F2. One friend close in a test build
 

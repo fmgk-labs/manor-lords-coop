@@ -11,6 +11,7 @@ Replace these before you post anything.
 | `https://discord.gg/cK9HzVxzaY` | the server's permanent invite link |
 | `<NEXUS_PAGE>` | the mod's Nexus Mods page |
 | `<RELEASE_DATE>` | the date 0.2.1 goes public |
+| `<RELEASE_DATE_022>` | the date 0.2.2 goes public |
 
 The GitHub links are already filled in: the repository is https://github.com/fmgk-labs/manor-lords-coop.
 
@@ -132,7 +133,7 @@ Default sort: **Latest activity**. Default layout: **List**.
 
 ```text
 One post per session. Title: day, time and time zone, e.g. "Sat 18:00 UTC, host needed".
-Say: host or friend, how many players, how long you can play, and your mod version (must be 0.2.1 for everyone).
+Say: host or friend, how many players, how long you can play, and your mod version (must be 0.2.2 for everyone).
 Use the tags. Mark the post "full" when you have your group and "done" afterwards.
 After playing: write how it went in #feedback, and one post per bug in #bug-reports.
 ```
@@ -142,10 +143,13 @@ After playing: write how it went in #feedback, and one post per bug in #bug-repo
 ```text
 One bug per post. Title: short and clear, e.g. "Friend: road not shown on host after a resync".
 Check #known-issues first. If the game closed, use #crash-reports.
-Fill in: game version, mod version (0.2.1), host or friend, how many players and PCs, what happened, what you expected, the time on your PC's clock, what you did just before.
-Attach: patch_status.txt and coop_patch.log (folder Win64\ue4ss\Mods\ManorLordsCoop) and host_log.txt or friend<N>_log.txt (its link folder). Files from the host AND the friend help most.
-Privacy: logs can hold your Windows user name and Steam names. Check them first, or send them to a moderator in a DM.
-Pick the tags for who saw it and the area. Moderators add the status tags.
+1. Right after the problem, open the Co-op menu (title screen: the Co-op button; in a game: Esc, then Co-op).
+2. Press Make Bug Report. A folder opens with report_<time>.zip.
+3. Fill in the template from the pinned post: game version, mod version (0.2.2), host or friend, players and PCs, what happened, what you expected, the time on your PC's clock, what you did just before.
+4. Drag the zip into your post. Zips from the host AND the friend help most.
+5. Pick the tags for who saw it and the area. Moderators add the status tags.
+After a crash: start the game again and press Make Bug Report. The crashed session is kept.
+The zip has no Windows user name or Steam names. Do not post the raw log files.
 ```
 
 ---
@@ -163,14 +167,14 @@ This server is for **Manor Lords Co-op**, a fan-made mod that lets you play **on
 
 **How it works:** every player runs the game on their own PC. The host's save is the town. Friends join through a Steam invite. A host and up to 4 friends.
 
-**Status:** beta, version **0.2.1**. Manor Lords **0.8.117** only. Windows and Steam only.
+**Status:** beta, version **0.2.2**. Manor Lords **0.8.117** only. Windows and Steam only.
 
 **Start here**
 1. Read #rules and accept them.
 2. Install the mod: #download-and-install
 3. Before you report a bug: #known-issues
 4. Stuck? Ask in #install-help
-5. Found a bug? #bug-reports (game closed? #crash-reports)
+5. Found a bug? Open the **Co-op** menu, press **Make Bug Report**, and drag the zip into a post in #bug-reports (game closed? #crash-reports)
 6. Want to play with others? #test-sessions
 
 **Links**
@@ -273,23 +277,27 @@ Problems? #install-help
 ### 6.6 First post in `#bug-reports` (title: "How to report a bug: read first", pin)
 
 ```md
-**Right after the problem**
-1. Write down the time on your PC's clock.
-2. Copy the log files **before you start the game again**.
-3. Ask the other players to do the same.
+**How to report a bug**
+1. Right after the problem, open the **Co-op** menu.
+   - At the title screen: the **Co-op** button in the main menu.
+   - In a game: press **Esc**, then **Co-op**.
+2. Press **Make Bug Report**.
+3. A folder opens. It holds `report_<date>_<time>.zip`.
+4. Start a post here in #bug-reports. Copy the template below and fill it in.
+5. Drag the zip into your post.
+6. Pick the tags: who saw it (host / friend) and the area.
 
-**Always attach** (`Win64` = the folder with ManorLords-Win64-Shipping.exe)
-- `Win64\ue4ss\Mods\ManorLordsCoop\patch_status.txt`
-- `Win64\ue4ss\Mods\ManorLordsCoop\coop_patch.log`
-- `Win64\ue4ss\Mods\ManorLordsCoop\link\host_log.txt` (host) or `friend1_log.txt` (friend; the number is your slot)
+**The game closed?** Start the game again and press **Make Bug Report** at the title screen. The crashed session is kept. Post in #crash-reports.
 
-**Also useful:** `Win64\ue4ss\UE4SS.log`; for invite or join problems `link\coop_steam.log`.
+**Ask the other players** to press the button too. Zips from the host and the friend help most.
 
-**Privacy:** these files can hold your Windows user name and Steam names. Check them first, or send them to a moderator in a DM.
+**Privacy:** the zip has no Windows user name and no Steam names. Do not post the raw log files.
+
+**No folder opened?** The zip is in `Win64\ue4ss\Mods\ManorLordsCoop\link\reports` (`Win64` = the folder with ManorLords-Win64-Shipping.exe).
 
 **Template**
 Game version: 0.8.117
-Mod version: 0.2.1
+Mod version: 0.2.2
 I was: host / friend
 Players and PCs:
 What happened:
@@ -309,7 +317,7 @@ Full guide: https://github.com/fmgk-labs/manor-lords-coop/blob/HEAD/docs/REPORTI
 # How to join a test session
 
 **Before the session**
-1. Install the mod: #download-and-install. Everyone needs mod **0.2.1** and Manor Lords **0.8.117**.
+1. Install the mod: #download-and-install. Everyone needs mod **0.2.2** and Manor Lords **0.8.117**.
 2. Add the host as a friend on Steam. The invite comes through Steam.
 3. Make a post in #test-sessions, or reply to one: your time zone and when you can play.
 
@@ -329,6 +337,21 @@ Full guide: https://github.com/fmgk-labs/manor-lords-coop/blob/HEAD/docs/REPORTI
 ```
 
 ### 6.8 Changelog entry (post in `#changelog`)
+
+For 0.2.2:
+
+```md
+# 0.2.2 (<RELEASE_DATE_022>)
+
+- New: **Make Bug Report** in the Co-op menu (title screen, and Esc > Co-op in a game). It makes one zip with the logs and opens its folder. Drag the zip into your post in #bug-reports.
+- The logs of your last 5 game starts are kept, so a crashed session is still there after you start the game again.
+- The logs and the zip have no Windows user name and no Steam names.
+- The game plays as in 0.2.1.
+
+Everyone must use 0.2.2. Older versions are refused at the join.
+```
+
+For 0.2.1:
 
 ```md
 # 0.2.1 (<RELEASE_DATE>), first public version

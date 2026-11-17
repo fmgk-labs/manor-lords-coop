@@ -40,7 +40,7 @@
 #include <limits.h>
 #include "coop_scan.h"
 
-#define COOP_PATCH_VERSION "0.9"
+#define COOP_PATCH_VERSION "0.9.1"
 #define LOG_CAP            (256u * 1024u)
 #define MAX_LINE           4096       /* lane 22: a TOTALS SET line names every good of a region (512 was too short live) */
 #define READ_CHUNK         65536
@@ -59,6 +59,7 @@ static char      g_off_reason[160];
 static int       g_failures;                /* internal failures; MAX_FAILURES -> off */
 static int       g_in_tick;
 static wchar_t   g_dir[MAX_PATH];           /* I/O folder, ends with a backslash */
+static wchar_t   g_moddir[MAX_PATH];        /* lane 61: this DLL's own folder (the mod folder), ends with a backslash */
 static wchar_t   g_cmd_path[MAX_PATH], g_status_path[MAX_PATH], g_status_tmp[MAX_PATH], g_log_path[MAX_PATH], g_log_old[MAX_PATH];
 static ULONGLONG g_cmd_off;                 /* bytes of patch_cmd.txt already consumed */
 static int       g_dirty;                   /* status must be rewritten at the end of this tick */
@@ -85,6 +86,7 @@ static uint8_t *g_test_base;
 
 static void join_path(wchar_t *out, const wchar_t *dir, const wchar_t *name);
 #include "coop_cost.h"                      /* lane 45: the tick's own cost, the status file written only when changed */
+#include "coop_scrub.h"                     /* lane 61: no user name, Steam name or whole Steam id in what is written */
 
 /* ------------------------------------------------------------------ log */
 static void log_line(const char *fmt, ...)
@@ -103,6 +105,10 @@ static void log_line(const char *fmt, ...)
     _vsnprintf(msg, sizeof(msg) - 1, fmt, ap);
     msg[sizeof(msg) - 1] = 0;
     va_end(ap);
+    {   char sm[sizeof(msg)];                             /* lane 61: the folder line and every path: no user name */
+        size_t sn = scrub_buf(msg, strlen(msg), sm, sizeof(sm) - 1);
+        sm[sn] = 0; memcpy(msg, sm, sn + 1);
+    }
     GetLocalTime(&t);
     n = _snprintf(line, sizeof(line) - 3, "%04u-%02u-%02u %02u:%02u:%02u.%03u %s", t.wYear, t.wMonth, t.wDay,
                   t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, msg);
@@ -158,6 +164,8 @@ static void resolve_dir(void)
     slash = wcsrchr(self, L'\\');
     if (slash) slash[1] = 0; else wcscpy(self, L".\\");
     wcscpy(g_dir, self);
+    wcscpy(g_moddir, self);             /* lane 61 */
+    scrub_init_env();                   /* lane 61: the user name, before the first log line */
 
     join_path(cfg, self, L"coop_patch.cfg");
     f = _wfopen(cfg, L"rb");
@@ -251,6 +259,7 @@ static int fell_scan(void);
 static int endhold_status(char *buf, size_t len);    /* lane 49, round four: the ENDHOLD line */
 static int endhold_scan(void);
 static void endhold_off(const char *why);
+static int report_status(char *buf, size_t len);     /* lane 61: the REPORT line (coop_report.h) */
 
 static int write_status(void)              /* lane 45: 0 = not written yet (only counters changed): stays dirty */
 {
@@ -295,6 +304,7 @@ static int write_status(void)              /* lane 45: 0 = not written yet (only
     n += guide_status(buf + n, sizeof(buf) - (size_t)n);    /* lane 49 */
     n += fell_status(buf + n, sizeof(buf) - (size_t)n);     /* lane 54 */
     n += endhold_status(buf + n, sizeof(buf) - (size_t)n);  /* lane 49, round four */
+    n += report_status(buf + n, sizeof(buf) - (size_t)n);   /* lane 61 */
     n += _snprintf(buf + n, sizeof(buf) - (size_t)n, "process %lu version %s\r\n", GetCurrentProcessId(), COOP_PATCH_VERSION);
 have_text:
     if (n < 0 || n > (int)sizeof(buf)) n = (int)strlen(buf);
@@ -4103,6 +4113,9 @@ static void regset_cmd(int argc, char **argv)
 /* ------------------------------------------------------------------ ENDHOLD (lane 49, round four): its own file */
 #include "coop_endhold.h"
 
+/* ------------------------------------------------------------------ REPORT (lane 61): the bug report, its own file */
+#include "coop_report.h"
+
 /* ------------------------------------------------------------------ DIST (lane 42): a house's market goods on the host's word
  * (research/2026-11-10-game-probe/lanes/lane_s21_42/report.txt)
  * A house's distributedGoods (SMBuildingMaster +E90h: a list of the game's 24-byte goods records) is rebuilt by the
@@ -4388,6 +4401,7 @@ static void command(char *line)
     if (argc == 0) return;
     if (_stricmp(argv[0], "STATUS") == 0) { g_dirty = 1; co_forget_status(); return; }
     if (_stricmp(argv[0], "COST") == 0) { cost_cmd(); return; }          /* lane 45: cost.txt */
+    if (_stricmp(argv[0], "REPORT") == 0) { report_cmd(argc, argv); return; }    /* lane 61: also when the DLL is off */
     if (g_off) { log_line("ignored: the DLL is off (%s)", g_off_reason); g_dirty = 1; return; }
     if (_stricmp(argv[0], "NOKILL") == 0 && argc == 2 && on_off(argv[1], &v)) { set_site(S_P1, v); return; }
     if (_stricmp(argv[0], "NOROUT") == 0 && argc == 2 && on_off(argv[1], &v)) { set_site(S_P2, v); return; }
@@ -4555,6 +4569,7 @@ static void init(void)
     WIN32_FILE_ATTRIBUTE_DATA fa;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR)(void *)&init, &pinned);
     resolve_dir();
+    report_dirs();                             /* lane 61: link, link\sessions, link\reports in the mod folder */
     log_line("coop_patch %s starting in process %lu, folder %ls", COOP_PATCH_VERSION, GetCurrentProcessId(), g_dir);
     /* a command file left by an earlier run may hold old addresses: start at its current end */
     g_cmd_off = 0;
@@ -4574,6 +4589,7 @@ static void tick_body(void)
     totals_tick();
     hold_tick();
     {   unsigned long long co0 = co_now(); poll_commands(); co_add(CO_POLL, co0); }   /* lane 45 */
+    report_tick();          /* lane 61: a finished bug report */
     field_tick();           /* lane 40: queued plant drawings, audits */
     men_tick();             /* lane 43: a faulted hook taken out */
     goods_tick();           /* and what an audit or a command of this tick left */

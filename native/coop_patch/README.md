@@ -1045,3 +1045,30 @@ than the ceiling, the re-set's own end.
     ENDHOLD RANGE <lo> <hi>                                           the callers' range (offline test)
 
 Status: `ENDHOLD on|off n= held= passed= expired= skipped= faults= other= sets= bad=`. Offline E1-E3.
+
+## REPORT: the player's "Make Bug Report" button (lane 61)
+
+`coop_report.h`. The mod writes `patch_report_job.txt` in this DLL's I/O folder (UTF-8, tab-separated fields):
+
+    open 1|0                       open the reports folder in Explorer when done (the mod sends 0 while link\dev_report_noopen.txt exists)
+    zip 1|0                        make the zip (0: keep the folder; the mechanism test reads the copies)
+    name <from><TAB><to>           a Steam display name (3 bytes or more) and the slot name that replaces it
+    file <source><TAB><name><TAB><cap bytes>[<TAB><start byte>]    a file to copy under <name> (letters, digits, - _ . only) from <start> on; past <cap>, its start (a quarter, at most 1 MB) and its end
+
+then sends `REPORT <stamp>` (letters, digits, `-` and `_`). Works also while the DLL is off. While a report is being made, another REPORT changes nothing. Every path written is built
+from this DLL's own folder: `<mod>\link\reports\report_<stamp>\`, then `<mod>\link\reports\report_<stamp>.zip` made by
+Windows' own `%SystemRoot%\System32\tar.exe -a -c -f` (Windows 10 1803 and later), started with `CREATE_NO_WINDOW` in
+the reports folder with relative names only; the folder is removed after a good zip. No tar, a tar failure or more than
+120 s: the folder stays, a partial zip is removed. Explorer is started as `explorer.exe /select,"<zip>"`. Copies, tar
+and Explorer run on the report's own thread; the game thread only reads the job.
+
+Every copy is scrubbed (`coop_scrub.h`, the same rules as the mod's own log): the folder after `\Users\` (any case, when
+another separator follows) and the Windows user name (`USERNAME`, the last folder of `USERPROFILE`) right after a
+separator become `<user>`; the job's names become their slot; a Steam id (`7656119` and 10 digits) keeps its last 4
+digits (`<id..1234>`). The DLL's own log lines (`coop_patch.log`) get the same scrub when written.
+
+The first tick makes `<mod>\link`, `link\sessions` and `link\reports` (the mod's Lua cannot make a folder without a
+console window).
+
+Status: `REPORT idle | running report_<stamp> | done report_<stamp>.zip <files> [opened] |
+folder report_<stamp> <files> <why> [opened] | refused report_<stamp> <why> | refused - <why>`. Offline RP1-RP3.

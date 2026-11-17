@@ -5,7 +5,7 @@ Each player runs the game on their own PC. The host's save is the town.
 
 | | |
 |---|---|
-| **Mod version** | 0.2.1 (v1) |
+| **Mod version** | 0.2.2 (v1, with the **Make Bug Report** button) |
 | **Status** | **Beta**: for testing with friends |
 | **Game version** | Manor Lords **0.8.117** on Steam, exactly |
 | **Players** | a host and up to 4 friends |
@@ -62,7 +62,8 @@ They follow the host's, but can be a few seconds or a few metres apart. See [Kno
 
 ## Status
 
-**Beta.** Version 0.2.1 is v1, the version for testing with friends.
+**Beta.** Version 0.2.1 is v1, the version for testing with friends. 0.2.2 adds the **Make Bug Report** button and keeps
+the logs of the last 5 game starts; the game itself plays as in 0.2.1.
 The known differences between host and friend are fixed, or accepted under the owner's "soft bars" (a few metres, a few seconds).
 What was never tested goes to this beta.
 
@@ -243,35 +244,43 @@ The most important:
 | The invite does nothing | Start the game **through Steam**, not by a double-click on the `.exe`. |
 | "Steam joining needs the game started through Steam" | The same: start the game from Steam. |
 | "A player's co-op mod version differs from the host's" | Someone has another zip. Everyone installs the same one. |
-| "Syncing with the host" shows often | Normal after a join. If it repeats every minute or two, report it with the log files. |
+| "Syncing with the host" shows often | Normal after a join. If it repeats every minute or two, report it: **Co-op** menu, **Make Bug Report**, attach the zip. |
 | The game drops to speed 1 | Usually the game's own rule when an enemy is spotted. Press the speed button again. |
 | "The host left the game" | The host quit, or was silent for 30 s. The host starts again and invites again. |
-| The game closes (crash) | Report it with the files below. Do not start the game again before you copied them. |
+| The game closes (crash) | Start the game again. At the title screen open **Co-op** and press **Make Bug Report**: the crashed session is kept. Attach the zip to your report. |
+| Anything else that looks wrong | Right after it: **Co-op** menu (title screen: the **Co-op** button; in a game: **Esc**, then **Co-op**), press **Make Bug Report**, attach the zip (see [Report a bug](#report-a-bug)). |
 | After a game update the mod does nothing | The mod's native part switches itself off when the game changed. Wait for a new mod version. |
 | You want the mod off for a while | You do not need to: it stays idle in solo games. To switch it off fully, remove the `#` before `role = disabled` in `coop.cfg`. |
 
 ### Where the log files are
 
-`Win64` below is `<game folder>\ManorLords\Binaries\Win64`.
+You do not need to find them: **Make Bug Report** puts the right ones in one zip, without your Windows user name or
+Steam names. For the curious, `Win64` below is `<game folder>\ManorLords\Binaries\Win64`.
 
 | File | Folder | What it holds |
 |---|---|---|
+| `report_<date>_<time>.zip` | `Win64\ue4ss\Mods\ManorLordsCoop\link\reports\` | what **Make Bug Report** made: post this one |
+| `host_log.txt` or `friend1_log.txt` | `Win64\ue4ss\Mods\ManorLordsCoop\link\` | the mod's own log of this game start (host, or friend; the number is your slot) |
+| `idle_log.txt` | `Win64\ue4ss\Mods\ManorLordsCoop\link\` | the mod's log at the title screen |
+| `<name>_<date>_<time>.txt` | `Win64\ue4ss\Mods\ManorLordsCoop\link\sessions\` | the logs of earlier game starts (the newest 5 per name) |
 | `patch_status.txt` | `Win64\ue4ss\Mods\ManorLordsCoop\` | the state of the mod's native part |
 | `coop_patch.log` | `Win64\ue4ss\Mods\ManorLordsCoop\` | the native part's log |
-| `host_log.txt` or `friend1_log.txt` | `Win64\ue4ss\Mods\ManorLordsCoop\link\` | the mod's own log (host, or friend; the number is your slot: `friend2_log.txt` for the second friend) |
-| `idle_log.txt` | `Win64\ue4ss\Mods\ManorLordsCoop\link\` | the mod's log at the title screen (emptied at each game start) |
 | `UE4SS.log` | `Win64\ue4ss\` | the mod loader's log |
-| `coop_steam.log` | `Win64\ue4ss\Mods\ManorLordsCoop\link\` | the Steam part's log (holds Steam IDs and Steam names) |
-| crash records | `%LOCALAPPDATA%\ManorLords\Saved\Crashes\` | the game's own crash reports (hold your Windows user name) |
+| `coop_steam.log` | `Win64\ue4ss\Mods\ManorLordsCoop\link\` | the Steam part's log (holds Steam IDs and Steam names; not in the zip) |
+| crash records | `%LOCALAPPDATA%\ManorLords\Saved\Crashes\` | the game's own crash reports (hold your Windows user name; not in the zip) |
 
-**Privacy:** these files can contain your Windows user name (in folder paths) and Steam names. Check them before you post them in public.
+**Privacy:** post the zip, not the raw files. The zip has no Windows user name and no Steam names. `UE4SS.log`,
+`coop_steam.log` and the crash records can hold them.
 
 ---
 
 ## Report a bug
 
-1. Read [docs/REPORTING_BUGS.md](docs/REPORTING_BUGS.md). It has a template and the list of files.
-2. Post it:
+1. Right after the problem, open the **Co-op** menu (title screen: the **Co-op** button; in a game: **Esc**, then
+   **Co-op**) and press **Make Bug Report**. A folder opens with `report_<date>_<time>.zip`.
+   After a crash: start the game again and press it at the title screen. The crashed session is kept.
+2. Fill in the template in [docs/REPORTING_BUGS.md](docs/REPORTING_BUGS.md) and attach the zip.
+3. Post it:
    - Discord: `https://discord.gg/cK9HzVxzaY` (channel **#bug-reports**)
    - GitHub issues: https://github.com/fmgk-labs/manor-lords-coop/issues
    - Nexus Mods: `<NEXUS_PAGE>` (Bugs tab)

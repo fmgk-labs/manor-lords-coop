@@ -6,7 +6,8 @@
 --   menu:    a "Co-op" button in the game's menu column (the title menu and the pause menu are the same object,
 --            mainMenu_widget_C, a column `main_buttons_vb` of W_MainMenuButton_C), placed above Quit Game. It opens a
 --            panel made of the same button kind: the players with their state, then Invite Friends (host),
---            Keep a Copy of This Save and Leave Co-op (friend), Back.
+--            Keep a Copy of This Save and Leave Co-op (friend), Make Bug Report (everyone, also at the title screen;
+--            lane 61: Coop.report()), Back.
 --   status: banner and menu seen live on one copy (README sessions 17, 18; screens/s17-*, s18-*). The menu object only
 --           exists while a menu is or has been open; it is never opened from here (OpenPauseMenu from Lua crashed).
 --           Only in-place calls on existing widgets are used (Create, AddChild, RemoveChild, SetVisibility,
@@ -141,6 +142,11 @@ local function keepCopy(S)
   return true, "Saved a copy. Find it under Load Game"
 end
 
+-- (lane 61) the text of the panel's "Make Bug Report" row: how the report went (the next opening says "Make Bug Report")
+function U.reportNote(msg)
+  for _, b in ipairs(U.rows or {}) do if valid(b) and (U.keys or {})[addr(b)] == "report" then pcall(function() b:SetButtonText(text(tostring(msg))) end) end end
+end
+
 local function closePanel()
   local Pn = U.panel; if not Pn then return end
   for _, s in ipairs(Pn.saved) do if valid(s[1]) then s[1]:SetVisibility(s[2]) end end
@@ -165,6 +171,7 @@ local function openPanel(S)
     if S and S.role == "host" then want[#want + 1] = { "invite", "Invite Friends" } end
     if S and S.role == "friend" then want[#want + 1] = { "copy", "Keep a Copy of This Save" }; want[#want + 1] = { "leave", "Leave Co-op" } end
   end
+  want[#want + 1] = { "report", "Make Bug Report" }              -- (lane 61) title screen and in-game panel alike: Coop.report()
   want[#want + 1] = { "back", "Back" }
   local saved = {}
   for i = 0, col:GetChildrenCount() - 1 do
@@ -214,6 +221,17 @@ local function act(S, key)
     elseif st.state == "hosting" then C.steam.invite(); log("invite: Steam's invite window asked for")
     elseif st.state == "idle" or st.state == "starting" then C.steam.host(); U.wantInvite = os.clock(); log("invite: opening the Steam lobby first")
     else C.notify("info", "Not possible while joining another game") end
+    return
+  end
+  if key == "report" then
+    -- (lane 61) the bug report: Coop.report() gathers it, the native piece zips it and opens its folder; the row says how it went
+    local ok, msg = pcall(function() return C.report and C.report() or "not available" end)
+    msg = ok and tostring(msg) or ("failed: " .. tostring(msg))
+    log("bug report button: %s", msg)
+    if msg:find("^making") then U.reportNote("Making the Bug Report...")
+    elseif msg:find("^a bug report is being made") then U.reportNote("A Bug Report Is Being Made")
+    elseif msg:find("without the native piece") then U.reportNote("Bug Report Saved (No Zip)")
+    else U.reportNote("Bug Report Failed") end
     return
   end
   if key == "copy" then local ok, msg = keepCopy(S); C.notify("info", msg); log("keep a copy: %s", msg); return end

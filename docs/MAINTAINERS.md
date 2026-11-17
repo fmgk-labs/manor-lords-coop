@@ -52,7 +52,7 @@ Repository **Issues** > **Labels** > **New label**.
 
 ## Handling a new issue
 
-1. Did they use the template? Are the log files there? If not: label `needs-logs` and ask for them.
+1. Did they use the template? Is the zip from **Make Bug Report** there (or, with no Co-op button, `UE4SS.log`)? If not: label `needs-logs` and ask for it.
 2. **Privacy first.** If a post shows a Windows user name, Steam names, Steam IDs or a crash record: edit the post to remove them, or hide it, and ask the person to send the files privately ([SECURITY.md](../SECURITY.md)).
 3. Is it in [KNOWN_ISSUES.md](KNOWN_ISSUES.md)? Then link it and close, or keep it open if it adds new numbers.
 4. A duplicate? Link the first issue and close.

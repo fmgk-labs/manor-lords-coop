@@ -1461,6 +1461,148 @@ static DWORD WINAPI l28_other_thread(void *arg)
     return 0;
 }
 
+/* ------------------------------------------------------------------ lane 61: REPORT, the bug report */
+static void rp_utf8(const wchar_t *w, char *out, int cap) { WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL); }
+static void rp_write(const wchar_t *path, const char *text) { FILE *f = _wfopen(path, L"wb"); if (f) { fputs(text, f); fclose(f); } }
+static void rp_rmdir(const wchar_t *dir)          /* the test's own report folder: its files, then the folder */
+{
+    wchar_t pat[MAX_PATH], p[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    _snwprintf(pat, MAX_PATH, L"%s*", dir);
+    h = FindFirstFileW(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do { if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) { _snwprintf(p, MAX_PATH, L"%s%s", dir, fd.cFileName); DeleteFileW(p); } } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryW(dir);
+}
+/* ticks until the status's REPORT line is no longer "running" (the report's own thread is done), at most 30 s */
+static int rp_wait(void)
+{
+    int i;
+    for (i = 0; i < 600; i++) { cmd("STATUS"); if (status_has("REPORT ") && !status_has("REPORT running")) return 1; Sleep(50); }
+    return 0;
+}
+static long long rp_size(const wchar_t *p) { WIN32_FILE_ATTRIBUTE_DATA a; if (!GetFileAttributesExW(p, GetFileExInfoStandard, &a)) return -1; return ((long long)a.nFileSizeHigh << 32) | a.nFileSizeLow; }
+
+static void test_report(void)
+{
+    opts_t o = { 1 };
+    img_t *m = build_image(&o);
+    wchar_t src1[MAX_PATH], src2[MAX_PATH], job[MAX_PATH], reports[MAX_PATH], d1[MAX_PATH], p[MAX_PATH], zip[MAX_PATH], oldUser[256], oldProf[MAX_PATH];
+    char s1[MAX_PATH * 3], s2[MAX_PATH * 3], text[4096];
+    const char *t;
+    FILE *f;
+    int i;
+    DWORD nu = GetEnvironmentVariableW(L"USERNAME", oldUser, 256), np = GetEnvironmentVariableW(L"USERPROFILE", oldProf, MAX_PATH);
+    /* a user name with a space and a profile folder in its short form (both are seen on real PCs) */
+    SetEnvironmentVariableW(L"USERNAME", L"Test Person");
+    SetEnvironmentVariableW(L"USERPROFILE", L"C:\\Users\\TESTPE~1");
+    _snwprintf(src1, MAX_PATH, L"%srp_src1.txt", g_exedir);
+    _snwprintf(src2, MAX_PATH, L"%srp_src2.txt", g_exedir);
+    _snwprintf(reports, MAX_PATH, L"%slink\\reports\\", g_exedir);
+    _snwprintf(d1, MAX_PATH, L"%sreport_r1-test\\", reports);
+    rp_rmdir(d1);
+    _snwprintf(p, MAX_PATH, L"%sreport_r2-test\\", reports); rp_rmdir(p);
+    _snwprintf(zip, MAX_PATH, L"%sreport_r2-test.zip", reports); DeleteFileW(zip);
+    rp_write(src1,
+        "a C:\\Users\\Real Name\\AppData\\Local\\x.txt b\r\n"
+        "c D:\\Games\\Test Person\\ManorLords and /c/users/Someone/y and D:\\Games\\test person\r\n"
+        "d C:\\Users\\TESTPE~1\\AppData e\r\n"
+        "f id 76561198012345678 end, 176561198012345678 stays, 7656119801234567 stays\r\n"
+        "g Wilhelmina joined; wilhelmina again; Bo stays\r\n");
+    f = _wfopen(src2, L"wb");
+    for (i = 0; i < 40000; i++) fprintf(f, "line %06d of a long log, nothing private in it ..........................\r\n", i);
+    fclose(f);
+    rp_utf8(src1, s1, sizeof(s1)); rp_utf8(src2, s2, sizeof(s2));
+
+    start("RP1: REPORT, folder only (zip 0): every copy scrubbed, a long file cut in the middle", m, NULL, NULL, NULL);
+    check(status_line("REPORT idle", 1), "status has 'REPORT idle' before any report");
+    check(GetFileAttributesW(reports) != INVALID_FILE_ATTRIBUTES, "the first tick made link\\reports (and link\\sessions) in the DLL's own folder");
+    _snwprintf(p, MAX_PATH, L"%slink\\sessions", g_exedir);
+    check(GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES, "link\\sessions is there");
+    _snwprintf(job, MAX_PATH, L"%spatch_report_job.txt", g_io);
+    _snprintf(text, sizeof(text), "open 0\nzip 0\nname Wilhelmina\tfriend 1\nname Bo\tfriend 2\nfile %s\tcopy1.txt\t0\nfile %s\tbig.txt\t1048576\nfile %s.none\tmissing.txt\t0\nfile %s\tfrom2.txt\t0\t%u\n",
+              s1, s2, s1, s1, (unsigned)strlen("a C:\\Users\\Real Name\\AppData\\Local\\x.txt b\r\n"));
+    rp_write(job, text);
+    cmd("REPORT r1-test");
+    check(rp_wait(), "the report's thread finished within 30 s");
+    if (!status_line("REPORT folder report_r1-test 3 no zip asked", 1)) printf("%s\n", read_file(g_status));
+    check(status_line("REPORT folder report_r1-test 3 no zip asked", 1), "status: folder kept, 3 files copied (the missing one skipped), not opened");
+    _snwprintf(p, MAX_PATH, L"%sfrom2.txt", d1);
+    t = read_file(p);
+    check(strncmp(t, "c D:\\Games\\<user>\\ManorLords", 28) == 0 && strstr(t, "Real Name") == NULL && strstr(t, "AppData\\Local\\x.txt") == NULL,
+          "a file asked from a byte on: the lines above it are left out (an earlier run's lines that could not be moved)");
+    _snwprintf(p, MAX_PATH, L"%scopy1.txt", d1);
+    t = read_file(p);
+    check(strstr(t, "a C:\\Users\\<user>\\AppData\\Local\\x.txt b") != NULL, "the folder after \\Users\\ is <user> (any name)");
+    check(strstr(t, "D:\\Games\\<user>\\ManorLords") != NULL && strstr(t, "D:\\Games\\<user>\r\n") != NULL, "USERNAME after a separator is <user>, also in another case and at the end of a line");
+    check(strstr(t, "/c/users/<user>/y") != NULL, "a / path with lower-case users is scrubbed too");
+    check(strstr(t, "d C:\\Users\\<user>\\AppData e") != NULL, "the short profile folder (TESTPE~1) is <user>");
+    check(strstr(t, "id <id..5678> end, 176561198012345678 stays, 7656119801234567 stays") != NULL, "a Steam id keeps its last 4 digits; a longer or shorter number stays");
+    check(strstr(t, "g friend 1 joined; friend 1 again; Bo stays") != NULL, "a Steam name (any case) becomes its slot; a name under 3 letters is left");
+    check(strstr(t, "Real Name") == NULL && strstr(t, "Test Person") == NULL && strstr(t, "Someone") == NULL && strstr(t, "Wilhelmina") == NULL, "none of the names is left in the copy");
+    _snwprintf(p, MAX_PATH, L"%sbig.txt", d1);
+    {
+        long long sz = rp_size(p), full = rp_size(src2);
+        t = read_file(p);
+        check(full > 3000000 && sz > 1000000 && sz < 1100000, "a 3 MB file with a 1 MB cap is cut to about 1 MB (%lld of %lld bytes)", sz, full);
+        check(strncmp(t, "line 000000 ", 12) == 0 && strstr(t, "MB of this file are left out here") != NULL, "its start is kept, then the note of what was left out");
+        f = _wfopen(p, L"rb");
+        if (f) { char tail[200] = { 0 }; size_t got; _fseeki64(f, -(long long)sizeof(tail) + 1, SEEK_END); got = fread(tail, 1, sizeof(tail) - 1, f); tail[got] = 0; fclose(f);
+                 check(strstr(tail, "line 039999 ") != NULL, "its end is kept (the last line)"); }
+        t = read_file(p);
+        {   const char *nt = strstr(t, "left out here");
+            const char *nl = nt ? strstr(nt, "...\r\n") : NULL;
+            check(nl && strncmp(nl + 5, "line ", 5) == 0, "the end starts at a whole line"); }
+    }
+    _snwprintf(p, MAX_PATH, L"%smissing.txt", d1);
+    check(GetFileAttributesW(p) == INVALID_FILE_ATTRIBUTES, "no file for a missing source");
+
+    start("RP2: REPORT, the zip (Windows' own tar.exe, no window); the folder goes", m, NULL, NULL, NULL);
+    _snprintf(text, sizeof(text), "open 0\nfile %s\tcopy1.txt\t0\nfile %s\tbig.txt\t1048576\n", s1, s2);
+    rp_write(job, text);
+    cmd("REPORT r2-test");
+    check(rp_wait(), "the report's thread finished within 30 s");
+    if (!status_line("REPORT done report_r2-test.zip 2", 1)) printf("%s\n", read_file(g_status));
+    check(status_line("REPORT done report_r2-test.zip 2", 1), "status: done, the zip's name, 2 files, not opened");
+    t = read_file(zip);
+    check(rp_size(zip) > 1000 && memcmp(t, "PK\x03\x04", 4) == 0, "report_r2-test.zip is a zip (%lld bytes)", rp_size(zip));
+    {   long long n = rp_size(zip); int found1 = 0, found2 = 0; long long k;
+        for (k = 0; k + 9 < n && k < (long long)sizeof(g_buf) - 10; k++) { if (memcmp(g_buf + k, "copy1.txt", 9) == 0) found1 = 1; if (memcmp(g_buf + k, "big.txt", 7) == 0) found2 = 1; }
+        check(found1 && found2, "the zip names copy1.txt and big.txt"); }
+    _snwprintf(p, MAX_PATH, L"%sreport_r2-test", reports);
+    check(GetFileAttributesW(p) == INVALID_FILE_ATTRIBUTES, "the folder the zip was made of is removed");
+    t = read_file(g_log);
+    check(strstr(t, "REPORT done report_r2-test.zip 2") != NULL, "coop_patch.log has the result line");
+
+    start("RP3: REPORT refusals; the DLL's own log lines are scrubbed", m, NULL, NULL, NULL);
+    cmd("REPORT ../up");
+    check(status_line("REPORT refused - needs REPORT <stamp>", 0), "a stamp with a path in it is refused");
+    _snprintf(text, sizeof(text), "open 0\nzip 0\nfile %s\t..\\..\\evil.txt\t0\n", s1);
+    rp_write(job, text);
+    cmd("REPORT r3-test");
+    check(status_line("REPORT refused report_r3-test a file name in the job is not a plain name", 1), "a copy name with a path in it refuses the whole job");
+    _snwprintf(p, MAX_PATH, L"%sreport_r3-test", reports);
+    check(GetFileAttributesW(p) == INVALID_FILE_ATTRIBUTES, "and no folder was made for it");
+    _snprintf(text, sizeof(text), "open 0\nzip 0\nfile %s\tcopy1.txt\t0\n", s1);
+    rp_write(job, text);
+    CreateDirectoryW(d1, NULL);
+    cmd("REPORT r1-test");
+    check(status_line("REPORT refused report_r1-test a report of that name is there already", 1), "a report of a name that is there already is refused (nothing overwritten)");
+    cmd("STATUS C:\\Users\\Real Name\\x and D:\\Games\\Test Person\\y");
+    t = read_file(g_log);
+    check(strstr(t, "command: STATUS C:\\Users\\<user>\\x and D:\\Games\\<user>\\y") != NULL && strstr(t, "Real Name") == NULL && strstr(t, "Test Person") == NULL,
+          "coop_patch.log: a path in a logged line has <user> in place of the user name");
+
+    rp_rmdir(d1);
+    DeleteFileW(zip); DeleteFileW(src1); DeleteFileW(src2); DeleteFileW(job);
+    SetEnvironmentVariableW(L"USERNAME", nu ? oldUser : NULL);
+    SetEnvironmentVariableW(L"USERPROFILE", np ? oldProf : NULL);
+}
+
+
 int main(void)
 {
     wchar_t dll[MAX_PATH], cfg[MAX_PATH];
@@ -3998,6 +4140,7 @@ int main(void)
         check(status_line("ENDHOLD unavailable SETTASK signature has 0 hits", 0), "ENDHOLD unavailable without setTask");
     }
 
+    test_report();                              /* lane 61 */
     printf("\nRESULT: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

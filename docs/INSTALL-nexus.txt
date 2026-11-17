@@ -77,6 +77,6 @@ PROBLEMS
 - "A player's co-op mod version differs": someone has another version. Everyone installs the same one.
 - After a game update the mod's own memory changes switch themselves off until a new version of the mod is out.
 - Please do NOT report bugs to the game's developer while you use mods. Report them on the mod page instead.
-- For a bug report, send these files:
-    ue4ss\UE4SS.log
-    ue4ss\Mods\ManorLordsCoop\link\  (the files ending in _log.txt)
+- For a bug report: open the Co-op menu (title screen: the Co-op button; in a game: Esc, then Co-op) and press
+  Make Bug Report. A folder opens with report_<date>_<time>.zip: send that zip. After a crash, start the game again
+  and press it at the title screen: the crashed session is kept. The zip has no Windows user name or Steam names.

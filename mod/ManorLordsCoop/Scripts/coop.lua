@@ -8,7 +8,7 @@
 
 local C = rawget(_G, "Coop") or {}
 _G.Coop = C
-C.version = "0.2.1"
+C.version = "0.2.2"
 
 -- where the link files live: set by main.lua to "<this mod's folder>/link/"; the development console uses the probe's folder
 local LINK = rawget(_G, "COOP_LINK_DIR")
@@ -42,30 +42,197 @@ local function words(line) local w = {}; for x in line:gmatch("%S+") do w[#w + 1
 -- (lane 47) the log file stays open: an open, append and close cost 160 us a line (lane 47, sitting b1: x47_probe.lua
 -- "chan"), a write and flush on a kept handle 5 us. Opened again every 5 s and whenever the name changes, so a file
 -- that was removed or emptied elsewhere is written again as before.
-local LOGF = { f = nil, path = nil, t = -1e9 }
+local LOGF = { f = nil, path = nil, t = -1e9, size = 0 }
 local function logFile(path)
   local t = os.clock()
   if LOGF.f and LOGF.path == path and t - LOGF.t < 5.0 then return LOGF.f end
   if LOGF.f then pcall(io.close, LOGF.f); LOGF.f = nil; LOGF.path = nil end
   local f = io.open(path, "ab")
-  if f then LOGF.f, LOGF.path, LOGF.t = f, path, t end
+  if f then LOGF.f, LOGF.path, LOGF.t = f, path, t; LOGF.size = f:seek("end") or 0 end    -- (lane 61) the size, for the cap
   return f
 end
 C.logClose = function() if LOGF.f then pcall(io.close, LOGF.f) end; LOGF.f = nil; LOGF.path = nil end
-local function log(fmt, ...)
+
+-- (lane 61) SESSIONS. A session is one run of the game (this process). Each name this copy writes a log under (idle,
+-- host, friend1 ...) is turned over the first time this run writes it: the file an earlier run left, <name>_log.txt,
+-- moves to link\sessions\<name>_<the time of its first line, YYYY-MM-DD_HH-MM-SS>.txt and the newest 5 per name are kept
+-- (link\sessions\<name>_index.txt lists them, oldest first). So the log of a run that crashed is still there after the
+-- next start, also when this run never becomes host again. The current file keeps its name (the test scripts read
+-- <name>_log.txt). The sessions folder is made by the native piece at its first tick (Lua cannot make a folder without
+-- a console window): while it is missing, nothing is moved and the run goes on in the same file.
+-- HEADER: a session's file starts with "session:" lines (mod version, the run and its start, role, UE4SS); the game's
+-- version, the role, the players connected (a count, never names) and the save follow as "session:" lines when known.
+-- SIZE CAP: past C.logCapMB (200, or COOP_LOG_CAP_MB) a session's file takes only warnings, faults and "session:" lines,
+-- and once a minute a line that counts the lines left out.
+-- PRIVACY: every line is scrubbed before it is written, with the rules of the native piece (native\coop_patch\
+-- coop_scrub.h): a folder after \Users\ and the Windows user name after a separator become <user>, Steam display names
+-- (3 letters or more) their slot ("friend 1"), a Steam id keeps its last 4 digits. Notices drop display names of any length.
+local MODDIR = (debug.getinfo(1, "S").source:gsub("^@", ""):gsub("\\", "/")):match("^(.*)/Scripts/[^/]*$") or "."
+local SESS = rawget(C, "sess") or { names = {}, keep = 5 }
+C.sess = SESS
+C.runT = C.runT or os.time()                                -- this run's start (the first load of this file in the process)
+C.logCapMB = C.logCapMB or tonumber(os.getenv("COOP_LOG_CAP_MB") or "") or 200
+C.reportLogCap = C.reportLogCap or 12 * 1048576             -- per log in a bug report: its start and its end past this (logs zip about 7:1; Discord takes 10 MB)
+local function fexists(p) local f = io.open(p, "rb"); if f then f:close(); return true end; return false end
+local function firstLine(p)
+  local f = io.open(p, "rb"); if not f then return nil, 0 end
+  local size = f:seek("end") or 0
+  if size == 0 then f:close(); return nil, 0 end
+  f:seek("set", 0); local l = f:read("l"); f:close()
+  return l, size
+end
+-- a log's first line: its time (s since 1970; every line starts with it) and the run named in its header (nil before 0.2.2)
+local function logStart(l)
+  if not l then return nil end
+  return tonumber(l:match("^(%d+)%.%d+ ") or ""), tonumber(l:match("^%S+ session: .- run (%d+)") or "")
+end
+local function rotate(name)
+  SESS.names[name] = true
+  local cur = LINK .. name .. "_log.txt"
+  local l, size = firstLine(cur)
+  if size == 0 then return end
+  local t = logStart(l)
+  if not t or t < 1000000000 then t = os.time() end
+  local dir = LINK .. "sessions/"
+  local base = name .. "_" .. os.date("%Y-%m-%d_%H-%M-%S", t)
+  local file = base .. ".txt"
+  for k = 2, 99 do if not fexists(dir .. file) then break end; file = base .. "_" .. k .. ".txt" end
+  if LOGF.path == cur then C.logClose() end
+  if not os.rename(cur, dir .. file) then                -- (no sessions folder): this run goes on below the last one's lines
+    SESS.notMoved = name; SESS.from = SESS.from or {}; SESS.from[name] = size  -- a bug report takes this run's part only
+    return
+  end
+  local idx, list = dir .. name .. "_index.txt", {}
+  local f = io.open(idx, "rb")
+  if f then
+    for x in f:lines() do
+      x = x:gsub("%s+$", "")
+      if x ~= file and x:sub(1, #name + 1) == name .. "_" and x:match("^[%w_%-]+%.txt$") and not x:match("_index%.txt$") then list[#list + 1] = x end
+    end
+    f:close()
+  end
+  list[#list + 1] = file
+  while #list > SESS.keep do os.remove(dir .. table.remove(list, 1)) end      -- only files this list named
+  f = io.open(idx, "wb"); if f then f:write(table.concat(list, "\n"), "\n"); f:close() end
+  SESS.moved = (SESS.moved or 0) + 1
+end
+
+-- privacy (see above)
+local PRIV = { t = -10, names = {} }
+local function ciPat(s)                         -- a plain text as a Lua pattern, letters in either case
+  return (s:gsub("[%a%p]", function(c) if c:match("%a") then return "[" .. c:lower() .. c:upper() .. "]" end; return "%" .. c end))
+end
+local function userNames()
+  if PRIV.users then return PRIV.users end
+  local u = {}
+  local function add(n) if n and n ~= "" then u[#u + 1] = { low = n:lower(), pat = "([\\/])" .. ciPat(n) } end end
+  add(os.getenv("USERNAME"))
+  local prof = (os.getenv("USERPROFILE") or ""):gsub("[\\/]+$", "")
+  local leaf = prof:match("[\\/]([^\\/]+)$")
+  if leaf and leaf:lower() ~= (os.getenv("USERNAME") or ""):lower() then add(leaf) end
+  PRIV.users = u
+  return u
+end
+local function slotName(slot) slot = tostring(slot); if slot == "0" or slot == "host" then return "host" end; return ((slot:gsub("^friend", "")):gsub("^(%d+)$", "friend %1")) end
+-- Steam display names this copy knows (the host's player list, the Steam status), longest first; read at most every 2 s
+local function steamNames()
+  local t = os.clock()
+  local S = C.s
+  local disp = S and S.display
+  if t - PRIV.t < 2.0 and disp == PRIV.disp then return PRIV.names end     -- (the host's list is a new table when it changes)
+  PRIV.t = t; PRIV.disp = disp
+  local list = {}
+  if S and S.display then for slot, nm in pairs(S.display) do if type(nm) == "string" and #nm >= 3 then list[#list + 1] = { nm, slotName(slot) } end end end
+  local st = rawget(C, "steam")
+  if st and st.on and st.status then
+    local ok, s = pcall(st.status)
+    if ok and s and s.players then for _, p in ipairs(s.players) do if type(p.name) == "string" and #p.name >= 3 then list[#list + 1] = { p.name, slotName(p.slot or "?") } end end end
+  end
+  table.sort(list, function(a, b) return #a[1] > #b[1] end)
+  for _, e in ipairs(list) do e.low = e[1]:lower(); e.pat = ciPat(e[1]); e.to = e[2]:gsub("%%", "%%%%") end
+  PRIV.names = list
+  return list
+end
+local function scrub(line)
+  if line:find("[Uu][Ss][Ee][Rr][Ss][\\/]") then line = line:gsub("([\\/][Uu][Ss][Ee][Rr][Ss][\\/])[^\\/\r\n\"']+([\\/])", "%1<user>%2") end
+  local low
+  for _, u in ipairs(userNames()) do
+    low = low or line:lower()
+    if low:find(u.low, 1, true) then line = line:gsub(u.pat, "%1<user>"); low = nil end
+  end
+  for _, e in ipairs(steamNames()) do
+    low = low or line:lower()
+    if low:find(e.low, 1, true) then line = line:gsub(e.pat, e.to); low = nil end
+  end
+  if line:find("7656119", 1, true) then line = line:gsub("%f[%d]7656119%d%d%d%d%d%d(%d%d%d%d)%f[%D]", "<id..%1>") end
+  return line
+end
+C.scrub = scrub
+local function plainReplace(s, from, to)
+  local out, i = {}, 1
+  while true do
+    local a, b = s:find(from, i, true)
+    if not a then break end
+    out[#out + 1] = s:sub(i, a - 1); out[#out + 1] = to; i = b + 1
+  end
+  out[#out + 1] = s:sub(i)
+  return table.concat(out)
+end
+
+local function ue4ssVersion()
+  if SESS.ue4ss then return SESS.ue4ss end
+  SESS.ue4ss = "not read"
+  local f = io.open(MODDIR .. "/../../UE4SS.log", "rb")
+  if f then
+    local head = f:read(4096) or ""; f:close()
+    local v, sha = head:match("UE4SS %- (v[^\r\n]-) %- Git SHA #(%x+)")
+    if v then SESS.ue4ss = v .. ", git " .. sha end
+  end
+  return SESS.ue4ss
+end
+local function header(name)
+  local S = C.s
+  local t = string.format("%.3f", now())
+  return t .. string.format(" session: Manor Lords Co-op %s, log of %s, run %d started %s (this PC's clock)\n", C.version, name, C.runT, os.date("%Y-%m-%d %H:%M:%S", C.runT))
+      .. t .. string.format(" session: role %s, game version %s, UE4SS %s, earlier logs in link\\sessions (newest %d per name), log size cap %s MB%s\n",
+           tostring(S and S.role), SESS.gameVer or "read later", ue4ssVersion(), SESS.keep, tostring(C.logCapMB),
+           SESS.notMoved == name and " (the last run's log could not be moved: it is above this line)" or "")
+end
+local KEEPW = { "error", "fail", "warn", "crash", "watchdog", "refus", "fault", "exception", "session:", "bug report" }
+local function keepPastCap(line)
+  local l = line:lower()
+  for _, w in ipairs(KEEPW) do if l:find(w, 1, true) then return true end end
+  return false
+end
+
+local function logBody(fmt, ...)
   local S = C.s; if not S then return end
   local ok, msg = pcall(string.format, fmt, ...)
+  local name = S.name
+  if not SESS.names[name] then pcall(rotate, name); SESS.hdr = name end      -- (lane 61) this run's first line of this name
   local line = string.format("%.3f %s\n", now(), ok and msg or fmt)
-  local f = logFile(LINK .. S.name .. "_log.txt")
+  local okS, sl = pcall(scrub, line); if okS then line = sl end
+  local f = logFile(LINK .. name .. "_log.txt")
   if f then
-    if C.early then f:write(table.concat(C.early)); C.early = nil end
+    if SESS.hdr == name then SESS.hdr = nil; local h = header(name); f:write(h); LOGF.size = LOGF.size + #h end
+    if C.early then local e = table.concat(C.early); f:write(e); LOGF.size = LOGF.size + #e; C.early = nil end
+    if LOGF.size > C.logCapMB * 1048576 and not keepPastCap(line) then        -- (lane 61) the size cap
+      SESS.dropped = (SESS.dropped or 0) + 1
+      local t = os.clock()
+      if t - (SESS.dropT or -1e9) < 60.0 then return end
+      SESS.dropT = t
+      line = string.format("%.3f log size cap %s MB reached: %d line(s) left out since the last such line; only warnings, faults and session lines are written\n", now(), tostring(C.logCapMB), SESS.dropped)
+      SESS.dropped = 0
+    end
     if not f:write(line) then C.logClose()
-    else f:flush() end
+    else f:flush(); LOGF.size = LOGF.size + #line end
   else
     C.early = C.early or {}
     if #C.early < 300 then C.early[#C.early + 1] = line end
   end
 end
+-- (lane 61) a fault in the log's own steps (turnover, scrub, cap) never reaches the caller (a module's step)
+local function log(fmt, ...) pcall(logBody, fmt, ...) end
 
 local function later(dt, fn) local S = C.s; S.later[#S.later + 1] = { t = os.clock() + dt, fn = fn } end
 
@@ -2502,7 +2669,10 @@ function C.notify(kind, text)
   local n = { kind = kind, text = text, t = os.clock() }
   C.notices[#C.notices + 1] = n
   if #C.notices > 50 then table.remove(C.notices, 1) end
-  log("notice [%s] %s", tostring(kind), tostring(text))
+  -- (lane 61) the log gets the slot ("friend 1"), never the Steam name the player sees (also a name under 3 letters)
+  local lt = tostring(text); local S = C.s
+  if S and S.display then for slot, nm in pairs(S.display) do if type(nm) == "string" and nm ~= "" then lt = plainReplace(lt, nm, slotName(slot)) end end end
+  log("notice [%s] %s", tostring(kind), lt)
   local show = rawget(C, "onNotice"); if type(show) == "function" then pcall(show, n) end
 end
 
@@ -2644,6 +2814,8 @@ function C.tick()
   local ok, e = pcall(body)
   FR.p1 = false; FR.eng = false
   if not ok then S.nerr = S.nerr + 1; S.lastErr = tostring(e); if S.nerr <= 5 then log("tick error %d: %s", S.nerr, tostring(e)) end end
+  pcall(C.sessionStep, S)                                    -- (lane 61) "session:" lines (every 2 s at most)
+  if SESS.rep then pcall(C.reportStep) end                   -- (lane 61) a bug report the native piece is making
   dv = K.step.dev
   local ms, kb1 = (os.clock() - t0) * 1000 - ((dv and dv.ms or 0) - dev0), collectgarbage("count")
   if ms > 8 then                                             -- a long tick: what it was (a ring of the last 40)
@@ -2662,11 +2834,214 @@ function C.tick()
   WD.ms, WD.fName, WD.fMax, WD.dev, WD.gc, WD.te = ms, K.fName, K.fMax, (dv and dv.ms or 0) - dev0, kb1 < kb0, os.clock()   -- (lane 51)
   if t0 - K.wT >= 60 then C.costLine(t0) end
   -- lines kept while the link folder was missing: write them as soon as it is there (about once a second)
-  if C.early and S.ticks % 60 == 0 then
+  if C.early and S.ticks % 60 == 0 and not SESS.hdr then          -- (lane 61) a pending header goes first, with the next line
     local f = logFile(LINK .. S.name .. "_log.txt")            -- (lane 47) the kept handle
     if f then f:write(table.concat(C.early)); C.early = nil; f:flush() end
   end
   S.busy = false
+end
+
+-- ---------------------------------------------------------------- (lane 61) session lines and the bug report
+local function playersText(S)
+  if S.role == "host" then
+    local n = 0
+    for _, p in ipairs(S.peers or {}) do local h = S.heard and S.heard[p]; if h and os.clock() - h < 10.0 then n = n + 1 end end
+    return string.format("%d (the host and %d friend%s)", n + 1, n, n == 1 and "" or "s")
+  elseif S.role == "friend" then
+    if C.hold then return "joining the host" end
+    local h = S.heard and S.heard.host                       -- (when the host last sent anything)
+    return (h and os.clock() - h < 10.0) and "the host and this friend (other friends are not counted here)" or "the host not heard for 10 s"
+  end
+  return "none (not in a co-op game)"
+end
+local function saveName(S)
+  local J = rawget(C, "join")
+  if S.role == "friend" and J and J.lastLoaded then return J.lastLoaded .. " (the host's save, as loaded for the join)" end
+  if not valid(S.eng) then return "none (no world)" end
+  if not valid(SESS.gi) then SESS.gi = FindFirstOf("MLGameInstance") end
+  local nm; pcall(function() nm = SESS.gi.savefileToLoad:ToString() end)
+  if not nm or nm == "" then return "a new game, or not known" end
+  return nm
+end
+-- every 2 s on the game thread (C.tick): the game's version once, and a "session:" line whenever the role, the players
+-- connected or the save changed
+function C.sessionStep(S)
+  local t = os.clock()
+  if t - (SESS.stepT or -10) < 2.0 then return end
+  SESS.stepT = t
+  if not SESS.gameVer and t - (SESS.verT or -100) > 10.0 then
+    SESS.verT = t
+    local ok, v = pcall(function() local gi = FindFirstOf("MLGameInstance"); if valid(gi) then SESS.gi = gi; return gi:GetDisplayAppVersion():ToString() end end)
+    if ok and type(v) == "string" and v ~= "" then SESS.gameVer = v; log("session: game version %s", v) end
+  end
+  local p, sv = playersText(S), saveName(S)
+  local key = tostring(S.role) .. "|" .. tostring(S.name) .. "|" .. p .. "|" .. sv
+  if key ~= SESS.infoKey then SESS.infoKey = key; log("session: role %s (%s), players connected %s, save %s", tostring(S.role), tostring(S.name), p, sv) end
+end
+
+-- Coop.report(): the "Make Bug Report" button (coop_ui.lua) calls it. It gathers what a bug report needs, with the
+-- native piece (coop_patch.dll, coop_report.h) copying it scrubbed into link\reports\report_<time>.zip and opening that
+-- folder in Explorer:
+--   this run's log of every name this copy wrote this run, and every log of the run before (newest run only; a run can
+--   have an idle and a host part); patch_status.txt, coop_patch.log (and .old), the loader's UE4SS.log; report_info.txt
+--   (versions, role, players connected, save, the files, and "Describe the problem here:" for the player).
+-- "This copy": the names it wrote this run; on a player's install (a run that started idle: one copy per folder) also
+-- every other name's log in the link folder. Logs past C.reportLogCap (12 MB) keep their start and end.
+-- Without the native piece (coop.cfg native = off) the files are written scrubbed, without a zip, as
+-- link\reports\report_<time>_<file> and nothing is opened. Test switch: link\dev_report_noopen.txt (no Explorer).
+local NAMES_ALL = { "idle", "host", "friend1", "friend2", "friend3", "friend4", "friend5", "friend6", "friend7" }
+local function reportInfo(S, files, old)
+  local P = rawget(C, "patch")
+  local st = (P and P.fn and P.status) and P.status() or nil
+  local steam = rawget(C, "steam")
+  local okS, ss = pcall(function() return steam and steam.on and steam.status and steam.status() or nil end)
+  ss = okS and ss or nil
+  local L = {
+    "Manor Lords Co-op bug report",
+    "Made:              " .. os.date("%Y-%m-%d %H:%M:%S") .. " (this PC's clock)",
+    "Mod version:       " .. tostring(C.version),
+    "Game version:      " .. (SESS.gameVer or "not read"),
+    "UE4SS:             " .. ue4ssVersion(),
+    "Native piece:      " .. (st and (tostring(st.state) .. ", version " .. tostring(st.text and st.text:match("version (%S+)") or "?")) or "not loaded"),
+    "Role:              " .. tostring(S.role) .. " (" .. tostring(S.name) .. ")",
+    "Players connected: " .. playersText(S),
+    "Save:              " .. saveName(S),
+    "This run started:  " .. os.date("%Y-%m-%d %H:%M:%S", C.runT),
+    "Steam link:        " .. (ss and (tostring(ss.state) .. (ss.slot and (", slot " .. ss.slot) or "") .. ", " .. #(ss.players or {}) .. " player(s) in the lobby") or "off"),
+    "Resyncs and errors: " .. string.format("%d tick error(s) this run", S.nerr or 0),
+    (old or 0) > 0 and string.format("Left out:          %d log(s) from before 0.2.2 (they may hold Steam names)", old) or "Left out:          none",
+    "",
+    "Files in this report:",
+    "  report_info.txt  this file",
+  }
+  for _, e in ipairs(files) do L[#L + 1] = string.format("  %s  %s", e[2], e[4] or "") end
+  L[#L + 1] = ""
+  L[#L + 1] = "Describe the problem here:"
+  L[#L + 1] = "(What happened? What did you expect? What did you do just before? The time on your PC's clock.)"
+  L[#L + 1] = ""
+  return table.concat(L, "\r\n")
+end
+
+function C.reportShow(msg, label)
+  C.notify("info", msg)
+  local U = rawget(C, "ui"); if U and U.reportNote then pcall(U.reportNote, label or msg) end
+end
+
+function C.report(opts)
+  opts = opts or {}
+  local S = C.s; if not S then return "the mod is not started" end
+  local R = SESS.rep
+  if R and os.clock() - R.t < 180.0 then return "a bug report is being made: report_" .. R.stamp end
+  local stamp = os.date("%Y-%m-%d_%H-%M-%S")
+  local files = {}
+  local function add(src, dst, cap, note, start) if src and fexists(src) then files[#files + 1] = { src, dst, cap or 0, note, start or 0 } end end
+  -- a log's run (its header's) and start; a log without a 0.2.2 header is left out: it may hold Steam names (0.2.1 wrote them)
+  local old = 0
+  local function at(l) local t, run = logStart(l); return run, t and os.date("%Y-%m-%d %H:%M:%S", math.floor(t)) or "?" end
+  local cand, names = {}, {}
+  for n in pairs(SESS.names) do cand[n] = "used" end
+  if C.startRole == "idle" then for _, n in ipairs(NAMES_ALL) do cand[n] = cand[n] or "other" end end
+  for n in pairs(cand) do names[#names + 1] = n end
+  table.sort(names)
+  local prev = {}
+  for _, n in ipairs(names) do
+    local cur = LINK .. n .. "_log.txt"
+    local l = firstLine(cur)
+    if l and cand[n] == "used" then
+      local from = SESS.from and SESS.from[n] or 0       -- (an earlier run's lines above, when they could not be moved: left out)
+      add(cur, "current_" .. n .. "_log.txt", C.reportLogCap, "this run's log as " .. n .. (from > 0 and " (its own part only)" or ""), from)
+    elseif l then local key, when = at(l); if key then prev[#prev + 1] = { cur, key, n .. "_log.txt", when } else old = old + 1 end end
+    local idx = io.open(LINK .. "sessions/" .. n .. "_index.txt", "rb")
+    if idx then
+      local last
+      for x in idx:lines() do x = x:gsub("%s+$", ""); if x:match("^[%w_%-]+%.txt$") then last = x end end
+      idx:close()
+      local pl = last and firstLine(LINK .. "sessions/" .. last)
+      if pl then local key, when = at(pl); if key then prev[#prev + 1] = { LINK .. "sessions/" .. last, key, last, when } else old = old + 1 end end
+    end
+  end
+  local best = 0
+  for _, e in ipairs(prev) do if e[2] < C.runT and e[2] > best then best = e[2] end end
+  for _, e in ipairs(prev) do if best > 0 and e[2] == best then add(e[1], "previous_" .. e[3], C.reportLogCap, "the run before (started " .. e[4] .. ")") end end
+  local P = rawget(C, "patch")
+  if P and P.statusPath and P.dir then
+    add(P.statusPath, "patch_status.txt", 0, "the native piece's status")
+    add(P.dir .. "coop_patch.log", "coop_patch.log", 8 * 1048576, "the native piece's log")
+    add(P.dir .. "coop_patch.log.old", "coop_patch.log.old", 8 * 1048576, "its log before (it turns over at 256 KB)")
+  end
+  add(MODDIR .. "/../../UE4SS.log", "UE4SS.log", 8 * 1048576, "the mod loader's log")
+  local info = reportInfo(S, files, old)
+  local list = {}; for i, e in ipairs(files) do list[i] = e[2] end
+  if P and P.fn and P.dir and P.send then
+    local ip = P.dir .. "patch_report_info.txt"
+    local f = io.open(ip, "wb"); if f then f:write(info); f:close() end
+    table.insert(files, 1, { ip, "report_info.txt", 0 })
+    local J = { "open " .. ((opts.open == false or fexists(LINK .. "dev_report_noopen.txt")) and "0" or "1"), "zip " .. (opts.zip == false and "0" or "1") }
+    PRIV.t = -10
+    for _, e in ipairs(steamNames()) do J[#J + 1] = "name " .. (e[1]:gsub("[\t\r\n]", " ")) .. "\t" .. e[2] end
+    for _, e in ipairs(files) do J[#J + 1] = "file " .. (e[1]:gsub("/", "\\")) .. "\t" .. e[2] .. "\t" .. string.format("%d\t%d", math.floor(e[3]), math.floor(e[5] or 0)) end
+    local jf = io.open(P.dir .. "patch_report_job.txt", "wb")
+    if not jf then return "the bug report could not be started (the job file could not be written)" end
+    jf:write(table.concat(J, "\n"), "\n"); jf:close()
+    SESS.rep = { stamp = stamp, t = os.clock() }
+    P.send("REPORT " .. stamp); P.tick()
+    log("bug report: report_%s asked, %d files: report_info.txt, %s", stamp, #files, table.concat(list, ", "))
+    return "making the bug report: link\\reports\\report_" .. stamp .. ".zip"
+  end
+  -- no native piece: the files themselves, scrubbed here, without a zip (shorter: Lua reads them whole)
+  local dir = LINK .. "reports/"
+  local pre = "report_" .. stamp .. "_"
+  local o = io.open(dir .. pre .. "report_info.txt", "wb")
+  if not o then dir = LINK; o = io.open(dir .. pre .. "report_info.txt", "wb") end
+  if not o then return "the bug report could not be written" end
+  o:write(scrub(info)); o:close()
+  local n = 1
+  for _, e in ipairs(files) do
+    local f = io.open(e[1], "rb")
+    if f then
+      local size = f:seek("end") or 0
+      local base = math.min(e[5] or 0, size)
+      local cap = math.min(e[3] > 0 and e[3] or size, 4 * 1048576)
+      local text
+      if size - base <= cap then f:seek("set", base); text = f:read("a") or ""
+      else
+        local head = math.floor(cap / 4)
+        f:seek("set", base); local a = f:read(head) or ""
+        f:seek("set", size - (cap - head)); local b = (f:read("a") or ""):gsub("^[^\n]*\n", "")
+        text = a .. "\r\n... the middle of this file is left out here (the bug report keeps its start and its end) ...\r\n" .. b
+      end
+      f:close()
+      local w = io.open(dir .. pre .. e[2], "wb"); if w then w:write(scrub(text)); w:close(); n = n + 1 end
+    end
+  end
+  log("bug report: report_%s written without the native piece: %d files in link%s", stamp, n, dir == LINK and "" or "\\reports")
+  C.reportShow("Bug report saved in the mod's link\\reports folder", "Bug Report Saved (No Zip)")
+  return string.format("bug report written without the native piece (no zip): %d files report_%s_* in link%s", n, stamp, dir == LINK and "" or "\\reports")
+end
+
+-- every tick (cheap): the native piece's answer to the report
+function C.reportStep()
+  local R = SESS.rep; if not R then return end
+  local t = os.clock()
+  if t - (R.chk or 0) < 0.5 then return end
+  R.chk = t
+  local P = rawget(C, "patch")
+  local st = P and P.status and P.status()
+  local it = st and st.items and st.items.REPORT
+  local why = it and it.why or ""
+  local mine = why:find("report_" .. R.stamp, 1, true) ~= nil
+  local done = it and mine and (it.state == "done" or it.state == "folder" or it.state == "refused") and it.state or nil
+  if not done then
+    if t - R.t > 180.0 then SESS.rep = nil; log("bug report: report_%s did not finish within 180 s", R.stamp); C.reportShow("The bug report did not finish", "Bug Report Failed") end
+    return
+  end
+  SESS.rep = nil
+  SESS.lastReport = done .. " " .. why
+  log("bug report: %s %s", done, why)
+  local opened = why:find(" opened", 1, true) ~= nil
+  if done == "done" then C.reportShow("Bug report saved: " .. (why:match("^(%S+)") or "") .. (opened and " (its folder is open)" or ""), opened and "Bug Report Saved (Folder Opened)" or "Bug Report Saved")
+  elseif done == "folder" then C.reportShow("Bug report saved as a folder: " .. (why:match("^(%S+)") or ""), "Bug Report Saved (Folder)")
+  else C.reportShow("The bug report could not be made", "Bug Report Failed") end
 end
 
 -- lane 45: the minute line, "cost: <frames> frames: mod <ms a frame> ms a frame, longest <ms> ...", then per step (the
@@ -2705,7 +3080,8 @@ function C.start(role, name, peers, cfg)
   for _, p in ipairs(others) do C.s.readers[p] = readerAtEnd(p) end      -- (at the end of the newest file of its chain)
   linkReset(C.s, C.s.name)                                              -- this copy's own lines start afresh
   C.logClose()                                                          -- (lane 47) the kept log handle first
-  local f = io.open(LINK .. C.s.name .. "_log.txt", "wb"); if f then f:close() end
+  -- (lane 61) the log is no longer emptied here: the first line of this run moves the last run's file to link\sessions
+  C.startRole = C.startRole or role                                    -- (a run started "idle" is a player's own install)
   local mode
   if rawget(_G, "EngineTickAvailable") and rawget(_G, "LoopInGameThreadAfterFrames") then C.handle = LoopInGameThreadAfterFrames(1, function() _G.Coop.tick() end); mode = "every frame"
   else C.handle = LoopInGameThreadWithDelay(10, function() _G.Coop.tick() end); mode = "every 10 ms" end
@@ -2734,6 +3110,7 @@ function C.setRole(role, name, peers)
   C.hold = (role == "friend")
   if C.join then C.join.helloFor = nil; C.join.holdT = (role == "friend") and os.clock() or nil; C.join.loading = nil end
   log("role is now %s (%s)", role, S.name)
+  SESS.infoKey = nil                            -- (lane 61) a "session:" line with the role, players and save follows
   if role ~= "friend" and C.patch and C.patch.fn and C.patch.send then pcall(C.patch.send, "ALLOFF") end
   return "role " .. role
 end
