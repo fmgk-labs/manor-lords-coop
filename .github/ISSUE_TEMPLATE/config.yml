@@ -1,9 +1,9 @@
-# Replace <DISCORD_INVITE> with the real invite link before the repository goes public.
+# Replace https://discord.gg/cK9HzVxzaY with the real invite link before the repository goes public.
 # GitHub refuses a contact link whose url is not a real URL.
 blank_issues_enabled: false
 contact_links:
   - name: Questions and help (Discord)
-    url: <DISCORD_INVITE>
+    url: https://discord.gg/cK9HzVxzaY
     about: Install help, how to play, finding people to play with. Please ask questions there, not as an issue.
   - name: Known issues
     url: https://github.com/fmgk-labs/manor-lords-coop/blob/HEAD/docs/KNOWN_ISSUES.md

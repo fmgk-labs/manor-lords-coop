@@ -7,7 +7,7 @@ Report them here:
 
 | Where | Link |
 |---|---|
-| Discord, channel **#bug-reports** (crashes: **#crash-reports**) | `<DISCORD_INVITE>` |
+| Discord, channel **#bug-reports** (crashes: **#crash-reports**) | `https://discord.gg/cK9HzVxzaY` |
 | GitHub issues | https://github.com/fmgk-labs/manor-lords-coop/issues |
 | Nexus Mods, Bugs tab | `<NEXUS_PAGE>` |
 

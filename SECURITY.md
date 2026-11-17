@@ -29,7 +29,7 @@ Use one of these. **Do not open a public issue.**
 
 1. GitHub: the repository's **Security** tab > **Report a vulnerability**: https://github.com/fmgk-labs/manor-lords-coop/security
 2. E-mail or message: **`<CONTACT>`**
-3. Discord: a direct message to a moderator on `<DISCORD_INVITE>`.
+3. Discord: a direct message to a moderator on `https://discord.gg/cK9HzVxzaY`.
 
 Say what you found, how to make it happen, and which version. We answer as soon as we can, fix it, and name you in the release notes if you want.
 

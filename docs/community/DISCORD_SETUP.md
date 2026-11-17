@@ -8,7 +8,7 @@ Replace these before you post anything.
 
 | Placeholder | Put in |
 |---|---|
-| `<DISCORD_INVITE>` | the server's permanent invite link |
+| `https://discord.gg/cK9HzVxzaY` | the server's permanent invite link |
 | `<NEXUS_PAGE>` | the mod's Nexus Mods page |
 | `<RELEASE_DATE>` | the date 0.2.1 goes public |
 
@@ -36,7 +36,7 @@ The GitHub links are already filled in: the repository is https://github.com/fmg
    **If Discord does not let you turn Onboarding on, skip it.** Rules screening alone is enough, and a Moderator gives the Player role by hand.
 10. **AutoMod** (Server Settings > AutoMod): turn on "Block mention spam" and "Block suspected spam content".
 11. **Post the texts** (section 6). Pin the welcome, rules, known-issues and how-to-join messages.
-12. **Make the invite:** right-click `#welcome` > Invite People > Edit invite link > **Expire after: Never**. That link is `<DISCORD_INVITE>`.
+12. **Make the invite:** right-click `#welcome` > Invite People > Edit invite link > **Expire after: Never**. That link is `https://discord.gg/cK9HzVxzaY`.
 
 ---
 
