@@ -12,7 +12,7 @@ Please follow the [Code of Conduct](../CODE_OF_CONDUCT.md).
 | A tester | Try what nobody ran yet: 3 or more players, long sessions, a late-game town. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md), section A. |
 | A developer | Read [HOW_IT_WORKS.md](HOW_IT_WORKS.md) and [BUILDING.md](BUILDING.md). Open an issue before a big change. |
 
-Questions: Discord `<DISCORD_INVITE>` (channel **#dev-talk**). Bugs and ideas: https://github.com/fmgk12/manor-lords-coop/issues
+Questions: Discord `<DISCORD_INVITE>` (channel **#dev-talk**). Bugs and ideas: https://github.com/manor-lords-coop/manor-lords-coop/issues
 
 ## 1. Set up a test copy of the game
 

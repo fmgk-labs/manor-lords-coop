@@ -8,7 +8,7 @@ Report them here:
 | Where | Link |
 |---|---|
 | Discord, channel **#bug-reports** (crashes: **#crash-reports**) | `<DISCORD_INVITE>` |
-| GitHub issues | https://github.com/fmgk12/manor-lords-coop/issues |
+| GitHub issues | https://github.com/manor-lords-coop/manor-lords-coop/issues |
 | Nexus Mods, Bugs tab | `<NEXUS_PAGE>` |
 
 Before you post, look at [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Your bug may be there already.

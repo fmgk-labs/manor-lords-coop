@@ -27,7 +27,7 @@ What the mod is meant to do, for comparison:
 
 Use one of these. **Do not open a public issue.**
 
-1. GitHub: the repository's **Security** tab > **Report a vulnerability**: https://github.com/fmgk12/manor-lords-coop/security
+1. GitHub: the repository's **Security** tab > **Report a vulnerability**: https://github.com/manor-lords-coop/manor-lords-coop/security
 2. E-mail or message: **`<CONTACT>`**
 3. Discord: a direct message to a moderator on `<DISCORD_INVITE>`.
 

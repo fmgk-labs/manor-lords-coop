@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thank you. Please read the [known issues](https://github.com/fmgk12/manor-lords-coop/blob/HEAD/docs/KNOWN_ISSUES.md) first: your bug may be there already.
+        Thank you. Please read the [known issues](https://github.com/manor-lords-coop/manor-lords-coop/blob/HEAD/docs/KNOWN_ISSUES.md) first: your bug may be there already.
 
         **Please do not report mod bugs to Slavic Magic or Hooded Horse.** Report them here.
 

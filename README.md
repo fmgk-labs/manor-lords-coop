@@ -10,7 +10,7 @@ Each player runs the game on their own PC. The host's save is the town.
 | **Game version** | Manor Lords **0.8.117** on Steam, exactly |
 | **Players** | a host and up to 4 friends |
 | **Download** | Nexus Mods: `<NEXUS_PAGE>` |
-| **Help and bug reports** | Discord: `<DISCORD_INVITE>` · GitHub issues: https://github.com/fmgk12/manor-lords-coop/issues |
+| **Help and bug reports** | Discord: `<DISCORD_INVITE>` · GitHub issues: https://github.com/manor-lords-coop/manor-lords-coop/issues |
 
 > **Please do not report bugs to the game's developer while you use this mod.**
 > Report them to us instead (see [Report a bug](#report-a-bug)).
@@ -273,7 +273,7 @@ The most important:
 1. Read [docs/REPORTING_BUGS.md](docs/REPORTING_BUGS.md). It has a template and the list of files.
 2. Post it:
    - Discord: `<DISCORD_INVITE>` (channel **#bug-reports**)
-   - GitHub issues: https://github.com/fmgk12/manor-lords-coop/issues
+   - GitHub issues: https://github.com/manor-lords-coop/manor-lords-coop/issues
    - Nexus Mods: `<NEXUS_PAGE>` (Bugs tab)
 
 Please **do not** report bugs to Slavic Magic or Hooded Horse while you use mods.
