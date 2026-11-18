@@ -72,6 +72,7 @@ Every player must use **the same zip**. A different mod version is refused at th
 5. **Check the zip:** no `coop_dev.lua`, no `mods.txt`, no `mods.json`; the loader is build 3.0.1-1218. Write down the SHA-256.
 6. **Test the zip itself**, installed as a player does, with no test console: a join and a resync on two copies, and on two PCs if you can.
 7. **Tag** the commit `v<new version>` and publish a GitHub release with the zip `ManorLordsCoop-<version>-nexus.zip` attached. Put the changes as a list under a heading `## New in <version>`.
+   Without a browser: write the notes to `docs/releases/v<version>.md`, push the tested zip and its `.sha256` to the branch `release-zips`, then push the tag; `.github/workflows/cut-release.yml` publishes the release and starts the Nexus upload.
 8. **Nexus is automatic:** publishing the release runs `.github/workflows/nexus-release.yml`, which sends that zip to the Nexus page as the new main file, sets the mod version and adds the changelog. It needs the repository secret `NEXUSMODS_API_KEY`. Check the Actions tab shows it green. Longer page text is still edited by hand on Nexus.
 9. **Discord:** `#github-feed` posts the release by itself. Write the announcement in `#announcements`.
 

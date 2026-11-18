@@ -1411,7 +1411,7 @@ local function onMessage(S, from, kind, w, line)
   if kind ~= "F" then return false end
   if S.role ~= "friend" or from ~= "host" then bump("ignored"); return true end      -- facts run host -> friends only
   local wall = tonumber(w[2])
-  if wall and S.startWall and wall < S.startWall - 1 then bump("staleLine"); return true end
+  if C.stale("host", w) then bump("staleLine"); return true end      -- (lane 62: by the host's own stamps, not by two clocks; coop.lua C.stale)
   fresh(S)
   bump("in"); bump("inBytes", #line)
   F.t.lineIn = os.clock()

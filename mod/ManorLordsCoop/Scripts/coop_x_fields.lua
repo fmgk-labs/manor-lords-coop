@@ -260,7 +260,7 @@ local function onMessage(S, from, kind, w, line)
   end
   if S.role ~= "friend" or from ~= "host" then bump("ignored"); return true end
   local wall = tonumber(w[2])
-  if wall and S.startWall and wall < S.startWall - 1 then bump("staleLine"); return true end
+  if C.stale("host", w) then bump("staleLine"); return true end      -- (lane 62: by the host's own stamps, not by two clocks; coop.lua C.stale)
   bump("in"); bump("inBytes", #line)
   if wall and w[4] == "S" then                                       -- how late the host's changes arrive here (link + frames)
     local d = A.now() - wall

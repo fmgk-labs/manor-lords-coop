@@ -163,6 +163,10 @@ typedef const char *(*PFN_MM_GetLobbyData)(ISteamMatchmaking *, uint64_t lobby, 
 typedef int (*PFN_MM_GetNumLobbyMembers)(ISteamMatchmaking *, uint64_t lobby);
 typedef uint64_t (*PFN_MM_GetLobbyMemberByIndex)(ISteamMatchmaking *, uint64_t lobby, int index);
 typedef uint64_t (*PFN_MM_GetLobbyOwner)(ISteamMatchmaking *, uint64_t lobby);
+/* (lane 62, part two) [U] never called on real Steam yet. Only the lobby's owner may call it, and the new owner must be a
+ * member (Steamworks: ISteamMatchmaking::SetLobbyOwner). A friend's copy that got the ownership while the host was out
+ * hands it back with this. Optional: without it the host goes on as a member. */
+typedef sbool (*PFN_MM_SetLobbyOwner)(ISteamMatchmaking *, uint64_t lobby, uint64_t newOwner);
 
 typedef int (*PFN_NM_SendMessageToUser)(ISteamNetworkingMessages *, const SteamNetIdentity *to, const void *data, uint32_t len, int flags, int channel);
 typedef int (*PFN_NM_ReceiveMessagesOnChannel)(ISteamNetworkingMessages *, int channel, SteamNetworkingMessage_t **out, int max);

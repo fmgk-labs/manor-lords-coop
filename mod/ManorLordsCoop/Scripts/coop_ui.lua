@@ -48,7 +48,9 @@ local function noticeTick(clock)
   if clock - n.t > STALE then table.remove(U.queue, 1); return end
   if n.kind ~= "syncing" and clock - (U.last or 0) < GAP then return end   -- "syncing" is shown at once
   table.remove(U.queue, 1)
-  if U.banner(n.text) then U.last = clock; U.shown = (U.shown or 0) + 1 end
+  -- (lane 63) a notice of two lines ("first\nsecond"): the banner's second line takes the second part instead of "Co-op"
+  local first, second = tostring(n.text):match("^(.-)\n(.*)$")
+  if U.banner(first or n.text, second) then U.last = clock; U.shown = (U.shown or 0) + 1 end
 end
 
 -- ---------------------------------------------------------------- menu
@@ -93,7 +95,9 @@ local function players(S)
   if not S then return t end
   local J = C.join or {}
   if S.role == "host" then
-    t[#t + 1] = "You (host)  -  playing"
+    -- (lane 63) a new world is saved and loaded once before friends load it (coop_join.lua prepStep): say so here too,
+    -- the banner is not drawn while the pause menu stands
+    t[#t + 1] = J.fresh and "You (host)  -  preparing the new game for co-op" or "You (host)  -  playing"
     for _, p in ipairs(S.peers or {}) do
       local st = nil                                             -- nobody has this place yet
       if J.expect and J.expect[p] then st = "connecting" end
@@ -158,9 +162,16 @@ local function openPanel(S)
   local m = U.menu; local quit = m.menuButton_quit; local col = quit:GetParent()
   U.rows = U.rows or {}                                      -- our row buttons, reused: text is set each time
   local want = {}
+  local Pn = C.session
   if S and S.role == "idle" then
     -- not a co-op game. A co-op game is one started from here (title screen): that also settles who the host is.
-    if not valid(S.p1) then
+    if Pn and Pn.leaving and valid(S.p1) then
+      -- (lane 62) the host is gone and this copy is on its way out (5 s): not "a solo game"
+      want[#want + 1] = { nil, "The host left the game" }; want[#want + 1] = { nil, "Returning to the main menu" }
+    elseif not valid(S.p1) then
+      -- (lane 62) why the last co-op game of this run ended, in one line (the menu button no longer keeps saying it)
+      local le = Pn and Pn.lastEndText and Pn.lastEndText()
+      if le then want[#want + 1] = { nil, le } end
       want[#want + 1] = { "hostnew", "Host New Game" }; want[#want + 1] = { "hostsave", "Host From Save" }
       if U.hostNext then want[#want + 1] = { nil, "The next game you start is a co-op game" }; want[#want + 1] = { "hostcancel", "Cancel Hosting" } end
     else
@@ -179,6 +190,8 @@ local function openPanel(S)
     if not ours then saved[#saved + 1] = { c, c:GetVisibility() }; c:SetVisibility(COLLAPSED) end
   end
   if valid(U.btn) then saved[#saved + 1] = { U.btn, U.btn:GetVisibility() }; U.btn:SetVisibility(COLLAPSED) end
+  -- (lane 63) the host's guarded Main Menu / Quit Game are ours too (their keys are known): hidden with the rest
+  for _, b in pairs((U.guard and U.guard.b) or {}) do if valid(b) then saved[#saved + 1] = { b, b:GetVisibility() }; b:SetVisibility(COLLAPSED) end end
   U.rowSet = U.rowSet or {}
   local shown = {}
   for i, w in ipairs(want) do
@@ -195,8 +208,111 @@ local function openPanel(S)
   log("co-op panel opened (%d rows, %s)", #shown, S and S.role or "?")
 end
 
+-- ---------------------------------------------------------------- (lane 63) the host asks first before it leaves
+-- First public new game (2026-11-17): the host's pause-menu "Main Menu" ran 7.5 s after Esc and ended the co-op game
+-- for both friends at once (the Co-op button sits right under it; no question was asked). A pre-hook cannot stop a
+-- blueprint's click (the hook runs, then the click's own code runs anyway), so while friends are in, the host's
+-- menu shows the mod's own "Main Menu" and "Quit Game" in their place (the game's two are collapsed, never removed).
+-- The first click only arms one and says what it does, on the button itself (a notice is not drawn while the game
+-- stands); a second click within GUARD_ARM s runs the game's own handler of that button, in the next tick, so the
+-- goodbye hook (coop_session.lua H_MAIN / H_QUIT) runs as after a real click. No friend in: the game's own buttons.
+local GUARD_ARM = 6.0      -- s the first click stays armed
+local GUARD_GAP = 0.7      -- s the second click must come after the first (a double click only arms)
+local GUARD_FN = { gmain = { field = "menuButton_mainMenu", fn = "BndEvt__mainMenu_widget_menuButton_mainMenu_K2Node_ComponentBoundEvent_19_OnClicked__DelegateSignature", label = "Main Menu", bye = "BYE menu" },
+                   gquit = { field = "menuButton_quit", fn = "BndEvt__mainMenu_widget_menuButton_quit_K2Node_ComponentBoundEvent_24_OnClicked__DelegateSignature", label = "Quit Game", bye = "BYE quit" } }
+local function friendsIn(S)
+  local n = 0
+  if not (S and S.role == "host") then return 0 end
+  -- heard from in this role and not gone (no "heard in the last 10 s": a hitch or a friend's load must not drop the
+  -- question for a moment)
+  for _, p in ipairs(S.peers or {}) do
+    local h = S.heard and S.heard[p]
+    if h and not (S.gone and S.gone[p]) then n = n + 1 end
+  end
+  return n
+end
+U.friendsIn = friendsIn
+-- The armed words are short on purpose (lane 63, real clicks): a longer text made the game shrink the whole menu
+-- column to fit it (the 66-letter sentence first used), so the button moved away from under the mouse and the second
+-- click missed it. Up to about 25 letters keep the column as it is (measured: 20 and 25 letters stay, 30 shrink it).
+function U.guardWords(key, n)
+  return "Ends co-op: click again"
+end
+local function disarm(why)
+  local G = U.guard; if not (G and G.armed) then return end
+  local b = G.b[G.armed]
+  if valid(b) then pcall(function() b:SetButtonText(text(GUARD_FN[G.armed].label)) end) end
+  log("leave guard: %s is no longer armed (%s)", GUARD_FN[G.armed].label, tostring(why))
+  G.armed = nil
+end
+local function guardTick(S, m, col, quit, clock)
+  if U.panel then return end                                 -- the panel hides and shows them itself (openPanel / closePanel)
+  local n = (S and valid(S.p1)) and friendsIn(S) or 0
+  local want = n > 0
+  local G = U.guard
+  if want and not G then
+    G = { b = {} }
+    for _, k in ipairs({ "gmain", "gquit" }) do
+      local b = makeButton(S, col, quit, GUARD_FN[k].label)
+      if valid(b) then U.keys[addr(b)] = k; G.b[k] = b end
+    end
+    U.guard = G
+    log("leave guard: the menu's Main Menu and Quit Game ask first while friends are in (%d now)", n)
+  end
+  if not G then return end
+  local changed = false
+  for k, b in pairs(G.b) do
+    local o = m[GUARD_FN[k].field]
+    local ov, bv = want and COLLAPSED or VISIBLE, want and VISIBLE or COLLAPSED
+    if (want or G.hid) and valid(o) and o:GetVisibility() ~= ov then o:SetVisibility(ov); changed = true end
+    if valid(b) and b:GetVisibility() ~= bv then b:SetVisibility(bv); changed = true end
+  end
+  if changed then
+    G.hid = want
+    pcall(function() m:RebuildNaviGrid() end)
+    log("leave guard: %s", want and string.format("on (%d friend%s in)", n, n == 1 and "" or "s") or "off (no friend in): the game's own Main Menu and Quit Game")
+  end
+  if G.armed and (not want or clock - G.armedT > GUARD_ARM) then disarm(want and string.format("no second click within %.0f s", GUARD_ARM) or "no friend in any more")
+  elseif G.armed and G.armedN ~= n then
+    G.armedN = n
+    local b = G.b[G.armed]; if valid(b) then pcall(function() b:SetButtonText(text(U.guardWords(G.armed, n))) end) end
+  end
+end
+-- the second click: the game's own handler of that button (from the tick, not inside the click)
+local function guardLeave(S, m, key)
+  local F = GUARD_FN[key]
+  local Pn = C.session
+  if Pn then Pn.byeSent = nil end
+  log("leave guard: second click on %s: the game's own %s runs (%d friend(s) in)", F.label, F.label, friendsIn(S))
+  local ok, e = pcall(function() m[F.fn](m, m[F.field]) end)
+  -- the goodbye is written by the hook on that handler (coop_session.lua); should it not have run, it is written here
+  if ok and not (Pn and Pn.byeSent) and S and S.on and S.role == "host" then pcall(A.send, F.bye); log("leave guard: the goodbye hook did not run: '%s' sent here", F.bye) end
+  if not ok then log("leave guard: the game's %s failed: %s", F.label, tostring(e)) end
+end
+U.guardLeave = guardLeave
+
 local function act(S, key)
-  if key == "coop" then openPanel(S); return end
+  if key == "gmain" or key == "gquit" then
+    local G = U.guard; if not G then return end
+    local n = friendsIn(S)
+    local dt = os.clock() - (G.armedT or -100)
+    if n > 0 and G.armed == key and dt < GUARD_GAP then return end   -- a double click is one click: it only arms
+    if n > 0 and not (G.armed == key and dt <= GUARD_ARM) then
+      if G.armed and G.armed ~= key then disarm("the other one was clicked") end
+      G.armed = key; G.armedT = os.clock(); G.armedN = n
+      local b = G.b[key]; if valid(b) then pcall(function() b:SetButtonText(text(U.guardWords(key, n))) end) end
+      log("leave guard: first click on %s: armed for %.0f s (%d friend(s) in)", GUARD_FN[key].label, GUARD_ARM, n)
+      return
+    end
+    disarm("second click"); U.leaveKey = key; U.leaveT = os.clock()
+    return
+  end
+  if key == "coop" then
+    -- (lane 62) the button's "Co-op: the host left the game" has been read: the normal words come back at once (the
+    -- panel's first line says why the last game ended)
+    if C.session and C.session.labelBack then pcall(C.session.labelBack, "the player opened the Co-op panel") end
+    openPanel(S); return
+  end
   if key == "back" then closePanel(); return end
   if key == "hostnew" or key == "hostsave" then
     -- the next world this player starts (new game or a loaded save) is a co-op game with this player as host.
@@ -215,12 +331,19 @@ local function act(S, key)
   end
   if key == "invite" then
     -- Steam's own invite window. The lobby (invite only, 8 players) is opened the first time it is needed.
+    -- (lane 62) Whether a lobby of this host exists is the Steam piece's question, asked of Steam at the moment of
+    -- the click, not this menu's reading of the status file: the piece opens the window only for a lobby this host
+    -- is in, and makes a new lobby first when there is none (never hosted yet, or the lobby was lost: first public
+    -- session, the window opened twice for a lobby the host was no longer in). While Steam is offline it waits.
     local st = C.steam and C.steam.on and C.steam.status()
     if not st then C.notify("info", "Steam joining needs the game started through Steam")
     elseif st.state == "off" then C.notify("info", "Steam joining is off: " .. tostring(st.reason or "Steam was not found"))
-    elseif st.state == "hosting" then C.steam.invite(); log("invite: Steam's invite window asked for")
-    elseif st.state == "idle" or st.state == "starting" then C.steam.host(); U.wantInvite = os.clock(); log("invite: opening the Steam lobby first")
-    else C.notify("info", "Not possible while joining another game") end
+    elseif st.state == "joining" or st.state == "joined" then C.notify("info", "Not possible while joining another game")
+    else
+      C.steam.invite(); U.wantInvite = os.clock(); U.inviteSaid = nil; log("invite: Steam's invite window asked for (Steam piece: %s)", tostring(st.state))
+      -- (part two) inside the 30 s in which the Steam piece tries to get back into the lobby, the window waits: say so
+      if st.reconnecting then C.notify("info", "Still reconnecting. The invite window opens when your Steam connection is back") end
+    end
     return
   end
   if key == "report" then
@@ -261,14 +384,21 @@ local function roleTick(S, clock)
   local inWorld = valid(S.p1) and valid(S.eng)
   if S.role == "friend" then if inWorld then U.frWorld = true; U.frNoT = nil end else U.frWorld = nil; U.frNoT = nil end
   local steam = C.steam and C.steam.on and C.steam.status() or nil
+  if not (S.role == "friend" and U.viaSteam and steam and (steam.state == "idle" or steam.state == "off")) then U.goneT = nil end   -- (lane 62: see the last branch)
   if S.role == "idle" then
     if U.hostNext and inWorld then
       U.hostNext = nil
       C.setRole("host", "host", rawget(_G, "COOP_FRIEND_NAMES") or { "friend1", "friend2", "friend3", "friend4", "friend5", "friend6", "friend7" }); U.madeHost = true
       if valid(U.btn) then pcall(function() U.btn:SetButtonText(text("Co-op")) end) end
       C.notify("info", "Co-op game started. Invite friends from the menu")
-    elseif steam and steam.state == "joined" and steam.slot then
-      U.viaSteam = true; C.setRole("friend", "friend" .. steam.slot, {})
+    elseif steam and steam.state == "joined" and steam.slot and not (C.steam.leavePending and C.steam.leavePending()) then
+      -- (lane 62) not while a LEAVE this mod sent is still on its way to the Steam piece: for a moment after this
+      -- copy left (the host's goodbye, the silence rule, the Leave button) the status file still says "joined", and
+      -- this line made the copy a friend again in the middle of leaving. (C.setRole ends what the last co-op game
+      -- left in the session module: coop_session.lua P.newGame.)
+      U.hostNext = nil; U.openKey = nil      -- ("Host New Game" chosen before the invite: this copy is a friend now, and must not host the host's world when that game ends)
+      U.viaSteam = true; U.friendT = clock; U.goneT = nil; U.bareSaid = nil
+      C.setRole("friend", "friend" .. steam.slot, {})
     end
   elseif S.role == "host" then
     local J = C.join or {}
@@ -290,8 +420,25 @@ local function roleTick(S, clock)
   elseif S.role == "friend" and U.viaSteam and steam and (steam.state == "idle" or steam.state == "off") then
     -- (lane 44) no longer in the host's Steam lobby (the host closed the game or left, or this player was removed):
     -- the one way out of a co-op game when the host is gone (coop_session.lua: notice, items off, main menu)
-    if C.session and C.session.gone then U.viaSteam = nil; C.session.gone(S, "steam", steam.state .. " " .. tostring(steam.note or steam.reason or "")); return end
-    U.viaSteam = nil; C.notify("info", "The co-op game ended")
+    -- (lane 62) A BOUNCED JOIN, second live session (3 players, 0.2.2): one second after "role is now friend" the
+    -- status read "idle" with no note, this line called the host gone, and the copy went back to the menu; the next
+    -- invite worked. One read of "idle" is not enough: it must be read for 2 s on end. And in the first 20 s of a
+    -- join an "idle" WITHOUT a note is not believed at all: whenever the Steam piece really leaves a host's game it
+    -- writes a note with the reason (the host left, the host closed the game, refused, left the game), so a bare
+    -- "idle" is a status that has not caught up with the join.
+    U.goneT = U.goneT or clock
+    if steam.state == "idle" and not steam.note and clock - (U.friendT or -1e9) < 20.0 then
+      if not U.bareSaid then U.bareSaid = true; log("the Steam status reads 'idle' with no reason %.1f s after this copy joined: not taken for the host leaving (waited for up to 20 s)", clock - (U.friendT or clock)) end
+      return
+    end
+    if clock - U.goneT < 2.0 then return end
+    U.goneT = nil
+    U.viaSteam = nil
+    if C.session and C.session.gone then
+      C.session.gone(S, "steam", steam.state .. " " .. tostring(steam.note or steam.reason or ""))
+      if S.role ~= "friend" then return end       -- (lane 62) it left; if it did nothing, the plain way out below
+    end
+    C.notify("info", "The co-op game ended")
     C.setRole("idle", "idle", {})
     if U.titleMap and inWorld then pcall(function() StaticFindObject("/Script/Engine.Default__GameplayStatics"):OpenLevel(FindFirstOf("MLGameInstance"), FName(U.titleMap), true, "") end) end
   end
@@ -301,22 +448,71 @@ local function menuTick(S, clock)
   ensureHook(clock)
   U.keys = U.keys or {}
   local okR, eR = pcall(roleTick, S, clock); if not okR then U.lastErr = "role: " .. tostring(eR) end
-  -- "Invite Friends" was clicked before a lobby existed: open Steam's invite window as soon as the lobby is there
+  -- "Invite Friends" was clicked: the Steam piece opens the window by itself as soon as a lobby of this host exists
+  -- (lane 62). Here only what the player is told while that takes long: Steam offline (the piece waits up to 2
+  -- minutes for it), or no lobby after 15 s.
   if U.wantInvite and C.steam and C.steam.on then
+    local st = C.steam.status(); local dt = os.clock() - U.wantInvite
+    if st.state == "hosting" and dt > 1.0 then U.wantInvite = nil
+    elseif st.info and st.info.loggedon == "0" then
+      if not U.inviteSaid then U.inviteSaid = true; C.notify("info", "Steam is not online. The invite window opens when Steam is back") end
+      if dt > 120.0 then U.wantInvite = nil end
+    elseif dt > 15.0 then U.wantInvite = nil; C.notify("info", "Steam did not open a lobby") end
+  end
+  -- (lane 62) This host lost its own Steam lobby while its game lives on (its Steam connection dropped; first public
+  -- session: a VPN switched on). The Steam piece counts it in its status ("lost <times> <friends then>"): the player
+  -- is told once per time, the friends are marked as gone without one "left the game" notice each, and the next
+  -- Invite Friends opens a new lobby. The game and the host role stay.
+  -- (lane 62, part two) Before that, for 30 s, the Steam piece tries to get this host back into the same lobby (its
+  -- status has "reconnecting <seconds>"; the friends wait meanwhile): the player is told when that starts and when it
+  -- worked ("back <n>" went up). While it runs the host's "left the game" rule stands still for every friend
+  -- (S.linkWait, coop.lua host tick), and starts afresh when the host is back. If it did not work, "lost" goes up
+  -- and the notice below follows.
+  if C.steam and C.steam.on and S then
     local st = C.steam.status()
-    if st.state == "hosting" then U.wantInvite = nil; C.steam.invite(); log("invite: Steam's invite window asked for")
-    elseif clock - U.wantInvite > 10.0 then U.wantInvite = nil; C.notify("info", "Steam did not open a lobby") end
+    if S.role == "host" and st.state == "hosting" and st.reconnecting then
+      if not U.recon then
+        U.recon = { t = os.clock(), back0 = st.back or 0 }
+        S.linkWait = true
+        log("this host's place in its Steam lobby is lost: the Steam piece tries for %d s to get back in; the friends are kept", st.reconnecting)
+        C.notify("left", string.format("Your Steam connection dropped. Trying to reconnect (%d s)...", st.reconnecting))
+      end
+    elseif U.recon then
+      local R = U.recon; U.recon = nil
+      S.linkWait = nil
+      if S.role == "host" and (st.back or 0) > R.back0 then
+        if S.heard then for p in pairs(S.heard) do if not (S.gone and S.gone[p]) then S.heard[p] = os.clock() end end end   -- the silence clock of every friend that was there starts afresh
+        log("this host is back in its Steam lobby after %.1f s: nothing was lost", os.clock() - R.t)
+        C.notify("joined", "Reconnected.")
+      end
+    end
+  end
+  if C.steam and C.steam.on then
+    local st = C.steam.status(); local n = st.lost or 0
+    if S and S.role == "host" and n > (U.lostSeen or 0) then
+      U.lostSeen = n
+      local fr = st.lostFriends or 0
+      local gone = 0
+      if C.friendsLost then local ok, g = pcall(C.friendsLost, "this host lost its Steam lobby"); if ok and tonumber(g) then gone = g end end
+      log("this host lost its Steam lobby (time %d of this run; %d friend(s) connected in the Steam piece, %d marked as gone here): the player is told once", n, fr, gone)
+      C.notify("left", fr > 0 and "Your Steam connection dropped. Your friends were sent to the main menu. Press Invite Friends to bring them back."
+                               or "Your Steam connection dropped. Press Invite Friends to open a new lobby.")
+    elseif not (S and S.role == "host") then U.lostSeen = n end
   end
   -- Steam names instead of friend1..3 in notices and in the player list
   if S and S.role == "host" and C.steam and C.steam.on and clock - (U.namesT or 0) > 1.0 then U.namesT = clock; local ok, n = pcall(C.steam.names); if ok then S.display = n end end
   local m = findMenu(clock); if not m then return end
   local shown = false; pcall(function() shown = m:IsInViewport() end)
-  if not shown then if U.panel then closePanel() end; return end
+  if not shown then
+    if U.panel then closePanel() end
+    if U.guard and U.guard.armed then disarm("the menu was closed") end   -- (lane 63)
+    return
+  end
   local quit = m.menuButton_quit; if not valid(quit) then return end
   local col = quit:GetParent(); if not valid(col) then return end
   if not valid(U.btn) or addr(U.btn:GetParent()) ~= addr(col) then
     -- (re)build: a new menu object, or the first time. Our button goes in, then Quit is moved below it.
-    U.rows = {}; U.rowSet = {}; U.keys = {}; U.panel = nil
+    U.rows = {}; U.rowSet = {}; U.keys = {}; U.panel = nil; U.guard = nil
     U.btn = makeButton(S, col, quit, "Co-op")
     if not valid(U.btn) then return end
     U.keys[addr(U.btn)] = "coop"
@@ -332,8 +528,10 @@ local function menuTick(S, clock)
     local k = U.openKey; U.openKey = nil
     if not (S and valid(S.p1)) then
       local ok, e = pcall(function()
+        -- a new world is one started with no save name; a loaded save sets its own (lane 63: for "Host From Save" too, so
+        -- a name left from an earlier load never makes a new game look loaded: coop_join.lua M.onWorld reads it)
+        pcall(function() FindFirstOf("MLGameInstance").savefileToLoad = "" end)
         if k == "hostnew" then
-          pcall(function() FindFirstOf("MLGameInstance").savefileToLoad = "" end)     -- a new world is one started with no save name
           m:BndEvt__mainMenu_widget_menuButton_newGame_K2Node_ComponentBoundEvent_0_OnClicked__DelegateSignature(m.menuButton_newGame)
         else
           m:BndEvt__mainMenu_widget_menuButton_loadGame_K2Node_ComponentBoundEvent_2_OnClicked__DelegateSignature(m.menuButton_loadGame)
@@ -350,6 +548,9 @@ local function menuTick(S, clock)
       if valid(b) and b:GetVisibility() ~= COLLAPSED then b:SetVisibility(COLLAPSED); pcall(function() m:RebuildNaviGrid() end) end
     end
   end
+  -- (lane 63) the host's Main Menu / Quit Game ask first while friends are in; a second click runs the game's own
+  local okG, eG = pcall(guardTick, S, m, col, quit, clock); if not okG and U.guardErr ~= tostring(eG) then U.guardErr = tostring(eG); log("leave guard: %s", tostring(eG)) end
+  if U.leaveKey and clock - (U.leaveT or 0) > 0.15 then local k = U.leaveKey; U.leaveKey = nil; guardLeave(S, m, k) end
   if U.clicked then local k = U.clicked; U.clicked = nil; local ok, e = pcall(act, S, k); if not ok then log("menu action %s failed: %s", tostring(k), tostring(e)) end end
   -- our button exists but its clicks never arrive: say so once (a click on Co-op that does nothing)
   if valid(U.btn) and not (rawget(_G, "__coop_ui_hook") or {}).done and not U.saidNoHook and clock - (U.btnT or clock) > 10 then
@@ -423,26 +624,32 @@ end
 -- the event banner of a notice is not drawn while the game stands (seen on background screenshots). So the words of
 -- that line are changed for as long as the hold lasts, and put back afterwards.
 local HOLD_TEXT = "Waiting for the host"         -- short: the line is as wide as "Game Paused" (a longer text was cut off, r6)
+-- (lane 62, part two) the same line while this copy is held because the host's link is lost for a moment
+-- (coop_session.lua linkStep sets S.linkHold). 20 characters, like HOLD_TEXT: the notice has the long text.
+local LINK_TEXT = "Host connection lost"
 local function holdTick(S, clock)
-  local want = S.role == "friend" and S.hostHold == true
-  if want == (U.holdShown or false) and (not want or clock - (U.holdT or 0) < 2.0) then return end
+  local words = nil
+  if S.role == "friend" then words = (S.linkHold == true and LINK_TEXT) or (S.hostHold == true and HOLD_TEXT) or nil end
+  local want = words ~= nil
+  if want == (U.holdShown or false) and (not want or (U.holdWords == words and clock - (U.holdT or 0) < 2.0)) then return end
   U.holdT = clock
   if want then
     if not valid(U.pauseLbl) then
       U.pauseLbl = nil
       for _, w in ipairs(FindAllOf("TextBlock") or {}) do
         local ok, t = pcall(function() return w:GetText():ToString() end)
-        if ok and (t == "Game Paused" or t == HOLD_TEXT) then local okV, v = pcall(function() return w:IsVisible() end); if okV and v then U.pauseLbl = w; U.pauseOrig = (t == HOLD_TEXT) and (U.pauseOrig or "Game Paused") or t end end
+        local ours = t == HOLD_TEXT or t == LINK_TEXT
+        if ok and (t == "Game Paused" or ours) then local okV, v = pcall(function() return w:IsVisible() end); if okV and v then U.pauseLbl = w; U.pauseOrig = ours and (U.pauseOrig or "Game Paused") or t end end
       end
     end
     if valid(U.pauseLbl) then
-      local ok = pcall(function() if U.pauseLbl:GetText():ToString() ~= HOLD_TEXT then U.pauseLbl:SetText(text(HOLD_TEXT)) end end)
-      if ok and not U.holdShown then log("the pause line says: %s", HOLD_TEXT) end
-      U.holdShown = ok
+      local ok = pcall(function() if U.pauseLbl:GetText():ToString() ~= words then U.pauseLbl:SetText(text(words)) end end)
+      if ok and (not U.holdShown or U.holdWords ~= words) then log("the pause line says: %s", words) end
+      U.holdShown = ok; U.holdWords = ok and words or nil
     end
   else
     if valid(U.pauseLbl) then pcall(function() U.pauseLbl:SetText(text(U.pauseOrig or "Game Paused")) end) end
-    U.holdShown = false
+    U.holdShown = false; U.holdWords = nil
   end
 end
 
@@ -456,6 +663,7 @@ local function worldKey(S)
   if key == U.wKey then return end
   U.wKey = key
   U.menu = nil; U.menuT = nil; U.btn = nil; U.rows = {}; U.rowSet = {}; U.keys = {}; U.panel = nil; U.pauseLbl = nil; U.holdShown = false
+  U.guard = nil; U.leaveKey = nil                           -- (lane 63)
 end
 local M = {}
 function M.onWorld(S) U.hostMercs = nil; U.mercScreens = nil; U.mercSent = nil; worldKey(S) end

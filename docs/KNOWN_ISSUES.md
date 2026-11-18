@@ -226,6 +226,28 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 - **Basis:** code reading. A friend's region numbers come from the host, so the game's own check does not run there.
 - **Workaround:** the host watches these warnings.
 
+### G5. Host New Game: friends resynced again and again (0.2.2; changed in 0.2.3)
+
+- **You see (0.2.2):** after **Host New Game**, each friend sees "Syncing with the host" every minute or two. The host's game saves each time.
+- **Numbers:** first public new game (host and two friends): 6 resyncs of one friend at a time in 6 minutes, none helped. After every copy loaded the save once, 0 resyncs in the next 6 minutes. The cause: a world the game has just made differs from the same world loaded from its save. Five buildings near the start camp had no owner on the host and the player as owner on each friend.
+- **0.2.3:** about 10 s after a new game is up, the host's game says "Preparing the new game for co-op..." and saves and loads it once (a few seconds). A friend who joins in that time waits and comes in with that load. A game loaded from a save is never prepared. A friend whose load alone did not help now goes straight to a load of every copy (in 0.2.2 it could take six loads).
+- **Basis:** owner's live play (0.2.2). 0.2.3: lane 63's runs on test copies (one PC): 6 of 6 new games prepared (a load of about 6 to 7 s), the friend who said hello meanwhile came in with that load, 20 of 20 days equal and 0 resyncs at speed 4 in 3 runs. A control run without the preparing showed the same kind of difference (14 region settings 0 on the host, 359 on the friend, every day). The five unowned buildings of the live game did not show up on the test map.
+- **Workaround (0.2.2):** host a new game, save it, and load that save with **Host From Save** before you invite friends.
+
+### G6. A difference a resync cannot fix
+
+- **You see:** once: "The games differ in a way a resync cannot fix (buildings). Play goes on. Please send a bug report: Co-op > Make Bug Report."
+- **Numbers:** 0.2.3 shows it when the same difference is still there after every copy loaded the host's save. Then no resync for that kind of difference for 15 minutes, and after that at most one per hour. On test copies with a made-up lasting difference: 3 of 3 runs went one load alone, one load of every copy, then the notice once and 0 saves or loads in the next 5 minutes.
+- **Basis:** lane 63's runs on test copies (the difference was made by a test switch, not a real one).
+- **Workaround:** play on. Every player presses **Co-op > Make Bug Report** and sends the zip. The host's zip has the difference as the friend saw it.
+
+### G7. A rival lord's new marketplace is on the host only
+
+- **You see:** a marketplace a rival lord builds after your friend joined is on the host's map and not on the friend's. It comes to the friend with the next load of the host's save.
+- **Numbers:** seen once in the first public new game (one marketplace of one rival lord). The mod makes a rival's other new buildings on a friend's copy, but not marketplaces, fields and pastures (drawn plots).
+- **Basis:** owner's live play (seen in a friend's log); the reason by code reading. It never causes a resync: the daily comparison looks at the player's own town only.
+- **Workaround:** none needed.
+
 ---
 
 ## H. Other limits
@@ -261,9 +283,17 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 ### H5. When the host leaves, everybody leaves
 
 - **You see:** "The host left the game. Returning to the main menu."
-- **Numbers:** a friend decides on the host's goodbye, on Steam's word, or after 30 s of silence.
-- **Basis:** lead's run.
+- **Numbers:** a friend decides on the host's goodbye, or after 30 s of silence, or 30 s after Steam says the host is out of the lobby. In the first public game the host's **Main Menu** button (right above the Co-op button) ended the game for both friends by a likely mis-click. Since 0.2.3, while friends are in, the host's **Main Menu** and **Quit Game** ask first: the first click changes the button to "Ends co-op: click again", and a second click (0.7 to 6 s later) leaves. A fast double click only asks. Tried with real clicks on test copies: 3 of 3 left on the second click, and the friend was told at once.
+- **Basis:** lead's run; owner's live play; the 0.2.3 question: lane 63's run with real clicks on test copies.
 - **Workaround:** the host starts again and invites the friends again.
+
+### H5a. A short connection drop: proven in mock tests only
+
+- **You see:** when the host's Steam connection drops for a moment (internet, Steam, a VPN switched on): the host reads "Your Steam connection dropped. Trying to reconnect (30 s)...", a friend reads "Connection to the host lost. Waiting up to 30 s..." and its game is held. Back within 30 s: "Reconnected." and the game goes on. Not back: the friends go to the main menu and the host invites again.
+- **Numbers:** 30 s on both sides. In the first public session (2026-11-17, two PCs, before this change) a VPN switched on by the host ended the game for the friend at once, and the host's invites went to a lobby that no longer existed.
+- **Basis:** the mod's mock tests (a simulated Steam: a 5 s drop with two friends, a drop with no return, a goodbye inside the 30 s, the lobby's ownership moving to a friend and back) and a desk test of the mod's own part. **Never run on real Steam.** Not known: whether Steam lets a host back into an invite-only lobby by its number, whether it hands the lobby's ownership back, what a host's Steam answers about its lobby right after a drop, and whether the notice texts fit on screen. Until the owner repeats the VPN test on two PCs this is unproven.
+- **Workaround:** if it does not hold, it ends as before: "The host left the game" for the friends; the host presses **Invite Friends** (a new lobby) and the friends accept the new invite.
+- A drop on a **friend's** side is not covered: that friend leaves at once and joins again by invite.
 
 ### H6. Tutorials pause everybody
 

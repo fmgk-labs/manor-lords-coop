@@ -5,7 +5,7 @@ Each player runs the game on their own PC. The host's save is the town.
 
 | | |
 |---|---|
-| **Mod version** | 0.2.2 (v1, with the **Make Bug Report** button) |
+| **Mod version** | 0.2.3 (v1, with the **Make Bug Report** button) |
 | **Status** | **Beta**: for testing with friends |
 | **Game version** | Manor Lords **0.8.117** on Steam, exactly |
 | **Players** | up to 8: a host and 7 friends (tested: 5 copies on one PC, 2 players for real) |
@@ -64,6 +64,7 @@ They follow the host's, but can be a few seconds or a few metres apart. See [Kno
 
 **Beta.** Version 0.2.1 is v1, the version for testing with friends. 0.2.2 adds the **Make Bug Report** button and keeps
 the logs of the last 5 game starts; the game itself plays as in 0.2.1.
+0.2.3 fixes the first fault from a public session: a host whose Steam connection dropped could not invite its friends back.
 The known differences between host and friend are fixed, or accepted under the owner's "soft bars" (a few metres, a few seconds).
 What was never tested goes to this beta.
 
@@ -161,9 +162,26 @@ The mod never changes your own save files.
 | Who | How | What happens |
 |---|---|---|
 | Friend | **Esc** > **Co-op** > **Leave Co-op** | The host's game goes on. |
-| Host | **Main Menu** or quit the game | Every friend sees "The host left the game. Returning to the main menu." |
+| Host | **Main Menu** or **Quit Game**, clicked twice while friends are in (0.2.3: the first click asks) | Every friend sees "The host left the game. Returning to the main menu." |
 
 If the host's game goes silent for 30 s, friends are sent back to the main menu too.
+
+### What happens when the connection drops
+
+A short drop does not end the game. Both sides wait up to **30 seconds**.
+
+| Who | You see | What happens |
+|---|---|---|
+| Host, own connection dropped (internet, Steam, a VPN switched on) | "Your Steam connection dropped. Trying to reconnect (30 s)..." | Your game goes on. The mod asks Steam to let you back into the same lobby. Your friends stay. |
+| Host, back in time | "Reconnected." | Nothing was lost. Friends that missed something load your save once by themselves ("Syncing with the host"). |
+| Host, not back within 30 s | "Your Steam connection dropped. Your friends were sent to the main menu. Press Invite Friends to bring them back." | Your game goes on. **Esc** > **Co-op** > **Invite Friends** opens a new lobby. |
+| Friend, the host dropped | "Connection to the host lost. Waiting up to 30 s..." and the pause line "Host connection lost" | Your game is held (paused) while nothing comes from the host, so the two towns stay equal. |
+| Friend, the host is back in time | "Connection to the host is back" | The game runs on. After a gap of more than 2 s your copy loads the host's save once. |
+| Friend, the host is not back within 30 s | "The host left the game. Returning to the main menu." | As when the host leaves. Accept the host's new invite; no restart needed. |
+
+A host that leaves on purpose (**Main Menu**, quit) still ends the game for everyone at once.
+
+**How far this is tested:** in the mod's own tests with a simulated Steam only. It has not run between two PCs yet (see [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md), H5a). If the drop was on a **friend's** side, that friend still leaves at once and joins again by invite.
 
 ### Keep a copy (a friend)
 
@@ -244,9 +262,17 @@ The most important:
 | The invite does nothing | Start the game **through Steam**, not by a double-click on the `.exe`. |
 | "Steam joining needs the game started through Steam" | The same: start the game from Steam. |
 | "A player's co-op mod version differs from the host's" | Someone has another zip. Everyone installs the same one. |
-| "Syncing with the host" shows often | Normal after a join. If it repeats every minute or two, report it: **Co-op** menu, **Make Bug Report**, attach the zip. |
+| "Syncing with the host" shows often | Normal after a join. If it repeats every minute or two, report it: **Co-op** menu, **Make Bug Report**, attach the zip. With mod 0.2.2 after **Host New Game**: use **0.2.3**, or save the new game, load it with **Host From Save**, then invite. |
+| Host: "Preparing the new game for co-op..." | Normal, once, about 10 s after **Host New Game**: the host's game saves and loads the new world once (0.2.3). Friends who join meanwhile come in with that load. |
+| "The games differ in a way a resync cannot fix" | Play goes on; the mod stops resyncing for that difference. Every player: **Co-op** menu, **Make Bug Report**, send the zip. |
+| Host: the **Main Menu** or **Quit Game** button says "Ends co-op: click again" | Your friends are still in: leaving ends their game too. Click it again (after a moment, within 6 s) to leave, or press **Continue** to stay. |
 | The game drops to speed 1 | Usually the game's own rule when an enemy is spotted. Press the speed button again. |
-| "The host left the game" | The host quit, or was silent for 30 s. The host starts again and invites again. |
+| "The host left the game" | The host quit, was silent for 30 s, or the host's Steam connection dropped for more than 30 s. The host invites again (the host's own game goes on if only its connection dropped); you accept the new invite, without restarting your game. |
+| "Connection to the host lost. Waiting up to 30 s..." | The host's connection dropped. Wait: your game is held and runs on when the host is back (see [What happens when the connection drops](#what-happens-when-the-connection-drops)). |
+| Host: "Your Steam connection dropped. Trying to reconnect (30 s)..." | Your internet or Steam dropped for a moment (a VPN switched on does this too). Keep playing; the mod gets you back into your lobby. "Reconnected." means nothing was lost. |
+| Host: "Your Steam connection dropped. Your friends were sent to the main menu..." | You were not back within 30 s. Your game goes on. Press **Esc**, **Co-op**, **Invite Friends**: a new lobby opens and the invite goes to that one. |
+| Your friend did not get the invite after your internet dropped | Use mod **0.2.3** or later. Before it, the invite window could open for a lobby that no longer existed. Press **Invite Friends** again. If the game says "Steam is not online", wait: the invite window opens by itself when Steam is back. |
+| The menu says "Manor Lords is already running with co-op on this PC. Close this copy." | The game was started a second time while the first copy still runs. Co-op is off in the second copy, so it cannot disturb the first one's session. Close the second copy. (If no other copy runs and the line still shows: restart the PC, or put the line `guard = off` into `coop.cfg` and tell us.) |
 | The game closes (crash) | Start the game again. At the title screen open **Co-op** and press **Make Bug Report**: the crashed session is kept. Attach the zip to your report. |
 | Anything else that looks wrong | Right after it: **Co-op** menu (title screen: the **Co-op** button; in a game: **Esc**, then **Co-op**), press **Make Bug Report**, attach the zip (see [Report a bug](#report-a-bug)). |
 | After a game update the mod does nothing | The mod's native part switches itself off when the game changed. Wait for a new mod version. |

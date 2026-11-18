@@ -530,6 +530,9 @@ local function fpJob(st)
     end
     return false
   end
+  -- (lane 63, test switch, console on a friend only: Coop.fpSkew = true) a lasting difference that no load can fix:
+  -- one made-up entry in this copy's building section, so the join module's escalation and breaker can be run
+  if rawget(C, "fpSkew") and S.role == "friend" then st.B[#st.B + 1] = "TEST@skew" end
   table.sort(st.B); table.sort(st.C)
   st.P.B = string.format("%x/%d", H(table.concat(st.B, "|")), #st.B)
   -- (lane 52, test switch, console on both copies: Coop.fpLog = true) the building section's entries of each day, so
@@ -614,6 +617,8 @@ local function tryCompare(S, day)
   for d in pairs(W.fp.host) do if d < day - 3 then W.fp.host[d] = nil end end
   for d in pairs(W.fp.mine) do if d < day - 3 then W.fp.mine[d] = nil end end
   local bad = W.compareFp(a, b)
+  -- (lane 63) the last differing pair, for the join module's breaker (W.diffText)
+  if #bad > 0 then W.lastBad = { day = day, text = table.concat(bad, " "), host = fpEncode(a), here = fpEncode(b), t = os.clock() } end
   -- (join, lane 15) A copy that loaded the host's save ALONE starts at the beginning of the save's day, and the
   -- host did not wait for it: it runs behind the host's clock until it has caught up (the core's follow-speed
   -- block). While it is more than cfg.maxDayGap days behind, its own day N is compared with numbers the host has
@@ -2496,7 +2501,7 @@ local function onMessage(S, from, kind, w, line)
   -- the core's friendInbox does not drop lines from before this copy started (hostInbox does): do it here,
   -- so a late friend does not replay an old raid or fire; the next keyframe brings the current values
   local wall = tonumber(w[2])
-  if wall and S.startWall and wall < S.startWall - 1 then bump("w_stale"); return true end
+  if C.stale("host", w) then bump("w_stale"); return true end      -- (lane 62: by the host's own stamps, not by two clocks; coop.lua C.stale)
   W.apply(S, w)
   bump("w_in")
   return true
@@ -2615,6 +2620,29 @@ function W.wideDetail(tag)
     for _, it in ipairs(R.items) do t[#t + 1] = table.concat({ spec[1], it.k, it.f, it.h, it.m, it.mark or "", it.o or "" }, "\t") end
   end
   return table.concat(t, "\n")
+end
+-- (lane 63) a friend's whole difference in one line, for the join module's breaker: the last daily comparison that
+-- differed (both fingerprints), and every difference of the last wide comparison (not cut at cfg.wideLogMax)
+function W.diffText()
+  local t = {}
+  local LB = W.lastBad
+  if LB then t[#t + 1] = string.format("daily comparison day %s (%.0f s ago) differs: %s; host %s; here %s", tostring(LB.day), os.clock() - LB.t, LB.text, LB.host, LB.here)
+  else t[#t + 1] = "no daily comparison has differed yet" end
+  local L = W.wideLast[#W.wideLast]
+  if L then
+    local n = 0
+    for _, spec in ipairs(WIDE) do
+      local R = L.res[spec[1]]
+      if R and #R.items > 0 then
+        local u = {}
+        for _, it in ipairs(R.items) do u[#u + 1] = it.k .. " " .. it.f .. " " .. it.h .. "/" .. it.m .. (it.mark and ("(" .. it.mark .. ")") or "") .. (it.o and (" " .. it.o) or "") end
+        n = n + #u
+        t[#t + 1] = string.format("wide %s %s: %s", tostring(L.tag), spec[1], table.concat(u, "; "))
+      end
+    end
+    if n == 0 then t[#t + 1] = string.format("wide %s: no difference", tostring(L.tag)) end
+  else t[#t + 1] = "no wide comparison yet" end
+  return table.concat(t, " | ")
 end
 function W.wideNow()
   local S = W.S; if not (S and W.wd and valid(S.eng)) then return "wide: not attached yet" end

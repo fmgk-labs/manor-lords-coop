@@ -4,6 +4,9 @@
  *   open 1|0                     open the reports folder in Explorer when done (0: the test switch dev_report_noopen.txt)
  *   zip 1|0                      make the zip (0: keep the folder only; the mechanism test reads the copies)
  *   name <from> <to>             a Steam display name and the slot name that replaces it in every copy
+ *   steamlog <source> <name> <cap>      (lane 62) the Steam piece's log, and
+ *   steamstatus <source> <name> <cap>   its status file: copied like a file, with the Steam names taken out by the
+ *                                shape of the line first (coop_scrub.h, scrub_steam)
  *   file <source> <name> <cap> [<start>]   a file to copy (scrubbed, coop_scrub.h) under <name>, from byte <start> on
  *                                (default 0); past <cap> bytes its start (a quarter of <cap>, at most 1 MB) and its end
  *                                are kept, the middle is left out
@@ -18,10 +21,10 @@
  * (refused - <why> when the command had no usable name).
  */
 
-#define REP_MAX_FILES 24
+#define REP_MAX_FILES 40          /* (lane 62: 24 before; a job beyond this drops its last files, so the mod lists the Steam piece's files first) */
 #define REP_HEAD_MAX  (1024u * 1024u)
 #define REP_CHUNK     (1024u * 1024u)
-typedef struct { wchar_t src[MAX_PATH]; char dst[64]; ULONGLONG cap, start; } rep_file;    /* start: bytes before it are left out */
+typedef struct { wchar_t src[MAX_PATH]; char dst[64]; ULONGLONG cap, start; int kind; } rep_file;    /* start: bytes before it are left out; kind: 0, SCRUB_STEAM_LOG or SCRUB_STEAM_STATUS */
 static struct {
     volatile LONG state;          /* 0 idle, 1 running, 2 finished (result says how), 3 refused */
     LONG shown;                   /* the state the status file was last written for */
@@ -67,7 +70,7 @@ static int rep_write(HANDLE o, const char *buf, size_t n)
 }
 
 /* copy [from, to) of h to o, scrubbed, in whole lines of at most REP_CHUNK bytes (a longer line is cut in pieces) */
-static int rep_copy_range(HANDLE h, HANDLE o, ULONGLONG from, ULONGLONG to, char *in, char *out)
+static int rep_copy_range(HANDLE h, HANDLE o, ULONGLONG from, ULONGLONG to, char *in, char *out, char *mid, int kind)
 {
     ULONGLONG pos = from;
     size_t carry = 0;
@@ -89,7 +92,10 @@ static int rep_copy_range(HANDLE h, HANDLE o, ULONGLONG from, ULONGLONG to, char
             while (k > 0 && in[k - 1] != '\n') k--;
             if (k > 0) cut = k;
         }
-        w = scrub_buf(in, cut, out, REP_CHUNK * 4);
+        if (kind) {                        /* (lane 62) a file of the Steam piece: its names go by the shape of the line first */
+            size_t m = scrub_steam(in, cut, mid, REP_CHUNK * 2, kind);
+            w = scrub_buf(mid, m, out, REP_CHUNK * 4);
+        } else w = scrub_buf(in, cut, out, REP_CHUNK * 4);
         if (!rep_write(o, out, w)) return 0;
         carry = have - cut;
         if (carry) memmove(in, in + cut, carry);
@@ -98,7 +104,7 @@ static int rep_copy_range(HANDLE h, HANDLE o, ULONGLONG from, ULONGLONG to, char
     return 1;
 }
 
-static int rep_copy(const rep_file *rf, char *in, char *out)
+static int rep_copy(const rep_file *rf, char *in, char *out, char *mid)
 {
     wchar_t dst[MAX_PATH], wname[64];
     HANDLE h, o;
@@ -114,14 +120,14 @@ static int rep_copy(const rep_file *rf, char *in, char *out)
     if (o == INVALID_HANDLE_VALUE) { CloseHandle(h); return 0; }
     size = (ULONGLONG)sz.QuadPart;
     base = rf->start < size ? rf->start : size;          /* (an earlier run's lines above this run's, when they could not be moved) */
-    if (rf->cap == 0 || size - base <= rf->cap) ok = rep_copy_range(h, o, base, size, in, out);
+    if (rf->cap == 0 || size - base <= rf->cap) ok = rep_copy_range(h, o, base, size, in, out, mid, rf->kind);
     else {
         char note[200];
         int n;
         ULONGLONG from;
         head = rf->cap / 4; if (head > REP_HEAD_MAX) head = REP_HEAD_MAX;
         tail = rf->cap - head;
-        ok = rep_copy_range(h, o, base, base + head, in, out);
+        ok = rep_copy_range(h, o, base, base + head, in, out, mid, rf->kind);
         head += base;
         /* the end starts at a whole line: the first newline at or after (size - tail) */
         from = size - tail;
@@ -135,7 +141,7 @@ static int rep_copy(const rep_file *rf, char *in, char *out)
         n = _snprintf(note, sizeof(note) - 1, "\r\n... %.1f MB of this file are left out here (the bug report keeps its start and its end) ...\r\n",
                       (double)(from - head) / 1048576.0);
         if (ok && n > 0) ok = rep_write(o, note, (size_t)n);
-        if (ok) ok = rep_copy_range(h, o, from, size, in, out);
+        if (ok) ok = rep_copy_range(h, o, from, size, in, out, mid, rf->kind);
     }
     CloseHandle(h);
     CloseHandle(o);
@@ -206,13 +212,13 @@ static int rep_open(const wchar_t *what)
 
 static DWORD WINAPI rep_thread(void *arg)
 {
-    char *in = (char *)malloc(REP_CHUNK), *out = (char *)malloc(REP_CHUNK * 4);
+    char *in = (char *)malloc(REP_CHUNK), *out = (char *)malloc(REP_CHUNK * 4), *mid = (char *)malloc(REP_CHUNK * 2);
     char why[160] = "";
     int i, zipped = 0, opened = 0;
     (void)arg;
     RP.copied = 0;
-    if (in && out) for (i = 0; i < RP.nfiles; i++) if (rep_copy(&RP.f[i], in, out)) RP.copied++;
-    free(in); free(out);
+    if (in && out && mid) for (i = 0; i < RP.nfiles; i++) if (rep_copy(&RP.f[i], in, out, mid)) RP.copied++;
+    free(in); free(out); free(mid);
     if (!RP.zip) _snprintf(why, sizeof(why) - 1, "no zip asked");
     else if (rep_tar(why, sizeof(why) - 1) == 0) zipped = 1;
     else DeleteFileW(RP.zipPath);                          /* a partial zip */
@@ -260,9 +266,10 @@ static void report_cmd(int argc, char **argv)
         *a++ = 0;
         b = strchr(a, '\t');
         if (_stricmp(line, "name") == 0 && b) { *b++ = 0; scrub_add(a, b, 0); continue; }
-        if (_stricmp(line, "file") == 0 && b) {
+        if ((_stricmp(line, "file") == 0 || _stricmp(line, "steamlog") == 0 || _stricmp(line, "steamstatus") == 0) && b) {
             rep_file *rf;
             char *d = NULL;
+            int kind = _stricmp(line, "steamlog") == 0 ? SCRUB_STEAM_LOG : _stricmp(line, "steamstatus") == 0 ? SCRUB_STEAM_STATUS : 0;
             *b++ = 0;
             c = strchr(b, '\t');
             if (c) { *c++ = 0; d = strchr(c, '\t'); if (d) *d++ = 0; }
@@ -273,6 +280,7 @@ static void report_cmd(int argc, char **argv)
             strcpy(rf->dst, b);
             rf->cap = c ? _strtoui64(c, NULL, 10) : 0;
             rf->start = d ? _strtoui64(d, NULL, 10) : 0;
+            rf->kind = kind;
             RP.nfiles++;
         }
     }

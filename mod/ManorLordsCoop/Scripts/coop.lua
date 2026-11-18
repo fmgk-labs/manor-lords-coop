@@ -8,7 +8,7 @@
 
 local C = rawget(_G, "Coop") or {}
 _G.Coop = C
-C.version = "0.2.2"
+C.version = "0.2.3"
 
 -- where the link files live: set by main.lua to "<this mod's folder>/link/"; the development console uses the probe's folder
 local LINK = rawget(_G, "COOP_LINK_DIR")
@@ -193,7 +193,8 @@ end
 local function header(name)
   local S = C.s
   local t = string.format("%.3f", now())
-  return t .. string.format(" session: Manor Lords Co-op %s, log of %s, run %d started %s (this PC's clock)\n", C.version, name, C.runT, os.date("%Y-%m-%d %H:%M:%S", C.runT))
+  return t .. string.format(" session: Manor Lords Co-op %s, log of %s, run %d started %s (this PC's clock)%s\n", C.version, name, C.runT, os.date("%Y-%m-%d %H:%M:%S", C.runT),
+                            SESS.pid and (", process " .. SESS.pid) or "")      -- (lane 62: the process id, once the native piece told it)
       .. t .. string.format(" session: role %s, game version %s, UE4SS %s, earlier logs in link\\sessions (newest %d per name), log size cap %s MB%s\n",
            tostring(S and S.role), SESS.gameVer or "read later", ue4ssVersion(), SESS.keep, tostring(C.logCapMB),
            SESS.notMoved == name and " (the last run's log could not be moved: it is above this line)" or "")
@@ -233,6 +234,34 @@ local function logBody(fmt, ...)
 end
 -- (lane 61) a fault in the log's own steps (turnover, scrub, cap) never reaches the caller (a module's step)
 local function log(fmt, ...) pcall(logBody, fmt, ...) end
+
+-- (lane 62) EVERY COUNTED ERROR LEAVES A LINE. S.nerr ("N tick error(s) this run" in a bug report) was raised at eleven
+-- places; six of them wrote nothing (a module's tick, a module's message handler, the squad mirror, a delayed step,
+-- the two calls of the army module's order step), and the others only the first five errors of a run. First public
+-- session (2026-11-17): a friend's report said "1 tick error(s) this run" and no log had a line for it.
+-- Now every place counts through here: the first five errors of a run and the first of every different text get their
+-- own line; repeats of a text already written are counted and told once a minute ("errors: N more ..."), also when
+-- no further error comes (C.errFlush from the session step every 2 s, and before a bug report is made).
+local ERRL = { seen = {}, nseen = 0, quiet = 0, t = -1e9 }
+local function countErr(S, where, e)
+  S.nerr = (S.nerr or 0) + 1
+  local msg = tostring(where) .. ": " .. tostring(e)
+  S.lastErr = msg
+  local fresh = not ERRL.seen[msg] and ERRL.nseen < 200       -- (200 different texts at most get a line of their own)
+  if fresh then ERRL.seen[msg] = true; ERRL.nseen = ERRL.nseen + 1 end
+  if fresh or S.nerr <= 5 then log("error %d in %s (role %s): %s", S.nerr, tostring(where), tostring(S.role), tostring(e))
+  else ERRL.quiet = ERRL.quiet + 1; ERRL.last = msg end
+end
+C.countErr = countErr                  -- (a module may count its own caught error the same way)
+function C.errFlush(force)
+  if ERRL.quiet == 0 then return end
+  local t = os.clock()
+  if not force and t - ERRL.t < 60.0 then return end
+  ERRL.t = t
+  local S = C.s
+  log("errors: %d more since the last such line, each a repeat of an error written before (%d this run); the last: %s", ERRL.quiet, S and S.nerr or 0, tostring(ERRL.last))
+  ERRL.quiet = 0
+end
 
 local function later(dt, fn) local S = C.s; S.later[#S.later + 1] = { t = os.clock() + dt, fn = fn } end
 
@@ -489,12 +518,32 @@ local function segChain(who)
 end
 
 -- a reader that starts at the end of a player's lines (nil when that player has no file yet)
+-- (lane 62) HISTORY WITHOUT COMPARING TWO CLOCKS. A line of another player is "written before this session" when it
+-- was in that player's file before this copy began to read it. Until now that was asked of the clocks: the SENDER's
+-- stamp against THIS copy's start time minus 1 s (seven places). Two PCs' clocks differ (0.3 to 0.9 s seen live, and
+-- drifting): a friend whose clock is more than 1 s ahead threw the host's lines of its first seconds away, and a
+-- host dropped a friend's first orders the same way. Now the reader remembers the LAST line that was in the file
+-- when it began (its stamp and number, both the sender's own): a line is history when it is not later than that one,
+-- by the sender's clock and count alone (C.stale). A file that was empty or missing then has no history. When the
+-- file is written anew (it got shorter, or starts with other bytes: that player started again) the mark goes.
 local function readerAtEnd(who)
   local _, k = segChain(who)
   local f = io.open(segFile(who, k), "rb"); if not f then return nil end
-  local R = { seg = k, off = f:seek("end"), part = "" }; f:close()
+  local R = { seg = k, off = f:seek("end"), part = "" }
+  f:seek("set", math.max(0, R.off - 4096)); local tail = f:read("a") or ""; f:close()
+  local last; for l in tail:gmatch("([^\n]*)\n") do if l:match("^%d+ [%d%.]+ ") then last = l end end
+  if last then R.floorSeq, R.floorWall = tonumber(last:match("^(%d+) ")), tonumber(last:match("^%d+ ([%d%.]+) ")) end
   return R
 end
+-- is this line of that player history (see above)?  w: the line's words (number, stamp, kind ...)
+local function stale(peer, w)
+  local S = C.s; local R = S and S.readers and S.readers[peer]
+  local wall = tonumber(w[2])
+  if not (R and R.floorWall and wall) then return false end
+  if wall < R.floorWall then return true end
+  return wall == R.floorWall and (tonumber(w[1]) or math.huge) <= (R.floorSeq or -1)
+end
+C.stale = stale
 
 -- this copy starts its own lines afresh: empty <who>.txt first, then delete the numbered files (a reader whose file is
 -- gone and that finds no later one then starts again at <who>.txt, as when a file gets shorter)
@@ -601,7 +650,7 @@ recvBody = function(peer)
       -- this file is gone. A later file exists: this copy was more than two whole files behind (never in normal play)
       local nx; for j = R.seg + 1, R.seg + 64 do if exists(segFile(peer, j)) then nx = j; break end end
       if nx then log("link: %s.%d.txt was deleted before this copy read it to its end; going on with file %d (lines may be lost)", peer, R.seg, nx); R.seg, R.off, R.part, R.head = nx, 0, "", nil
-      elseif exists(segFile(peer, 1)) then R.seg, R.off, R.part, R.head = 1, 0, "", nil   -- none: that player started again
+      elseif exists(segFile(peer, 1)) then R.seg, R.off, R.part, R.head = 1, 0, "", nil; R.floorWall = nil; R.floorSeq = nil   -- none: that player started again (lane 62: no history in its new file)
       else break end
     else
       local size = f:seek("end")
@@ -609,7 +658,7 @@ recvBody = function(peer)
       -- not show it: a rejoining friend's first line is exactly as long as the first line of the session before, and the
       -- host never saw that hello (first session between two PCs, 2026-11-11). So the first bytes are compared too.
       f:seek("set", 0); local head = f:read(48) or ""
-      if size < R.off or (R.head and #R.head > 0 and head:sub(1, #R.head) ~= R.head) then R.off = 0; R.part = ""; R.head = nil end
+      if size < R.off or (R.head and #R.head > 0 and head:sub(1, #R.head) ~= R.head) then R.off = 0; R.part = ""; R.head = nil; R.floorWall = nil; R.floorSeq = nil end   -- (lane 62: written anew, no history in it)
       if not R.head or #head > #R.head then R.head = head end
       if size == R.off then f:close(); break end
       f:seek("set", R.off); local data = f:read("a"); f:close()
@@ -1067,13 +1116,13 @@ local function hostInbox()
   for _, peer in ipairs(S.peers) do
     for _, line in ipairs(recv(peer)) do
       local w = words(line)
-      if w[3] == "O" and tonumber(w[2]) and tonumber(w[2]) >= S.startWall - 1 then
+      if w[3] == "O" and tonumber(w[2]) and not stale(peer, w) then
         S.curPeer = peer
         local ok, r = pcall(applyOrder, w)
         S.stats.applied = S.stats.applied + 1
         log("APPLIED %s %s %s %s delay_ms=%.0f %s", peer, w[1], w[4], w[5], (now() - tonumber(w[2])) * 1000, ok and tostring(r) or ("ERR " .. tostring(r)))
-      elseif w[3] == "BYE" and tonumber(w[2]) and tonumber(w[2]) >= S.startWall - 1 then C.friendLeft(peer, "its goodbye (" .. tostring(w[4]) .. ")", "bye")   -- (lane 51)
-      elseif w[3] and tonumber(w[2]) and tonumber(w[2]) >= S.startWall - 1 then C.dispatch(peer, w, line) end
+      elseif w[3] == "BYE" and tonumber(w[2]) and not stale(peer, w) then C.friendLeft(peer, "its goodbye (" .. tostring(w[4]) .. ")", "bye")   -- (lane 51)
+      elseif w[3] and tonumber(w[2]) and not stale(peer, w) then C.dispatch(peer, w, line) end
     end
   end
   -- keep chasing: re-send the attack approach until the squads are in contact
@@ -2213,7 +2262,7 @@ local function friendInbox()
           local MM = S.mirE or {}; S.mirE = MM; local last = MM[H.h]
           if not (last and last.e == entry and clockNow - last.t < 0.25) then
             if last then last.e = entry; last.t = clockNow else MM[H.h] = { e = entry, t = clockNow } end
-            local ok, e = pcall(mirror, H); if not ok then S.nerr = S.nerr + 1; S.lastErr = "mirror: " .. tostring(e) end
+            local ok, e = pcall(mirror, H); if not ok then countErr(S, "mirror", e) end
           else S.stats.mirrorSame = (S.stats.mirrorSame or 0) + 1 end
         end
       end end
@@ -2459,13 +2508,14 @@ do
 end
 local function body()
   local S = C.s; local clock = os.clock()
+  local roleN0 = S.roleN                                      -- (lane 62) C.setRole counts its calls: see the module loop below
 if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local tf0 = io.open(LINK .. "dev_trace.txt", "rb"); if tf0 then tf0:close(); C.traceF = io.open(LINK .. S.name .. "_trace.txt", "w+b") end end   -- (lane 47, round three: test switch dev_trace.txt)
   if S.role == "idle" then
     -- Not a co-op game (a solo game, or the title screen before anything was chosen): the mod changes nothing. Only the
     -- menu, the Steam link and the native piece keep ticking, so the player can start hosting or accept an invite.
     objs()
     for name, m in pairs(C.modules) do
-      if m.idle then local ok, e = pcall(m.idle, S, clock); if not ok then S.nerr = S.nerr + 1; S.lastErr = name .. ".idle: " .. tostring(e); if S.nerr <= 5 then log("error %d in %s.idle: %s", S.nerr, name, tostring(e)) end end end
+      if m.idle then local ok, e = pcall(m.idle, S, clock); if not ok then countErr(S, name .. ".idle", e) end end
     end
     return
   end
@@ -2482,7 +2532,7 @@ if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local
       end
     end
     for name, m in pairs(C.modules) do
-      if m.idle then local ok, e = pcall(m.idle, S, clock); if not ok then S.nerr = S.nerr + 1; S.lastErr = name .. ".idle: " .. tostring(e); if S.nerr <= 5 then log("error %d in %s.idle: %s", S.nerr, name, tostring(e)) end end end
+      if m.idle then local ok, e = pcall(m.idle, S, clock); if not ok then countErr(S, name .. ".idle", e) end end
     end
     return
   end
@@ -2499,13 +2549,13 @@ if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local
       if m.onWorld then
         crumb(S, name .. ".onWorld")
         local ok, e = pcall(m.onWorld, S)
-        if not ok then S.nerr = S.nerr + 1; S.lastErr = name .. ".onWorld: " .. tostring(e); log("error %d in %s.onWorld: %s", S.nerr, name, tostring(e)) end
+        if not ok then countErr(S, name .. ".onWorld", e) end
       end
     end
   end
   if #S.later > 0 then
     local keep = {}
-    for _, L in ipairs(S.later) do if clock >= L.t then local ok, e = pcall(L.fn); if not ok then S.nerr = S.nerr + 1; S.lastErr = "later: " .. tostring(e) end else keep[#keep + 1] = L end end
+    for _, L in ipairs(S.later) do if clock >= L.t then local ok, e = pcall(L.fn); if not ok then countErr(S, "later", e) end else keep[#keep + 1] = L end end
     S.later = keep
   end
   if S.role == "host" then
@@ -2525,7 +2575,9 @@ if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local
       local sid = C.steamSlots and C.steamSlots()
       for _, p in ipairs(S.peers) do
         local h = S.heard and S.heard[p]
-        if h and not C.hold and not (C.join and C.join.state) then
+        -- (lane 62, part two) not while this host's Steam piece tries to get back into its lobby (S.linkWait,
+        -- coop_ui.lua: 30 s at most): no friend is told as gone inside that window; its clock starts afresh after it
+        if h and not C.hold and not (C.join and C.join.state) and not S.linkWait then
           local g = clock - h
           local off = sid and sid.seen[p] and not sid.now[p]          -- out of Steam's lobby for 3 s in a row (not one read)
           S.steamOff = S.steamOff or {}; if off then S.steamOff[p] = S.steamOff[p] or clock else S.steamOff[p] = nil end
@@ -2549,7 +2601,7 @@ if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local
     -- (lane 28) orders of this copy's player that only the native piece can see (a path, an order against a building):
     -- the army module reads them here, before this tick's snapshot, so that friends get the order before the squad's
     -- new state
-    if C.preOrders then crumb(S, "preOrders"); local okP, eP = pcall(C.preOrders, S, clock); if not okP then S.nerr = S.nerr + 1; S.lastErr = "preOrders: " .. tostring(eP) end end
+    if C.preOrders then crumb(S, "preOrders"); local okP, eP = pcall(C.preOrders, S, clock); if not okP then countErr(S, "preOrders", eP) end end
     if clock - (S.tFast or 0) >= 0.05 then
       S.tFast = clock
       -- (lane 47, round two) every squad's state twice a second (was four times); a squad that moved, fought or got an
@@ -2561,7 +2613,7 @@ if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local
   elseif S.role == "friend" then
     -- (lane 28) the same on a friend, before the watcher: a path order must not also go to the host as a plain move
     -- (measured: the host took the move and the path in that order and the squad then walked straight)
-    if C.preOrders then crumb(S, "preOrders"); local okP, eP = pcall(C.preOrders, S, clock); if not okP then S.nerr = S.nerr + 1; S.lastErr = "preOrders: " .. tostring(eP) end end
+    if C.preOrders then crumb(S, "preOrders"); local okP, eP = pcall(C.preOrders, S, clock); if not okP then countErr(S, "preOrders", eP) end end
     crumb(S, "watch"); watch()
     if clock - S.tUp >= 0.5 then S.tUp = clock; crumb(S, "removeTick"); removeTick(clock); crumb(S, "friendUpkeep"); friendUpkeep() end
     if clock - S.tIn >= 0.02 then S.tIn = clock; crumb(S, "friendInbox"); friendInbox() end
@@ -2602,13 +2654,18 @@ if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local
     -- tick): no other module runs after it. Before, the job board switched the gate on again in the same frame and,
     -- with no tick after the stop, a friend kept the JG byte on and the job list full (acceptance run acc1).
     if not S.on then break end
+    -- (lane 62) the role changed inside this tick (C.setRole from a module: the host is gone, the Leave button; it
+    -- takes the world's objects away, S.eng and S.p1, until the next tick attaches them again): no other module runs
+    -- in this tick. Before, the modules after it ran with a role and a world they were not started for; an error
+    -- there was counted without a line (the likely source of the friend's "1 tick error(s)" with nothing in the log).
+    if S.roleN ~= roleN0 then break end
     if m.tick then
       crumb(S, name .. ".tick")
       local hk = C.traceF and rawget(C, "traceHook") and C.traceHook[name]      -- (lane 47, round three: test switch only)
       if hk then hookMod = type(hk) == "string" and hk or ("coop_x_" .. name); hookLast = nil; debug.sethook(hookFn, "c") end
       local k0 = os.clock(); local ok, e = pcall(m.tick, S, clock); kAdd(name, (os.clock() - k0) * 1000)
       if hk then debug.sethook() end
-      if not ok then S.nerr = S.nerr + 1; S.lastErr = name .. ".tick: " .. tostring(e) end
+      if not ok then countErr(S, name .. ".tick", e) end
     end
   end
   crumb(S, "tick done")
@@ -2627,7 +2684,7 @@ function C.dispatch(from, w, line)
       local ok, r = pcall(m.onMessage, C.s, from, w[3], w, line)
       local d = os.clock() - k0                                -- lane 45: the module that took the line, or that spent time on it
       if r or d > 0 then local mn = K.msgName[name]; if not mn then mn = name .. ":msg"; K.msgName[name] = mn end; kAdd(mn, d * 1000) end
-      if not ok then C.s.nerr = C.s.nerr + 1; C.s.lastErr = name .. ".onMessage: " .. tostring(r) elseif r then return true end
+      if not ok then countErr(C.s, name .. ".onMessage (a " .. tostring(w[3]) .. " line from " .. tostring(from) .. ")", r) elseif r then return true end
     end
   end
   return false
@@ -2656,6 +2713,27 @@ function C.friendLeft(p, why, kind)
   S.gone[p] = true; S.goneWhy[p] = kind or "silence"; S.goneT[p] = os.clock(); log("%s left the game: %s", p, why)
   C.notify("left", ((S.display and S.display[p]) or p) .. " left the game")
 end
+-- (lane 62) This host lost its own Steam lobby (coop_ui.lua tells the player once, in one notice): every friend heard
+-- so far has left with it. Marked as gone on Steam's word, without a "left the game" notice each. A friend that
+-- joins again is "back" by the rule in the host's tick (its lines come again, and Steam has it in the new lobby).
+-- A join under way for a friend is dropped: nobody is there to load the save.
+function C.friendsLost(why)
+  local S = C.s; if not S or S.role ~= "host" then return 0 end
+  S.gone = S.gone or {}; S.goneWhy = S.goneWhy or {}; S.goneT = S.goneT or {}
+  local n = 0
+  for _, p in ipairs(S.peers or {}) do
+    if S.heard and S.heard[p] and not S.gone[p] then
+      S.gone[p] = true; S.goneWhy[p] = "steam"; S.goneT[p] = os.clock(); n = n + 1
+      log("%s left the game: %s", p, tostring(why))
+    end
+  end
+  local J = rawget(C, "join")
+  if J then
+    J.away = {}; J.q = {}
+    if J.state == "saving1" then J.state = nil; J.one = nil; log("join: the save for a friend's load alone is dropped (%s)", tostring(why)) end
+  end
+  return n
+end
 -- (lane 51) Steam's lobby on the host: which friend slots it holds now, and which it ever held (nil without Steam)
 function C.steamSlots()
   local ST = rawget(C, "steam"); if not (ST and ST.on and ST.status) then return nil end
@@ -2672,7 +2750,7 @@ function C.notify(kind, text)
   -- (lane 61) the log gets the slot ("friend 1"), never the Steam name the player sees (also a name under 3 letters)
   local lt = tostring(text); local S = C.s
   if S and S.display then for slot, nm in pairs(S.display) do if type(nm) == "string" and nm ~= "" then lt = plainReplace(lt, nm, slotName(slot)) end end end
-  log("notice [%s] %s", tostring(kind), lt)
+  log("notice [%s] %s", tostring(kind), (lt:gsub("\n", " / ")))    -- (lane 63: a notice of two lines, coop_ui.lua)
   local show = rawget(C, "onNotice"); if type(show) == "function" then pcall(show, n) end
 end
 
@@ -2813,7 +2891,7 @@ function C.tick()
   FR.p1 = false; FR.eng = false                              -- (objs checks them again first)
   local ok, e = pcall(body)
   FR.p1 = false; FR.eng = false
-  if not ok then S.nerr = S.nerr + 1; S.lastErr = tostring(e); if S.nerr <= 5 then log("tick error %d: %s", S.nerr, tostring(e)) end end
+  if not ok then countErr(S, "the tick", e) end
   pcall(C.sessionStep, S)                                    -- (lane 61) "session:" lines (every 2 s at most)
   if SESS.rep then pcall(C.reportStep) end                   -- (lane 61) a bug report the native piece is making
   dv = K.step.dev
@@ -2869,6 +2947,18 @@ function C.sessionStep(S)
   local t = os.clock()
   if t - (SESS.stepT or -10) < 2.0 then return end
   SESS.stepT = t
+  C.errFlush()                                               -- (lane 62) counted errors that got no line of their own: once a minute
+  -- (lane 62) Which process this is. Lua has no process id: the native piece's status names it. Written once into the
+  -- log ("session: process ..."), into the header of every log this run starts later, into the guard's lock file
+  -- (coop_guard.lua), and into a bug report: a file can then be told from one another copy of the game wrote.
+  if not SESS.pid and t - (SESS.pidT or -100) > 5.0 then
+    SESS.pidT = t
+    local P = rawget(C, "patch")
+    local ok, st = pcall(function() return (P and P.fn and P.status) and P.status() or nil end)
+    local pid = ok and st and st.text and tonumber(tostring(st.text):match("process (%d+)")) or nil
+    if pid then SESS.pid = pid; log("session: process %d, run %d started %s (this PC's clock)", pid, C.runT, os.date("%Y-%m-%d %H:%M:%S", C.runT)) end
+  end
+  local G = rawget(_G, "COOP_GUARD"); if G and G.beat then pcall(G.beat, SESS.pid) end      -- the lock's heartbeat (one copy per install)
   if not SESS.gameVer and t - (SESS.verT or -100) > 10.0 then
     SESS.verT = t
     local ok, v = pcall(function() local gi = FindFirstOf("MLGameInstance"); if valid(gi) then SESS.gi = gi; return gi:GetDisplayAppVersion():ToString() end end)
@@ -2890,7 +2980,7 @@ end
 -- Without the native piece (coop.cfg native = off) the files are written scrubbed, without a zip, as
 -- link\reports\report_<time>_<file> and nothing is opened. Test switch: link\dev_report_noopen.txt (no Explorer).
 local NAMES_ALL = { "idle", "host", "friend1", "friend2", "friend3", "friend4", "friend5", "friend6", "friend7" }
-local function reportInfo(S, files, old)
+local function reportInfo(S, files, old, steamNote)
   local P = rawget(C, "patch")
   local st = (P and P.fn and P.status) and P.status() or nil
   local steam = rawget(C, "steam")
@@ -2907,9 +2997,14 @@ local function reportInfo(S, files, old)
     "Players connected: " .. playersText(S),
     "Save:              " .. saveName(S),
     "This run started:  " .. os.date("%Y-%m-%d %H:%M:%S", C.runT),
+    -- (lane 62) which process wrote what: each log below names its process and run; one install, one co-op copy
+    "This process:      " .. (SESS.pid and ("pid " .. SESS.pid) or "pid not known (the native piece is not loaded)") .. ", run " .. tostring(C.runT) .. " (the run's number is in the first line of each of its logs)",
+    "One copy guard:    " .. tostring((rawget(_G, "COOP_GUARD") or {}).state or "not loaded"),
     "Steam link:        " .. (ss and (tostring(ss.state) .. (ss.slot and (", slot " .. ss.slot) or "") .. ", " .. #(ss.players or {}) .. " player(s) in the lobby") or "off"),
-    "Resyncs and errors: " .. string.format("%d tick error(s) this run", S.nerr or 0),
+    -- (lane 62) every counted error has a line "error <n> in <where>" in the log of the role it happened in
+    "Resyncs and errors: " .. string.format("%d tick error(s) this run", S.nerr or 0) .. (((S.nerr or 0) > 0 and (S.lastErr or "") ~= "") and ("; the last: " .. tostring(S.lastErr):gsub("[\r\n]+", " ")) or ""),
     (old or 0) > 0 and string.format("Left out:          %d log(s) from before 0.2.2 (they may hold Steam names)", old) or "Left out:          none",
+    "Steam piece files: " .. tostring(steamNote or "not asked"),
     "",
     "Files in this report:",
     "  report_info.txt  this file",
@@ -2933,11 +3028,37 @@ function C.report(opts)
   local R = SESS.rep
   if R and os.clock() - R.t < 180.0 then return "a bug report is being made: report_" .. R.stamp end
   local stamp = os.date("%Y-%m-%d_%H-%M-%S")
+  pcall(C.errFlush, true)                                 -- (lane 62) the errors counted so far all have their line before the logs are copied
   local files = {}
-  local function add(src, dst, cap, note, start) if src and fexists(src) then files[#files + 1] = { src, dst, cap or 0, note, start or 0 } end end
+  local function add(src, dst, cap, note, start, kind) if src and fexists(src) then files[#files + 1] = { src, dst, cap or 0, note, start or 0, kind } end end
+  -- (lane 62) The Steam piece's log and status file: without them a fault in the Steam lobby cannot be read from a
+  -- report (first public session: the host lost its lobby, and only its coop_steam.log said so). They hold Steam
+  -- names this mod may not know any more (after a lobby is lost the status lists nobody; the log holds names of
+  -- earlier sessions), so the native piece takes the names out by the SHAPE of the line ("steamlog" / "steamstatus"
+  -- in the job; native\coop_patch\coop_scrub.h: a name becomes its slot, "host" / "friend 1", or "<name>"), then cuts
+  -- the Steam ids to their last 4 digits and the user name like everywhere. They are listed first (the job takes 40
+  -- files). Without the native piece they are left out: the list of known names alone is not enough for them.
+  -- Where: the Steam piece's link folder, else the mod's (a copy with the Steam link switched off may still hold the
+  -- files of an earlier run: they are taken too).
+  local STm, Pn = rawget(C, "steam"), rawget(C, "patch")
+  local sdir = (STm and STm.link) or LINK
+  local steamNote
+  if Pn and Pn.fn and Pn.dir and Pn.send then
+    add(sdir .. "coop_steam.log", "coop_steam.log", 2 * 1048576, "the Steam piece's log (Steam names out by line shape)", 0, "steamlog")
+    add(sdir .. "coop_steam.log.old", "coop_steam.log.old", 2 * 1048576, "its log before (it turns over at 1 MB)", 0, "steamlog")
+    add(sdir .. "steam_status.txt", "steam_status.txt", 0, "the Steam piece's status as it was last written (players by slot, not by name)", 0, "steamstatus")
+    steamNote = #files > 0 and (#files .. " file(s), Steam names taken out by the shape of the line") or "none found (the Steam link never ran in this folder)"
+  else steamNote = "left out (they hold Steam names that only the native piece takes out, and it is not loaded)" end
   -- a log's run (its header's) and start; a log without a 0.2.2 header is left out: it may hold Steam names (0.2.1 wrote them)
   local old = 0
   local function at(l) local t, run = logStart(l); return run, t and os.date("%Y-%m-%d %H:%M:%S", math.floor(t)) or "?" end
+  -- (lane 62) the process a log names (its header, or its "session: process" line; in its first 64 KB)
+  local function logPid(path)
+    local f = io.open(path, "rb"); if not f then return nil end
+    local head = f:read(65536) or ""; f:close()
+    return head:match("session: [^\n]-, process (%d+)") or head:match("session: process (%d+)")
+  end
+  local mine = "process " .. tostring(SESS.pid or "?") .. ", run " .. tostring(C.runT)
   local cand, names = {}, {}
   for n in pairs(SESS.names) do cand[n] = "used" end
   if C.startRole == "idle" then for _, n in ipairs(NAMES_ALL) do cand[n] = cand[n] or "other" end end
@@ -2949,7 +3070,7 @@ function C.report(opts)
     local l = firstLine(cur)
     if l and cand[n] == "used" then
       local from = SESS.from and SESS.from[n] or 0       -- (an earlier run's lines above, when they could not be moved: left out)
-      add(cur, "current_" .. n .. "_log.txt", C.reportLogCap, "this run's log as " .. n .. (from > 0 and " (its own part only)" or ""), from)
+      add(cur, "current_" .. n .. "_log.txt", C.reportLogCap, "this run's log as " .. n .. (from > 0 and " (its own part only)" or "") .. "; written by " .. mine, from)
     elseif l then local key, when = at(l); if key then prev[#prev + 1] = { cur, key, n .. "_log.txt", when } else old = old + 1 end end
     local idx = io.open(LINK .. "sessions/" .. n .. "_index.txt", "rb")
     if idx then
@@ -2962,15 +3083,15 @@ function C.report(opts)
   end
   local best = 0
   for _, e in ipairs(prev) do if e[2] < C.runT and e[2] > best then best = e[2] end end
-  for _, e in ipairs(prev) do if best > 0 and e[2] == best then add(e[1], "previous_" .. e[3], C.reportLogCap, "the run before (started " .. e[4] .. ")") end end
+  for _, e in ipairs(prev) do if best > 0 and e[2] == best then add(e[1], "previous_" .. e[3], C.reportLogCap, "the run before (started " .. e[4] .. "); written by process " .. tostring(logPid(e[1]) or "not recorded") .. ", run " .. tostring(e[2])) end end
   local P = rawget(C, "patch")
   if P and P.statusPath and P.dir then
     add(P.statusPath, "patch_status.txt", 0, "the native piece's status")
     add(P.dir .. "coop_patch.log", "coop_patch.log", 8 * 1048576, "the native piece's log")
     add(P.dir .. "coop_patch.log.old", "coop_patch.log.old", 8 * 1048576, "its log before (it turns over at 256 KB)")
   end
-  add(MODDIR .. "/../../UE4SS.log", "UE4SS.log", 8 * 1048576, "the mod loader's log")
-  local info = reportInfo(S, files, old)
+  add(MODDIR .. "/../../UE4SS.log", "UE4SS.log", 8 * 1048576, "the mod loader's log (the loader writes it anew at every start of the game from this install: it is the log of the copy started LAST, which may be another copy than this process)")
+  local info = reportInfo(S, files, old, steamNote)
   local list = {}; for i, e in ipairs(files) do list[i] = e[2] end
   if P and P.fn and P.dir and P.send then
     local ip = P.dir .. "patch_report_info.txt"
@@ -2979,7 +3100,7 @@ function C.report(opts)
     local J = { "open " .. ((opts.open == false or fexists(LINK .. "dev_report_noopen.txt")) and "0" or "1"), "zip " .. (opts.zip == false and "0" or "1") }
     PRIV.t = -10
     for _, e in ipairs(steamNames()) do J[#J + 1] = "name " .. (e[1]:gsub("[\t\r\n]", " ")) .. "\t" .. e[2] end
-    for _, e in ipairs(files) do J[#J + 1] = "file " .. (e[1]:gsub("/", "\\")) .. "\t" .. e[2] .. "\t" .. string.format("%d\t%d", math.floor(e[3]), math.floor(e[5] or 0)) end
+    for _, e in ipairs(files) do J[#J + 1] = (e[6] or "file") .. " " .. (e[1]:gsub("/", "\\")) .. "\t" .. e[2] .. "\t" .. string.format("%d\t%d", math.floor(e[3]), math.floor(e[5] or 0)) end
     local jf = io.open(P.dir .. "patch_report_job.txt", "wb")
     if not jf then return "the bug report could not be started (the job file could not be written)" end
     jf:write(table.concat(J, "\n"), "\n"); jf:close()
@@ -3098,6 +3219,13 @@ function C.setRole(role, name, peers)
   -- a friend's copy may be running a little fast or slow to catch up with the host: back to normal time
   pcall(function() if valid(S.p1) then StaticFindObject("/Script/Engine.Default__GameplayStatics"):SetGlobalTimeDilation(S.p1, 1.0) end end)
   S.role = role; S.name = name or (role == "friend" and "friend1" or "host"); S.peers = peers or {}
+  S.roleN = (S.roleN or 0) + 1                  -- (lane 62) the driver stops this tick's module loop after a role change
+  S.linkWait = nil; S.linkHold = nil            -- (lane 62, part two) a window for a lost Steam link belongs to the role before
+  -- (lane 62) a new co-op game on this copy (a friend's place, or hosting), however the role came (the Steam link's
+  -- word, the menu, the development console): what the last game's end left in the session module ends here (the way
+  -- back to the main menu still under way, the menu button's words, the silence rule's memory; coop_session.lua)
+  local Psn = rawget(C, "session")
+  if (role == "friend" or role == "host") and Psn and Psn.newGame then pcall(Psn.newGame, "the role is now " .. role) end
   S.reattach = S.reattach or valid(S.eng) or nil   -- (lane 59) a world is attached now: the next attach is this same world (S.sameWorld); kept when C.setRole is called twice before a tick
   S.eng = nil; S.p1 = nil                       -- attach the world again as this role: every module gets onWorld
   S.seq = 0; S.startWall = now(); S.heard = {}; S.gone = {}; S.stats.states = 0; S.readers = {}
@@ -3108,7 +3236,15 @@ function C.setRole(role, name, peers)
   -- a new friend is in some other world (or none): it ignores the host's state until it has loaded the host's save,
   -- and says hello at once so the host starts the join
   C.hold = (role == "friend")
-  if C.join then C.join.helloFor = nil; C.join.holdT = (role == "friend") and os.clock() or nil; C.join.loading = nil end
+  if C.join then
+    C.join.helloFor = nil; C.join.holdT = (role == "friend") and os.clock() or nil; C.join.loading = nil
+    -- (lane 62) nothing of the co-op game before reaches into this role: a repair asked for in the last game was sent
+    -- to the next host 30 s into the next game; the save loaded for the last join counted as "this copy has been in
+    -- the host's game" (coop_session.lua: the silence rule and the host's goodbye) before the new join had loaded one
+    C.join.repairLater = nil; C.join.repairT = nil; C.join.single = nil
+    -- (the places of the last host's saves in its line file, and the loads done for it, belong to that host's file)
+    if role == "friend" then C.join.lastLoaded = nil; C.join.marks = nil; C.join.markList = nil; C.join.done = nil end
+  end
   log("role is now %s (%s)", role, S.name)
   SESS.infoKey = nil                            -- (lane 61) a "session:" line with the role, players and save follows
   if role ~= "friend" and C.patch and C.patch.fn and C.patch.send then pcall(C.patch.send, "ALLOFF") end

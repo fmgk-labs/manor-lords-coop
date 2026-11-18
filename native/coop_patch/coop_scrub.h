@@ -108,3 +108,108 @@ static size_t scrub_buf(const char *in, size_t n, char *out, size_t cap)
 #undef SC_PUT
     return o;
 }
+
+/* (lane 62) The Steam piece's own files (coop_steam.log, steam_status.txt) in a bug report. They hold Steam display
+ * names that the mod may not know any more when the report is made (a host that lost its lobby has no player list; the
+ * log holds names of earlier sessions), and names of any length. So these names are taken out by the SHAPE of the
+ * line, not by a list of known names:
+ *   kind 1, the log (each line: 24 bytes of date and time, then the text):
+ *     "<name> (<digits>) connected as friend<N>"                      -> "friend <N> (<digits>) connected as friend<N>"
+ *     "note: <name> is in the lobby but the co-op mod ..."            -> "note: <name> is in the lobby but ..."   (the 6 bytes "<name>")
+ *     "first callback ...: first bytes <hex>"  (a whole Steam id in hex) -> "first callback ...: first bytes <left out>"
+ *   kind 2, the status file:
+ *     "<slot> <id> <state> <ping> <name>"   (a player line)           -> "<slot> <id> <state> <ping> host" or "... friend <slot>"
+ *     "note <name> is in the lobby but the co-op mod ..."             -> "note <name> is in the lobby but ..."
+ * (DLL 0.3 and later write no persona name into the log; the rules are for logs an earlier DLL wrote.) The Steam ids
+ * and the user name go by the common rules afterwards (scrub_buf). in[0..n) -> out, whole lines; returns the bytes. */
+#define SCRUB_STEAM_LOG    1
+#define SCRUB_STEAM_STATUS 2
+static size_t sc_find_last(const char *s, size_t n, const char *what)
+{
+    size_t w = strlen(what), i;
+    if (n < w) return (size_t)-1;
+    for (i = n - w + 1; i-- > 0; ) if (memcmp(s + i, what, w) == 0) return i;
+    return (size_t)-1;
+}
+static size_t scrub_steam_line(const char *s, size_t n, char *out, size_t cap, int kind)
+{
+    static const char NOMOD[] = " is in the lobby but the co-op mod";
+    size_t o = 0, at, i, j;
+#define SL_PUT(p, len) do { size_t l_ = (len); if (o + l_ > cap) l_ = cap - o; memcpy(out + o, (p), l_); o += l_; } while (0)
+    if (kind == SCRUB_STEAM_LOG && n > 24 && sc_digit((unsigned char)s[0]) && s[23] == ' ') {
+        const char *b = s + 24;
+        size_t bn = n - 24;
+        /* "first callback <id> (...): first bytes <24 bytes in hex>": the raw bytes of Steam's callback, which hold a
+         * whole Steam id (the member that changed, the friend that invited, the peer of a session) where no rule
+         * for decimal ids finds it */
+        at = sc_find_last(b, bn, "first bytes ");
+        if (at != (size_t)-1 && bn > 15 && memcmp(b, "first callback ", 15) == 0) { SL_PUT(s, 24 + at + 12); SL_PUT("<left out>", 10); return o; }
+        at = sc_find_last(b, bn, ") connected as friend");
+        if (at != (size_t)-1) {
+            /* the digits after "friend" must end the line; before the ")" digits, then "(" after a space */
+            i = at + 21;
+            j = i;
+            while (j < bn && sc_digit((unsigned char)b[j])) j++;
+            if (j > i && j == bn) {
+                size_t d = at;
+                while (d > 0 && sc_digit((unsigned char)b[d - 1])) d--;
+                if (d < at && d >= 2 && b[d - 1] == '(' && b[d - 2] == ' ' && d - 2 > 0) {
+                    SL_PUT(s, 24); SL_PUT("friend ", 7); SL_PUT(b + i, j - i); SL_PUT(b + d - 2, bn - (d - 2));
+                    return o;
+                }
+            }
+        }
+        if (bn > 6 && memcmp(b, "note: ", 6) == 0) {
+            at = sc_find_last(b, bn, NOMOD);
+            if (at != (size_t)-1 && at > 6) { SL_PUT(s, 24 + 6); SL_PUT("<name>", 6); SL_PUT(b + at, bn - at); return o; }
+        }
+    } else if (kind == SCRUB_STEAM_STATUS && n > 0) {
+        if (n > 5 && memcmp(s, "note ", 5) == 0) {
+            at = sc_find_last(s, n, NOMOD);
+            if (at != (size_t)-1 && at > 5) { SL_PUT(s, 5); SL_PUT("<name>", 6); SL_PUT(s + at, n - at); return o; }
+        } else if (sc_digit((unsigned char)s[0])) {
+            /* <slot> <id> <state> <ping> <name, the rest of the line> */
+            size_t slotEnd;
+            i = 0;
+            while (i < n && sc_digit((unsigned char)s[i])) i++;
+            slotEnd = i;
+            if (i < n && s[i] == ' ' && slotEnd <= 2) {
+                j = ++i;
+                while (i < n && sc_digit((unsigned char)s[i])) i++;
+                if (i > j && i < n && s[i] == ' ') {
+                    j = ++i;
+                    while (i < n && s[i] != ' ') i++;
+                    if (i > j && i < n) {
+                        j = ++i;
+                        if (i < n && s[i] == '-') i++;
+                        while (i < n && sc_digit((unsigned char)s[i])) i++;
+                        if (i > j && i < n && s[i] == ' ' && sc_digit((unsigned char)s[i - 1])) {
+                            SL_PUT(s, i + 1);
+                            if (slotEnd == 1 && s[0] == '0') SL_PUT("host", 4);
+                            else { SL_PUT("friend ", 7); SL_PUT(s, slotEnd); }
+                            return o;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    SL_PUT(s, n);
+#undef SL_PUT
+    return o;
+}
+static size_t scrub_steam(const char *in, size_t n, char *out, size_t cap, int kind)
+{
+    size_t i = 0, o = 0;
+    while (i < n && o < cap) {
+        size_t e = i, len, eol;
+        while (e < n && in[e] != '\n') e++;
+        len = e - i;
+        eol = (e < n) ? 1 : 0;
+        if (len > 0 && in[e - 1] == '\r') { len--; eol++; }
+        o += scrub_steam_line(in + i, len, out + o, cap - o, kind);
+        if (eol) { if (o + eol > cap) eol = cap - o; memcpy(out + o, in + i + len, eol); o += eol; }
+        i = e + (e < n ? 1 : 0);
+    }
+    return o;
+}

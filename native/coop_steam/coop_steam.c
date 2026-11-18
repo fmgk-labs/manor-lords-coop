@@ -26,7 +26,10 @@
 #include <ctype.h>
 #include "coop_steam_api.h"
 
-#define COOP_STEAM_VERSION "0.2"     /* 0.2 (lane 33): coat pictures travel with the save; link files turn over */
+#define COOP_STEAM_VERSION "0.4"     /* 0.2 (lane 33): coat pictures travel with the save; link files turn over
+                                      * 0.3 (lane 62): a host that lost its own lobby says so and the next INVITE opens a
+                                      *                new one; no persona names in the log
+                                      * 0.4 (lane 62, part two): a short drop does not end the session (GRACE_MS) */
 #define PROTO_VERSION      1
 #define MAX_LINE           65536u          /* longest mod line (bytes, without newline) */
 #define PING_EVERY_MS      2000
@@ -42,6 +45,32 @@
 #define HELLO_EVERY_MS     2000
 #define HI_EVERY_MS        2000
 #define MEMBERS_EVERY_MS   500
+/* (lane 62) The host's own place in its lobby. Steam's own word (a lobby chat update that names this host as left,
+ * disconnected, kicked or banned) counts at once. Its polled twin (lobby owner is not this host, or this host is not a
+ * member; asked every MEMBERS_EVERY_MS) was never seen on real Steam, and acting on it ends the lobby for good: it must
+ * fail OWN_MISSES times in a row (3 s) first. Right after Steam was offline and came back, one failed check is enough. */
+#ifndef OWN_MISSES
+#define OWN_MISSES         6
+#endif
+/* (lane 62, part two) A SHORT DROP DOES NOT END THE SESSION. In the live case the host's lobby membership dropped for a
+ * VPN route change while its game and Steam came back within seconds, and everybody was sent home at once. Now a loss
+ * sign starts a window of GRACE_MS (30 s, the number of the mod's silence rule) on both sides:
+ *   host    keeps its peers and their slots and asks Steam to let it back into the SAME lobby (JoinLobby every
+ *           REJOIN_EVERY_MS; the friends keep the lobby alive). It counts as back only on Steam's answer to such a call
+ *           (LobbyEnter, success): never on its own member list, which may be stale after a drop. Back as a member while a
+ *           friend's copy holds the ownership (Steam moved it when the host left): that copy hands it back
+ *           (SetLobbyOwner); until then the host works as a member. The lobby gone, or the window over: host_lost_lobby
+ *           (part one: peers dropped, the notice, the next INVITE makes a new lobby).
+ *   friend  does not leave when Steam says the host is out of the lobby: it stays in the lobby, keeps the host's Steam
+ *           id trusted for messages and sessions, and leaves as before only when the window ends (or at once on BYE).
+ * MOCK-TESTED ONLY: nothing of this has run on real Steam. */
+#ifndef GRACE_MS
+#define GRACE_MS           30000
+#endif
+#define REJOIN_EVERY_MS    2000
+#define LOBBY_HOST_KEY     "mlcoop_host"   /* the host's Steam id: a joiner must not take a friend that holds the ownership for the host */
+#define INVITE_WAIT_MS     120000          /* an INVITE waits this long for Steam to be online and a lobby of ours to exist */
+#define CREATE_RETRY_MS    3000            /* between two tries to create a lobby for a waiting INVITE */
 #define NOMOD_AFTER_MS     30000
 #define QUEUE_CAP          (16u << 20)     /* bytes waiting for one peer */
 #define MAX_SAVE_BYTES     (64u << 20)
@@ -113,6 +142,7 @@ typedef struct SteamFns {
     PFN_MM_GetNumLobbyMembers MM_GetNumLobbyMembers;
     PFN_MM_GetLobbyMemberByIndex MM_GetLobbyMemberByIndex;
     PFN_MM_GetLobbyOwner MM_GetLobbyOwner;
+    PFN_MM_SetLobbyOwner MM_SetLobbyOwner;
     PFN_NM_SendMessageToUser NM_SendMessageToUser;
     PFN_NM_ReceiveMessagesOnChannel NM_ReceiveMessagesOnChannel;
     PFN_NM_AcceptSessionWithUser NM_AcceptSessionWithUser;
@@ -156,6 +186,7 @@ static const struct { const char *name; size_t off; int required; } k_exports[] 
     EXP("SteamAPI_ISteamMatchmaking_GetNumLobbyMembers", MM_GetNumLobbyMembers, 1),
     EXP("SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex", MM_GetLobbyMemberByIndex, 1),
     EXP("SteamAPI_ISteamMatchmaking_GetLobbyOwner", MM_GetLobbyOwner, 1),
+    EXP("SteamAPI_ISteamMatchmaking_SetLobbyOwner", MM_SetLobbyOwner, 0),
     EXP("SteamAPI_ISteamNetworkingMessages_SendMessageToUser", NM_SendMessageToUser, 1),
     EXP("SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel", NM_ReceiveMessagesOnChannel, 1),
     EXP("SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser", NM_AcceptSessionWithUser, 1),
@@ -262,7 +293,7 @@ typedef struct Event { int id; DWORD thread; uint8_t data[EV_DATA]; } Event;
 typedef struct RecvMark { char name[64]; int ok; } RecvMark;
 
 enum { ST_OFF, ST_IDLE, ST_CREATING, ST_HOSTING, ST_JOINING, ST_JOINED };
-enum { CALL_NONE, CALL_CREATE, CALL_JOIN };
+enum { CALL_NONE, CALL_CREATE, CALL_JOIN, CALL_REJOIN };       /* CALL_REJOIN: a host asks to be let back into its own lobby */
 
 typedef struct Coop {
     int started, off, busy, steamOk, cbDone;
@@ -320,6 +351,20 @@ typedef struct Coop {
     int logChecked;
     uint32_t badSender;
     int quitting, saveOffNoted;
+    /* (lane 62) the host's own place in its lobby */
+    int lostN, lostFriends;      /* times this host lost its lobby in this run; friends connected at the last time */
+    int ownMiss, backOnline;     /* polled checks failed in a row; Steam was offline and is back: check at once */
+    uint64_t ownAt;
+    int inviteWanted, inviteOffNoted;   /* INVITE: Steam's invite window opens as soon as a lobby of ours exists */
+    uint64_t inviteUntil, createRetryAt;
+    /* (lane 62, part two) the window after a loss sign */
+    uint64_t lostAt;             /* host: its place in its lobby is lost since then (0: not); friend: the host is out of the lobby since then */
+    uint64_t rejoinAt;           /* host: when the next JoinLobby is sent */
+    int rejoinTries;
+    int memberOnly;              /* host: back by a confirmed JoinLobby, but a friend's copy holds the ownership (it hands it back) */
+    int backN;                   /* times the link came back inside the window, in this run (status "back <n>") */
+    uint64_t handAt;             /* friend: when it last tried to hand the ownership back */
+    int handTries;
     uint64_t sendWarnAt;
     Recv rcv;                    /* friend: the one incoming save file */
 } Coop;
@@ -533,6 +578,19 @@ static void notef(Coop *c, const char *fmt, ...)
     text[n] = 0;
     safe_text(c->note, sizeof(c->note), text, sizeof(c->note) - 1);
     logf_(c, "note: %s", c->note);
+}
+/* (lane 62) the same for a sentence that names a player: the menu gets it, the log does not (the caller logs the slot
+ * and the id instead). Since 0.3 no persona name is written to coop_steam.log: a bug report carries that file. */
+static void note_only(Coop *c, const char *fmt, ...)
+{
+    char text[300];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = _vsnprintf(text, sizeof(text) - 1, fmt, ap);
+    va_end(ap);
+    if (n < 0) n = (int)sizeof(text) - 1;
+    text[n] = 0;
+    safe_text(c->note, sizeof(c->note), text, sizeof(c->note) - 1);
 }
 
 /* ================================================================ link files: status, tail, mirror */
@@ -1185,6 +1243,11 @@ static void build_status(Coop *c, Buf *b)
     if (c->steamOk)
         buf_printf(b, "info appid %u overlay %d relay %s loggedon %d build %d proto %d dll %s\n", c->appId, c->overlay, relay_word(c->relay), c->loggedOn, c->buildId, PROTO_VERSION, COOP_STEAM_VERSION);
     if (c->note[0]) buf_printf(b, "note %s\n", c->note);
+    if (c->lostN) buf_printf(b, "lost %d %d\n", c->lostN, c->lostFriends);   /* (lane 62) this host lost its lobby: times, friends then */
+    /* (lane 62, part two) the window: a host that tries to get back into its lobby, a friend that waits for the host */
+    if (c->st == ST_HOSTING && c->lostAt) buf_printf(b, "reconnecting %d\n", GRACE_MS / 1000);
+    if (c->st == ST_JOINED && c->lostAt) buf_printf(b, "hostlost %d\n", GRACE_MS / 1000);
+    if (c->backN) buf_printf(b, "back %d\n", c->backN);
     if (c->st == ST_HOSTING) {
         status_player(c, b, 0, c->me, "connected", 0);
         for (int s = 1; s <= MAX_FRIENDS; s++) {
@@ -1645,13 +1708,33 @@ static void session_reset(Coop *c, int toState)
     c->mySlot = 0; c->roster[0] = 0; c->slotsSent[0] = 0;
     c->hostTail.active = 0; c->myTail.active = 0;
     c->nbans = 0; c->nmarks = 0;
+    c->ownMiss = 0; c->backOnline = 0;
+    c->lostAt = 0; c->memberOnly = 0; c->rejoinTries = 0; c->handTries = 0;
     c->st = toState;
 }
 
+/* (lane 62) A goodbye names its lobby: "BYE <lobby id>". Steam's messages go by Steam id, not by lobby, and a message
+ * sent to a player whose session is closed waits until that player talks to the sender again. A host that gave its
+ * lobby up says goodbye to friends that have left already; when such a friend then accepts the invite to the host's
+ * NEW lobby, the old goodbye arrives first, and it took it for the end of the new game (found in the mock: the friend
+ * joined the new lobby and was back at the main menu a moment later). A goodbye for another lobby is ignored.
+ * "BYE" without a number (a DLL before 0.3) counts as before. */
 static void say_bye(Coop *c)
 {
-    if (c->st == ST_HOSTING) { for (int s = 1; s <= MAX_FRIENDS; s++) if (c->peers[s].used && c->peers[s].inLobby) send_text(c, c->peers[s].sid, "BYE"); }
-    else if (c->st == ST_JOINED && c->peers[0].sid) send_text(c, c->peers[0].sid, "BYE");
+    char t[40];
+    snprintf(t, sizeof(t), "BYE %llu", (unsigned long long)c->lobby);
+    if (c->st == ST_HOSTING) { for (int s = 1; s <= MAX_FRIENDS; s++) if (c->peers[s].used && c->peers[s].inLobby) send_text(c, c->peers[s].sid, t); }
+    else if (c->st == ST_JOINED && c->peers[0].sid) send_text(c, c->peers[0].sid, t);
+}
+/* 1: a goodbye for the lobby this copy is in; 0: not a goodbye; -1: a goodbye for another lobby (logged, ignored) */
+static int bye_kind(Coop *c, uint64_t sid, const char *text)
+{
+    if (strncmp(text, "BYE", 3) != 0 || (text[3] && text[3] != ' ')) return 0;
+    if (!text[3]) return 1;
+    uint64_t id = parse_u64(text + 4, NULL);
+    if (!id || id == c->lobby) return 1;
+    logf_(c, "a goodbye from %llu for another lobby (%llu; this copy is in %llu) was ignored: it was sent before this game", (unsigned long long)sid, (unsigned long long)id, (unsigned long long)c->lobby);
+    return -1;
 }
 
 static void start_join(Coop *c, uint64_t lobby, const char *why)
@@ -1687,11 +1770,14 @@ static void on_lobby_created(Coop *c, int result, uint64_t lobby)
 {
     if (c->st != ST_CREATING) return;
     c->call = 0; c->callKind = CALL_NONE;
-    if (result != k_EResultOK || !lobby) { notef(c, "Steam could not create the lobby (result %d). Try again in a moment.", result); c->st = ST_IDLE; return; }
+    if (result != k_EResultOK || !lobby) { notef(c, "Steam could not create the lobby (result %d). Try again in a moment.", result); c->st = ST_IDLE; c->createRetryAt = c->now + CREATE_RETRY_MS; return; }
     c->lobby = lobby;
     c->st = ST_HOSTING;
+    c->ownMiss = 0; c->backOnline = 0; c->ownAt = c->now;
+    c->lostAt = 0; c->memberOnly = 0;
     char v[16]; snprintf(v, sizeof(v), "%d", PROTO_VERSION);
     sbool ok1 = c->f.MM_SetLobbyData(c->mm, lobby, LOBBY_KEY, v);
+    { char hs[24]; snprintf(hs, sizeof(hs), "%llu", (unsigned long long)c->me); c->f.MM_SetLobbyData(c->mm, lobby, LOBBY_HOST_KEY, hs); }   /* (lane 62, part two) */
     if (c->buildId > 0) { char b[24]; snprintf(b, sizeof(b), "%d", c->buildId); c->f.MM_SetLobbyData(c->mm, lobby, LOBBY_BUILD_KEY, b); }
     const char *back = c->f.MM_GetLobbyData(c->mm, lobby, LOBBY_KEY);
     logf_(c, "hosting lobby %llu; lobby data %s=%s set=%d read back '%s'; members %d", (unsigned long long)lobby, LOBBY_KEY, v, ok1, back ? back : "(null)", c->f.MM_GetNumLobbyMembers(c->mm, lobby));
@@ -1721,6 +1807,13 @@ static void on_lobby_entered(Coop *c, uint64_t lobby, uint32_t response)
     int hb = b ? atoi(b) : 0;
     if (hb > 0 && c->buildId > 0 && hb != c->buildId) { session_reset(c, ST_IDLE); notef(c, "the host runs another version of the game (build %d, yours is %d): both need the same game update", hb, c->buildId); return; }
     uint64_t owner = c->f.MM_GetLobbyOwner(c->mm, lobby);
+    /* (lane 62, part two) the host is the player the lobby's data names (DLL 0.4), not whoever owns the lobby now: while
+     * a host is out for a moment, Steam gives the ownership to a friend, and an invite accepted then must not take
+     * that friend for the host. A lobby without the name (an older host): its owner, as before. */
+    const char *hk = c->f.MM_GetLobbyData(c->mm, lobby, LOBBY_HOST_KEY);
+    uint64_t named = (hk && is_digit_str(hk, 20)) ? parse_u64(hk, NULL) : 0;
+    if (named && named != owner) logf_(c, "the lobby names %llu as its host; its owner is %llu right now (the host may be out for a moment)", (unsigned long long)named, (unsigned long long)owner);
+    if (named) owner = named;
     if (!owner || owner == c->me) { session_reset(c, ST_IDLE); notef(c, "the host of that game is not there any more"); return; }
     Peer *h = &c->peers[0];
     memset(h, 0, sizeof(*h));
@@ -1770,10 +1863,124 @@ static void host_drop(Coop *c, Peer *p, const char *why)
     mirror_flush(c, &c->mirrors[p->slot]);
 }
 
+/* (lane 62) ---------------------------------------------------------------- the host's own place in its lobby
+ * First public session, two PCs (2026-11-17): the host switched a VPN on, Steam dropped the HOST's lobby membership
+ * (a lobby chat update for the host's own id, change 0x4), and this DLL went on as "hosting": it called the friend
+ * "left the Steam lobby" and opened Steam's invite window for the dead lobby, so no invite ever reached the friend.
+ * Now: this host is "in its lobby" only while Steam says it is the owner AND a member. When that ends (host_lost_lobby)
+ * the hosting state ends with it; the next INVITE makes a new lobby and invites to that one (invite_step). */
+static int host_in_lobby(Coop *c)
+{
+    return c->lobby && c->f.MM_GetLobbyOwner(c->mm, c->lobby) == c->me && is_member(c, c->me);
+}
+/* The one place where a host gives its lobby up while its game lives on. The friends are told goodbye (those whose
+ * own copy has not seen it yet go back to their main menu, as every friend of a host that is gone), the old lobby is
+ * left for good (never a second lobby beside a half-dead one), every peer is dropped, and the player is told once
+ * (status line "lost <times> <friends connected then>", and the note). */
+static void host_lost_lobby(Coop *c, const char *how)
+{
+    int friends = 0;
+    for (int s = 1; s <= MAX_FRIENDS; s++) if (c->peers[s].used && c->peers[s].ready) friends++;
+    logf_(c, "THIS HOST LOST ITS OWN PLACE IN LOBBY %llu (%s). %d friend(s) were connected: they are dropped here and go back to their main menu. The game on this PC goes on; the next INVITE opens a new lobby.",
+          (unsigned long long)c->lobby, how, friends);
+    say_bye(c);
+    session_reset(c, ST_IDLE);
+    c->lostN++; c->lostFriends = friends;
+    notef(c, "%s", friends ? "Your Steam connection dropped. Your friends were sent to the main menu. Press Invite Friends to bring them back."
+                           : "Your Steam connection dropped. Press Invite Friends to open a new lobby.");
+}
+/* (part two) A loss sign starts the window; it no longer ends the lobby by itself. */
+static void host_window_begin(Coop *c, const char *how)
+{
+    if (c->lostAt) return;
+    c->lostAt = c->now; c->rejoinAt = c->now; c->rejoinTries = 0;
+    c->memberOnly = 0; c->ownMiss = 0;
+    if (c->callKind == CALL_REJOIN) { c->call = 0; c->callKind = CALL_NONE; }   /* only a JoinLobby sent after this sign proves anything */
+    logf_(c, "THIS HOST'S PLACE IN LOBBY %llu IS LOST (%s). For %d s it asks Steam to let it back into the same lobby; the friends and their slots are kept meanwhile.",
+          (unsigned long long)c->lobby, how, GRACE_MS / 1000);
+    notef(c, "Your Steam connection dropped. Trying to reconnect (%d s)...", GRACE_MS / 1000);
+}
+/* Steam's answer to a JoinLobby of the window (LobbyEnter by callback or call result). This is the ONLY proof that the
+ * host is in its lobby again: its own member list may still show the state before the drop. */
+static void host_rejoin_answer(Coop *c, uint32_t response)
+{
+    c->call = 0; c->callKind = CALL_NONE;
+    if (c->st != ST_HOSTING || !c->lostAt) return;
+    if (response == k_EChatRoomEnterResponseSuccess) {
+        uint64_t owner = c->f.MM_GetLobbyOwner(c->mm, c->lobby);
+        double took = (c->now - c->lostAt) / 1000.0;
+        c->lostAt = 0; c->backN++;
+        c->ownMiss = 0; c->ownAt = c->now;
+        c->memberOnly = owner != c->me;
+        if (c->memberOnly) logf_(c, "THIS HOST IS BACK IN LOBBY %llu after %.1f s (Steam let it in again, try %d). Its owner is %llu now (Steam moved the ownership when the host was out): that copy hands it back; until then this host works as a member.",
+                                 (unsigned long long)c->lobby, took, c->rejoinTries, (unsigned long long)owner);
+        else logf_(c, "THIS HOST IS BACK IN LOBBY %llu after %.1f s (Steam let it in again, try %d) and is its owner.", (unsigned long long)c->lobby, took, c->rejoinTries);
+        notef(c, "%s", "Reconnected.");
+        c->membersDirty = 1; c->slotsSent[0] = 0;
+        for (int s = 1; s <= MAX_FRIENDS; s++) if (c->peers[s].used && c->peers[s].ready) c->peers[s].lastRecv = c->now;   /* the silence clock starts afresh */
+        return;
+    }
+    if (response == 2) { host_lost_lobby(c, "Steam says the lobby does not exist any more (every friend has left it)"); return; }
+    logf_(c, "Steam did not let this host back into its lobby (%s, answer %u); trying again", enter_word(response), response);
+}
+/* every tick of the window. Returns 1 when the lobby was given up (the hosting state is over). */
+static int host_window_step(Coop *c)
+{
+    if (c->now - c->lostAt >= GRACE_MS) {
+        char how[100];
+        snprintf(how, sizeof(how), "not back in it %d s after its place was lost (%d JoinLobby tries)", GRACE_MS / 1000, c->rejoinTries);
+        host_lost_lobby(c, how);
+        return 1;
+    }
+    if (c->loggedOn && !c->call && c->now >= c->rejoinAt) {
+        c->call = c->f.MM_JoinLobby(c->mm, c->lobby);
+        c->callKind = CALL_REJOIN; c->callAt = c->now; c->callDoneAt = 0;
+        c->rejoinAt = c->now + REJOIN_EVERY_MS; c->rejoinTries++;
+        logf_(c, "asking Steam to let this host back into lobby %llu (JoinLobby call %llu, try %d)", (unsigned long long)c->lobby, (unsigned long long)c->call, c->rejoinTries);
+    }
+    return 0;
+}
+
+/* the polled twin of Steam's word, and the check right after Steam came back online. A failed check starts the window. */
+static void host_own_check(Coop *c)
+{
+    if (c->backOnline) {
+        c->backOnline = 0;
+        c->ownAt = c->now;
+        if (!host_in_lobby(c) && !(c->memberOnly && is_member(c, c->me))) { host_window_begin(c, "Steam was offline and is back: it no longer has this host as owner and member"); return; }
+        c->ownMiss = 0;
+        logf_(c, "Steam is back and still has this host as owner and member of lobby %llu", (unsigned long long)c->lobby);
+        return;
+    }
+    if (c->now - c->ownAt < MEMBERS_EVERY_MS) return;
+    c->ownAt = c->now;
+    if (!c->loggedOn) return;           /* Steam is offline: what it says of lobbies means nothing now (checked at once when it is back) */
+    if (host_in_lobby(c)) {
+        if (c->ownMiss) logf_(c, "Steam has this host as owner and member of its lobby again (after %d failed check(s))", c->ownMiss);
+        if (c->memberOnly) { c->memberOnly = 0; c->slotsSent[0] = 0; logf_(c, "this host is the owner of lobby %llu again (the ownership was handed back)", (unsigned long long)c->lobby); }
+        c->ownMiss = 0;
+        return;
+    }
+    /* (part two) back by a confirmed rejoin, a friend's copy still holds the ownership: a member is enough until it is handed back */
+    if (c->memberOnly && is_member(c, c->me)) { c->ownMiss = 0; return; }
+    c->ownMiss++;
+    if (c->ownMiss == 1) logf_(c, "Steam does not have this host as owner and member of its lobby %llu (owner %llu, %d member(s)); asked again for %d s before this counts",
+                               (unsigned long long)c->lobby, (unsigned long long)c->f.MM_GetLobbyOwner(c->mm, c->lobby), c->f.MM_GetNumLobbyMembers(c->mm, c->lobby), OWN_MISSES * MEMBERS_EVERY_MS / 1000);
+    if (c->ownMiss < OWN_MISSES) return;
+    char how[120];
+    snprintf(how, sizeof(how), "asked of Steam %d times in %d s: this host is not its owner or not a member", OWN_MISSES, OWN_MISSES * MEMBERS_EVERY_MS / 1000);
+    host_window_begin(c, how);
+}
+
 static void host_members(Coop *c)
 {
     uint64_t m[16];
     int n = lobby_members(c, m, 16);
+    /* (lane 62) a list without this host says nothing about the friends: nobody is called "left the Steam lobby" on
+     * it (the live fault above). Whether this host still has its lobby is host_own_check's question. */
+    int me = 0;
+    for (int i = 0; i < n; i++) if (m[i] == c->me) me = 1;
+    if (!me) return;
     for (int s = 1; s <= MAX_FRIENDS; s++) c->peers[s].inLobby = 0;
     for (int i = 0; i < n; i++) {
         if (m[i] == c->me || is_banned(c, m[i])) continue;
@@ -1787,7 +1994,8 @@ static void host_members(Coop *c)
         if (p->inLobby && !p->ready && !p->nomodNoted && p->state == PS_CONNECTING && c->now - p->born > NOMOD_AFTER_MS) {
             p->nomodNoted = 1;
             char nm[100]; persona(c, p->sid, nm, sizeof(nm));
-            notef(c, "%s is in the lobby but the co-op mod on that PC has not answered for 30 s (mod missing or Steam link off?)", nm);
+            note_only(c, "%s is in the lobby but the co-op mod on that PC has not answered for 30 s (mod missing or Steam link off?)", nm);
+            logf_(c, "note: the co-op mod of friend%d (%llu) has not answered for 30 s though that player is in the lobby (mod missing or Steam link off?)", p->slot, (unsigned long long)p->sid);
         }
     }
     publish_slots(c);
@@ -1797,7 +2005,8 @@ static void host_hello(Coop *c, uint64_t sid, const char *text)
 {
     unsigned ver = 0, nonce = 0;
     if (sscanf(text, "HELLO %u %u", &ver, &nonce) != 2) { logf_(c, "a bad hello from %llu was ignored", (unsigned long long)sid); return; }
-    if (!is_member(c, sid)) { logf_(c, "hello from %llu, who is not in our lobby: ignored", (unsigned long long)sid); return; }
+    /* (lane 62, part two) inside the window the member list is not to be trusted: a friend that has a slot stays known */
+    if (!is_member(c, sid) && !(c->lostAt && peer_by_sid(c, sid))) { logf_(c, "hello from %llu, who is not in our lobby: ignored", (unsigned long long)sid); return; }
     if (is_banned(c, sid)) { send_text(c, sid, "REFUSE kicked the host removed you from this game"); return; }
     if (ver != PROTO_VERSION) {
         char t[160]; snprintf(t, sizeof(t), "REFUSE bad-version this host speaks co-op version %d, you sent %u", PROTO_VERSION, ver);
@@ -1815,8 +2024,7 @@ static void host_hello(Coop *c, uint64_t sid, const char *text)
     p->state = PS_CONNECTED;
     p->lastRecv = c->now; p->lastPing = c->now; p->rtt = -1;
     peer_push_ctl(p, w);
-    char nm[100]; persona(c, sid, nm, sizeof(nm));
-    logf_(c, "%s (%llu) connected as friend%d", nm, (unsigned long long)sid, p->slot);
+    logf_(c, "%llu connected as friend%d", (unsigned long long)sid, p->slot);     /* (lane 62) no persona name in the log */
     publish_slots(c);
 }
 
@@ -1926,7 +2134,7 @@ static void host_message(Coop *c, uint64_t sid, const uint8_t *d, uint32_t n)
     } else if (strcmp(text, "T") == 0) {
         mirror_flush(c, &c->mirrors[p->slot]);
         mirror_clear(c, &c->mirrors[p->slot]);
-    } else if (strcmp(text, "BYE") == 0) {
+    } else if (bye_kind(c, sid, text) == 1) {
         host_drop(c, p, "left the game");
         schedule_close(c, sid);
     }
@@ -1934,7 +2142,12 @@ static void host_message(Coop *c, uint64_t sid, const uint8_t *d, uint32_t n)
 
 static void host_tick(Coop *c)
 {
-    if (c->membersDirty || c->now - c->membersAt >= MEMBERS_EVERY_MS) { c->membersDirty = 0; c->membersAt = c->now; host_members(c); }
+    /* (lane 62) this host's own place in its lobby: a loss sign starts the window (part two); the window may end the hosting */
+    if (c->lostAt) { if (host_window_step(c)) return; }
+    else host_own_check(c);
+    /* (lane 62: not while Steam is offline, and not inside the window: its member list means nothing then. In the live
+     * fault that list, read right after the host's own drop, made the friend "left the Steam lobby".) */
+    if (!c->lostAt && c->loggedOn && (c->membersDirty || c->now - c->membersAt >= MEMBERS_EVERY_MS)) { c->membersDirty = 0; c->membersAt = c->now; host_members(c); }
     /* say "HI" to members who have not said hello: opens the session from our side even if no callback fires */
     for (int s = 1; s <= MAX_FRIENDS; s++) {
         Peer *p = &c->peers[s];
@@ -2032,7 +2245,7 @@ static void friend_message(Coop *c, uint64_t sid, const uint8_t *d, uint32_t n)
             return;
         }
         if (strcmp(text, "HI") == 0 && c->now - c->lastHello >= 500) c->lastHello = 0;   /* answer at once */
-        if (strcmp(text, "BYE") == 0) { friend_leave(c, "%s", "the host closed the game"); return; }
+        if (bye_kind(c, sid, text) == 1) { friend_leave(c, "%s", "the host closed the game"); return; }
         return;
     }
     /* The host greets ("HI") only players it does not have connected. A greeting while this copy believes it is
@@ -2068,7 +2281,7 @@ static void friend_message(Coop *c, uint64_t sid, const uint8_t *d, uint32_t n)
     } else if (strcmp(text, "T") == 0) {
         mirror_flush(c, &c->mirrors[0]);
         mirror_clear(c, &c->mirrors[0]);
-    } else if (strcmp(text, "BYE") == 0) {
+    } else if (bye_kind(c, sid, text) == 1) {
         friend_leave(c, "%s", "the host closed the game");
     } else if (strncmp(text, "REFUSE ", 7) == 0) {
         const char *sp = strchr(text + 7, ' ');
@@ -2082,7 +2295,38 @@ static void friend_tick(Coop *c)
     if (c->now - c->ownerAt >= MEMBERS_EVERY_MS) {
         c->ownerAt = c->now;
         uint64_t owner = c->f.MM_GetLobbyOwner(c->mm, c->lobby);
-        if (owner != h->sid || !is_member(c, h->sid)) { friend_leave(c, "%s", "the host left the game"); return; }
+        /* this copy itself is out of the lobby: it leaves at once, as before (its own way back is not built) */
+        if (!is_member(c, c->me)) { friend_leave(c, "%s", "the host left the game"); return; }
+        if (!is_member(c, h->sid)) {
+            /* (lane 62, part two) Steam says the host is out of the lobby and there was no BYE: its connection may have
+             * dropped for a moment. This copy stays in the lobby (it keeps it alive for the host's way back) and keeps
+             * the host's Steam id trusted. It leaves as before when the window ends. */
+            if (!c->lostAt) {
+                c->lostAt = c->now; c->handTries = 0;
+                logf_(c, "Steam says the host %llu is not in the lobby any more (its owner is %llu now) and it did not say goodbye: this copy stays and waits up to %d s for it",
+                      (unsigned long long)h->sid, (unsigned long long)owner, GRACE_MS / 1000);
+            } else if (c->now - c->lostAt >= GRACE_MS) {
+                logf_(c, "the host did not come back into the lobby within %d s", GRACE_MS / 1000);
+                friend_leave(c, "%s", "the host left the game");
+                return;
+            }
+        } else {
+            if (c->lostAt) {
+                logf_(c, "the host is back in the lobby after %.1f s", (c->now - c->lostAt) / 1000.0);
+                c->lostAt = 0; c->backN++;
+                h->lastRecv = c->now;                        /* the silence clock starts afresh */
+                if (!h->ready) c->lastHello = 0;
+            }
+            /* Steam gave this copy the lobby's ownership while the host was out: handed back (once a second until it is the host's) */
+            if (owner == c->me && c->now - c->handAt >= 1000) {
+                c->handAt = c->now; c->handTries++;
+                if (!c->f.MM_SetLobbyOwner) { if (c->handTries == 1) logf_(c, "this copy holds the lobby's ownership and cannot hand it back (this Steam library has no SetLobbyOwner): the host goes on as a member"); }
+                else {
+                    sbool okh = c->f.MM_SetLobbyOwner(c->mm, c->lobby, h->sid);
+                    if (c->handTries <= 3 || c->handTries % 30 == 0) logf_(c, "this copy holds the lobby's ownership: handing it back to the host %llu (SetLobbyOwner said %d, try %d)", (unsigned long long)h->sid, okh, c->handTries);
+                }
+            } else if (owner == h->sid && c->handTries) { logf_(c, "the host owns the lobby again"); c->handTries = 0; }
+        }
         const char *r = c->f.MM_GetLobbyData(c->mm, c->lobby, LOBBY_SLOTS_KEY);
         copy_str(c->roster, sizeof(c->roster), r ? r : "");
     }
@@ -2146,13 +2390,23 @@ static void handle_event(Coop *c, Event *e)
     case CB_LobbyEnter: {
         LobbyEnter_t r; memcpy(&r, e->data, sizeof(r));
         logf_(c, "LobbyEnter callback: lobby %llu response %u", (unsigned long long)r.m_ulSteamIDLobby, r.m_EChatRoomEnterResponse);
-        on_lobby_entered(c, r.m_ulSteamIDLobby, r.m_EChatRoomEnterResponse);
+        if (c->callKind == CALL_REJOIN && c->st == ST_HOSTING && r.m_ulSteamIDLobby == c->lobby) host_rejoin_answer(c, r.m_EChatRoomEnterResponse);   /* (lane 62, part two) */
+        else on_lobby_entered(c, r.m_ulSteamIDLobby, r.m_EChatRoomEnterResponse);
         break;
     }
     case CB_LobbyChatUpdate: {
         LobbyChatUpdate_t r; memcpy(&r, e->data, sizeof(r));
         if (r.m_ulSteamIDLobby == c->lobby) {
             logf_(c, "lobby member %llu change 0x%x", (unsigned long long)r.m_ulSteamIDUserChanged, r.m_rgfChatMemberStateChange);
+            /* (lane 62) Steam's word that THIS host is out of its own lobby: acted on at once, before the member
+             * list is read (host_members would have called every friend "left the Steam lobby") */
+            if (c->st == ST_HOSTING && r.m_ulSteamIDUserChanged == c->me &&
+                (r.m_rgfChatMemberStateChange & (k_EChatMemberStateChangeLeft | k_EChatMemberStateChangeDisconnected | k_EChatMemberStateChangeKicked | k_EChatMemberStateChangeBanned))) {
+                char how[96];
+                snprintf(how, sizeof(how), "Steam's word: lobby chat update for this host's own id, change 0x%x", r.m_rgfChatMemberStateChange);
+                host_window_begin(c, how);               /* (part two: the window; part one gave the lobby up here) */
+                break;
+            }
             c->membersDirty = 1; c->ownerAt = 0;
         }
         break;
@@ -2166,6 +2420,13 @@ static void handle_event(Coop *c, Event *e)
     case CB_NetMsgSessionRequest: {
         uint64_t sid = c->f.Identity_GetSteamID64(e->data);
         int member = sid && (c->st == ST_HOSTING || c->st == ST_JOINED) && is_member(c, sid) && !is_banned(c, sid);
+        /* (lane 62, part two) Steam's messages go by Steam id, not by lobby: a session that failed with the drop is
+         * opened again by the next message. The host of this game (a friend's copy) and, inside a host's window, a
+         * friend that has a slot stay trusted though the lobby does not list them at this moment. */
+        if (!member && sid && !is_banned(c, sid)) {
+            if (c->st == ST_JOINED && c->peers[0].used && sid == c->peers[0].sid) member = 1;
+            if (c->st == ST_HOSTING && c->lostAt && peer_by_sid(c, sid)) member = 1;
+        }
         if (member) {
             SteamNetIdentity id; ident(c, &id, sid);
             sbool ok = c->f.NM_AcceptSessionWithUser(c->nm, &id);
@@ -2212,6 +2473,7 @@ static void poll_call(Coop *c)
             sbool f2 = 0;
             sbool ok = c->f.Utils_GetAPICallResult(c->utils, c->call, &r, (int)sizeof(r), CB_LobbyEnter, &f2);
             logf_(c, "JoinLobby call completed: got=%d failed=%d/%d lobby %llu response %u", ok, failed, f2, (unsigned long long)r.m_ulSteamIDLobby, r.m_EChatRoomEnterResponse);
+            if (ok && !f2 && c->callKind == CALL_REJOIN) { host_rejoin_answer(c, r.m_EChatRoomEnterResponse); return; }   /* (lane 62, part two) */
             if (ok && !f2) { on_lobby_entered(c, c->lobby, r.m_EChatRoomEnterResponse); return; }
         }
         if (c->f.Utils_GetAPICallFailureReason) logf_(c, "call failure reason %d (waiting for the matching callback instead)", c->f.Utils_GetAPICallFailureReason(c->utils, c->call));
@@ -2220,8 +2482,54 @@ static void poll_call(Coop *c)
     if (c->call && ((c->callDoneAt && c->now - c->callDoneAt > 5000) || c->now - c->callAt > CALL_TIMEOUT_MS)) {
         int kind = c->callKind;
         c->call = 0; c->callKind = CALL_NONE;
-        if (kind == CALL_CREATE && c->st == ST_CREATING) { c->st = ST_IDLE; notef(c, "%s", "Steam did not answer the request to create a lobby"); }
+        if (kind == CALL_CREATE && c->st == ST_CREATING) { c->st = ST_IDLE; c->createRetryAt = c->now + CREATE_RETRY_MS; notef(c, "%s", "Steam did not answer the request to create a lobby"); }
         else if (kind == CALL_JOIN && c->st == ST_JOINING) { c->f.MM_LeaveLobby(c->mm, c->lobby); c->lobby = 0; c->st = ST_IDLE; notef(c, "%s", "Steam did not answer the request to join that game"); }
+        else if (kind == CALL_REJOIN) logf_(c, "Steam did not answer this host's request to get back into its lobby; asked again");   /* (the window goes on) */
+    }
+}
+
+static void start_create(Coop *c)
+{
+    c->call = c->f.MM_CreateLobby(c->mm, k_ELobbyTypePrivate, 1 + MAX_FRIENDS);   /* invite only: nothing shows on the host's friends list; friends come in through the invite */
+    c->callKind = CALL_CREATE; c->callAt = c->now; c->callDoneAt = 0;
+    c->st = ST_CREATING;
+    notef(c, "%s", "creating the game's Steam lobby");
+    logf_(c, "CreateLobby(invite only, %d) call %llu", 1 + MAX_FRIENDS, (unsigned long long)c->call);
+}
+
+/* (lane 62) INVITE asked for Steam's invite window. It is opened only for a lobby this host is in right now (owner and
+ * member, asked of Steam at this moment). Without one (never hosted, or the lobby was lost) a new lobby is made first
+ * and the window opens for that one. While Steam is offline nothing is made or opened: the note says so, and the
+ * window opens when Steam is back (within INVITE_WAIT_MS). Runs every tick while an INVITE waits. */
+static void invite_step(Coop *c)
+{
+    if (!c->inviteWanted) return;
+    if (c->st == ST_JOINED || c->st == ST_JOINING) { c->inviteWanted = 0; return; }
+    if (c->now >= c->inviteUntil) {
+        c->inviteWanted = 0; c->inviteOffNoted = 0;
+        notef(c, "%s", "Steam did not open a lobby in time. Press Invite Friends again.");
+        return;
+    }
+    if (!c->f.User_BLoggedOn(c->user)) {
+        if (!c->inviteOffNoted) { c->inviteOffNoted = 1; notef(c, "%s", "Steam is not online right now. The invite window opens as soon as Steam is back."); }
+        return;
+    }
+    if (c->st == ST_CREATING) return;                    /* the lobby is on its way */
+    if (c->st == ST_HOSTING) {
+        if (c->backOnline || c->lostAt) return;          /* Steam just came back, or the window runs: first it is settled whether the lobby is still ours */
+        /* not ours right now: host_own_check sees it again or starts the window; then this goes on. (Back by a confirmed
+         * rejoin, with the ownership still at a friend's copy: a member may invite.) */
+        if (!host_in_lobby(c) && !(c->memberOnly && is_member(c, c->me))) return;
+        if (!c->f.Utils_IsOverlayEnabled(c->utils)) notef(c, "%s", "the Steam overlay is off (enable it in Steam) - the invite window may not open");
+        else if (c->inviteOffNoted) c->note[0] = 0;
+        c->f.Friends_ActivateInviteDialog(c->friends, c->lobby);
+        logf_(c, "opened the Steam invite window for lobby %llu", (unsigned long long)c->lobby);
+        c->inviteWanted = 0; c->inviteOffNoted = 0;
+        return;
+    }
+    if (c->st == ST_IDLE && c->now >= c->createRetryAt) {
+        logf_(c, "INVITE without a lobby of ours: a new lobby is made first");
+        start_create(c);
     }
 }
 
@@ -2245,21 +2553,17 @@ static void command(Coop *c, void *ctx, const uint8_t *line, uint32_t len)
         if (c->st == ST_HOSTING || c->st == ST_CREATING) { notef(c, "%s", "already hosting"); return; }
         if (c->st == ST_JOINED || c->st == ST_JOINING) { say_bye(c); session_reset(c, ST_IDLE); }
         if (!c->loggedOn) { notef(c, "%s", "Steam is not online, so no game can be hosted right now"); return; }
-        c->call = c->f.MM_CreateLobby(c->mm, k_ELobbyTypePrivate, 1 + MAX_FRIENDS);   /* invite only: nothing shows on the host's friends list; friends come in through the invite */
-        c->callKind = CALL_CREATE; c->callAt = c->now; c->callDoneAt = 0;
-        c->st = ST_CREATING;
-        notef(c, "%s", "creating the game's Steam lobby");
-        logf_(c, "CreateLobby(invite only, %d) call %llu", 1 + MAX_FRIENDS, (unsigned long long)c->call);
+        start_create(c);
     } else if (!strcmp(verb, "INVITE")) {
-        if (c->st != ST_HOSTING) { notef(c, "%s", "host a game first, then invite"); return; }
-        if (!c->f.Utils_IsOverlayEnabled(c->utils)) notef(c, "%s", "the Steam overlay is off (enable it in Steam) - the invite window may not open");
-        c->f.Friends_ActivateInviteDialog(c->friends, c->lobby);
-        logf_(c, "opened the Steam invite window for lobby %llu", (unsigned long long)c->lobby);
+        /* (lane 62) never Steam's invite window for a lobby this host is not in: invite_step (this tick) decides */
+        if (c->st == ST_JOINED || c->st == ST_JOINING) { notef(c, "%s", "you are in another player's game: only its host invites"); return; }
+        c->inviteWanted = 1; c->inviteOffNoted = 0; c->inviteUntil = c->now + INVITE_WAIT_MS;
     } else if (!strcmp(verb, "JOIN")) {
         start_join(c, parse_u64(arg, NULL), "JOIN command");
     } else if (!strcmp(verb, "LEAVE")) {
         say_bye(c);
         session_reset(c, ST_IDLE);
+        c->inviteWanted = 0;
         notef(c, "%s", "left the game");
     } else if (!strcmp(verb, "KICK")) {
         uint64_t sid = parse_u64(arg, NULL);
@@ -2276,6 +2580,7 @@ static void command(Coop *c, void *ctx, const uint8_t *line, uint32_t len)
     } else if (!strcmp(verb, "QUIT")) {
         say_bye(c);
         session_reset(c, ST_IDLE);
+        c->inviteWanted = 0;
         c->quitting = 1;
     } else {
         logf_(c, "unknown command ignored");
@@ -2285,11 +2590,23 @@ static void command(Coop *c, void *ctx, const uint8_t *line, uint32_t len)
 /* ================================================================ start-up */
 static void refresh_info(Coop *c)
 {
+    int first = c->infoAt == 0;
     c->infoAt = c->now;
     c->overlay = c->f.Utils_IsOverlayEnabled(c->utils) ? 1 : 0;
-    c->loggedOn = c->f.User_BLoggedOn(c->user) ? 1 : 0;
+    int on = c->f.User_BLoggedOn(c->user) ? 1 : 0;
+    if (!first && on != c->loggedOn) {
+        /* (lane 62) Steam offline does not end a lobby by itself here (a short break may leave it whole). When Steam is
+         * back, a host asks at once whether the lobby is still its own (host_own_check). */
+        logf_(c, on ? "Steam is online again (logged on)" : "Steam went offline (not logged on)");
+        if (on && c->st == ST_HOSTING) c->backOnline = 1;
+    }
+    c->loggedOn = on;
     int r = c->f.NU_GetRelayNetworkStatus(c->nu, NULL);
-    if (r != c->relay) { logf_(c, "Steam relay network: %s (%d)", relay_word(r), r); c->relay = r; }
+    if (r != c->relay) {
+        logf_(c, "Steam relay network: %s (%d)", relay_word(r), r);
+        if (r == 100 && !first) c->ownAt = 0;               /* the relay is back: a host asks about its lobby in its next tick (the 3 s rule) */
+        c->relay = r;
+    }
 }
 
 #ifdef COOP_STEAM_MOCK
@@ -2426,6 +2743,7 @@ CS_STATIC void coop_tick(Coop *c)
     c->phase = "receiving"; receive_messages(c);
     if (c->st == ST_HOSTING) { c->phase = "host"; host_tick(c); }
     else if (c->st == ST_JOINED) { c->phase = "friend"; friend_tick(c); }
+    if (c->inviteWanted) { c->phase = "invite"; invite_step(c); }
     if (c->nclose && c->now >= c->closeAt) {
         c->phase = "closing sessions";
         for (int i = 0; i < c->nclose; i++) {

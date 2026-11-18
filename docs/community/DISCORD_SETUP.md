@@ -338,6 +338,24 @@ Full guide: https://github.com/fmgk-labs/manor-lords-coop/blob/HEAD/docs/REPORTI
 
 ### 6.8 Changelog entry (post in `#changelog`)
 
+For 0.2.3:
+
+```md
+# 0.2.3 (`<date it goes public>`)
+
+- Fixed: a host whose Steam connection dropped for a moment (for example a VPN switched on) could not invite friends back: the invite window opened for a lobby that no longer existed, and no invite arrived. Now the host is told **"Your Steam connection dropped"**, and **Invite Friends** opens a new lobby and invites to that one. The host's game goes on.
+- Fixed: after "The host left the game" a friend can accept a new invite without restarting the game.
+- Fixed: the title menu's Co-op button no longer keeps saying "Co-op: the host left the game". The Co-op menu says why the last game ended.
+- **Make Bug Report** now also takes the Steam link's log and state, with every player's name taken out.
+- Every error the mod counts now has a line in its log.
+- Fixed: after **Host New Game**, friends were resynced again and again (a new world differs from the same world loaded from its save). Now the host's game says **"Preparing the new game for co-op..."** and saves and loads the new world once, about 10 s after it starts. A game loaded from a save is not touched.
+- Fixed: a friend whose resync did not help now gets a resync of every copy at once (it could take six resyncs before).
+- New: when a difference is still there after every copy loaded, the mod stops resyncing for it and says so once: **"The games differ in a way a resync cannot fix"**. Play goes on; please send a bug report.
+- New: while friends are in, the host's **Main Menu** and **Quit Game** ask first. Click again to leave.
+
+Everyone must use 0.2.3. Older versions are refused at the join.
+```
+
 For 0.2.2:
 
 ```md

@@ -27,6 +27,7 @@ for k, v in pairs({
   exitAfter = 5.0,       -- s between the notice and the way back to the main menu
   bannerEvery = 2.5,     -- s between two showings of the notice while it waits
   hostBeat = 3.0,        -- s between two "HL" lines of a host without a world
+  labelFor = 20.0,       -- s the title menu's Co-op button says "Co-op: the host left the game" (lane 62)
 }) do if P.cfg[k] == nil then P.cfg[k] = v end end
 local TITLE = "MainMenu"                     -- the title screen's level (logged by coop_ui: "title screen level is MainMenu")
 local TEXT_BYE = "The host left the game. Returning to the main menu."
@@ -92,7 +93,7 @@ end
 function P.line(S, w)
   if S.role ~= "friend" then return end
   local wall = tonumber(w[2])
-  if wall and S.startWall and wall < S.startWall - 1 then return end         -- written before this session: history
+  if C.stale("host", w) then return end                                      -- written before this session: history (lane 62: by the host's own stamps, coop.lua C.stale)
   if w[3] == "HL" then
     if not P.loadT or os.clock() - P.loadT > 10.0 then log("the host says it loads a world: a silence of up to %.0f s is a load", P.cfg.loadSilence) end
     P.loadT = os.clock(); P.lastHL = P.loadT
@@ -109,12 +110,54 @@ local function restoreHoldLine()
   U.holdShown = false
 end
 
+-- ---------------------------------------------------------------- (lane 62) the menu button's words, and the next game
+-- After a host-gone exit the title menu's Co-op button says TEXT_MENU. It said so for the rest of the run (first
+-- public session, 2026-11-17). Now the normal words come back after cfg.labelFor seconds, or at once when the player
+-- opens the Co-op panel (coop_ui.lua) or a new co-op game starts on this copy. The panel says in one line why the
+-- last co-op game ended (P.lastEndText), until a new one starts.
+local function buttonText(s) return StaticFindObject("/Script/Engine.Default__KismetTextLibrary"):Conv_StringToText(s) end
+function P.labelBack(why)
+  if not P.label then return end
+  P.label = nil
+  if P.leaving then P.leaving.labelOff = true end           -- (leavingStep does not put the words on a new button again)
+  local U = C.ui
+  local words = (U and U.hostNext) and "Co-op (hosting the next game)" or "Co-op"
+  if U and valid(U.btn) then pcall(function() U.btn:SetButtonText(buttonText(words)) end) end
+  log("the menu's Co-op button says '%s' again (%s)", words, tostring(why))
+end
+function P.lastEndText()
+  local E = P.lastEnd; if not E then return nil end
+  return E.why == "silent" and "Last co-op game: the host stopped answering" or "Last co-op game: the host left the game"
+end
+-- A new co-op game starts on this copy: called by C.setRole (coop.lua) whenever the role becomes friend or host (an
+-- invite was accepted and the host gave a place, this player hosts, or the development console set the role).
+-- Nothing of the last game's end may reach into it. Read for lane 62 (a friend that joins again
+-- in the same run of the game, never tested before): the way out still under way (P.leaving, up to 5 s before the
+-- level is left and 15 s at the title screen) opened the title level in the middle of the new join and made P.gone do
+-- nothing when the new host left; a silence limit passed in the last game (P.overT) counted as the first of the two
+-- checks in the new one.
+function P.newGame(why)
+  P.labelBack("a new co-op game: " .. tostring(why))
+  P.lastEnd = nil
+  local L = P.leaving
+  if L then
+    P.left = { t = os.clock(), why = L.why }; P.leaving = nil
+    log("a new co-op game starts (%s) while the way out of the last one was still under way (%s): that ends here", tostring(why),
+        L.atT and "at the title screen" or (L.exitT and "the title level was asked for" or "the level was not left yet"))
+  end
+  P.overT = nil; P.loadT = nil; P.lastHL = nil; P.lastH = nil; P.limit = nil; P.maxGap = nil
+  P.link = nil; P.linkBackT = nil
+end
+
 function P.gone(S, why, detail)
   if P.leaving or not S or S.role ~= "friend" then return end
   local clock = os.clock()
   local text = why == "silent" and string.format(TEXT_SILENT, math.floor(P.cfg.silence + 0.5)) or TEXT_BYE
   if why == "silent" and P.limit and P.limit > P.cfg.silence + 1 then text = string.format(TEXT_SILENT, math.floor(P.limit + 0.5)) end
   P.leaving = { t = clock, why = why, text = text, shownT = -100 }
+  P.lastEnd = { t = clock, why = why }                      -- (lane 62) the Co-op panel's line "Last co-op game: ..."
+  P.overT = nil
+  S.linkHold = nil; S.speedHold = 0; P.link = nil; P.linkBackT = nil     -- (part two) a hold for a lost link ends with the game
   log("THE HOST IS GONE (%s%s): this copy leaves the co-op game and goes back to the main menu in %.0f s", why,
       detail and (", " .. tostring(detail)) or "", P.cfg.exitAfter)
   -- the notice is drawn only while the game runs (lane 24): a host that paused and then died left this copy paused
@@ -177,12 +220,107 @@ local function leavingStep(S, clock)
     local U = C.ui
     if U and valid(U.btn) then
       local a = nil; pcall(function() a = U.btn:GetAddress() end)
-      if a and a ~= L.btnA then L.btnA = a; pcall(function() U.btn:SetButtonText(StaticFindObject("/Script/Engine.Default__KismetTextLibrary"):Conv_StringToText(TEXT_MENU)) end); log("the menu's Co-op button says: %s", TEXT_MENU) end
+      if a and a ~= L.btnA and not L.labelOff then
+        L.btnA = a; pcall(function() U.btn:SetButtonText(buttonText(TEXT_MENU)) end); log("the menu's Co-op button says: %s", TEXT_MENU)
+        P.label = P.label or { t = clock }                  -- (lane 62) taken back after cfg.labelFor s (labelStep), or sooner (P.labelBack)
+      end
     end
     if clock - L.atT > 15.0 then P.left = { t = clock, why = L.why }; P.leaving = nil; log("left the co-op game (%s); native piece: %s", L.why, patchItems()) end
   elseif clock - L.exitT > 60.0 then
     log("still not at the main menu 60 s after OpenLevel (level %s): trying once more", tostring(lvl)); L.exitT = nil; L.t = clock - P.cfg.exitAfter
   end
+end
+
+-- ---------------------------------------------------------------- (lane 62, part two) the host's link is lost for a moment
+-- The Steam piece (DLL 0.4) no longer leaves at once when Steam says the host is out of the lobby: it waits up to 30 s
+-- (its status then has "hostlost <seconds>", the state stays "joined"). What this copy does meanwhile:
+--   * the player is told once: "Connection to the host lost. Waiting up to 30 s..." (a notice, and the log);
+--   * while the host's lines are really missing (nothing read from the host for 1.5 s) the game on this copy is HELD:
+--     paused with the game's own pause, again every tick, so the worlds do not drift; the pause line says
+--     "Host connection lost" (coop_ui.lua holdTick: the words of the game's "Game Paused" line; a longer text is cut
+--     off there). The pause is the mod's own: S.setPaused / S.agree / S.speedHold are set as the core does when it
+--     follows the host, so the watcher (coop.lua, "the player changed it") never sends it to the host as an order,
+--     also not when the player presses the pause key during the hold. While the host's lines still flow (only the
+--     lobby membership dropped) nothing is held;
+--   * the silence rule below stands still while the Steam piece waits, and starts afresh when the host is back;
+--   * when the host's lines come again the hold ends: the host's next state line sets pause and speed. After a gap of
+--     more than 2 s lines may be missing: one repair is asked for (the join module's single load);
+--   * the host's "a screen is open" word (HOLD 1 / 0) may have been lost in the gap: when the host's state says it
+--     runs, the hold line of that screen goes too.
+-- The window's end without the host: the Steam piece leaves (state idle), coop_ui.lua calls P.gone, as before.
+-- NOT RUN IN THE GAME: desk test with stand-ins only (tests/lane62).
+local TEXT_LINK = "Connection to the host lost. Waiting up to %d s..."
+local function linkEnd(S)
+  if S then
+    if S.linkHold then S.linkHold = nil; S.speedHold = 0 end
+  end
+  P.link = nil
+end
+local function linkStep(S, clock)
+  if S.role ~= "friend" then if P.link or S.linkHold then linkEnd(S) end; return end
+  local st = (C.steam and C.steam.on and C.steam.status) and C.steam.status() or nil
+  local lost = st and st.state == "joined" and st.hostLost or nil
+  local K = P.link
+  if lost and not K then
+    K = { t = clock, window = lost, maxQuiet = 0 }; P.link = K
+    log("Steam says the host is out of the lobby and it did not say goodbye: this copy stays for up to %d s (the host's connection may have dropped for a moment)", lost)
+    C.notify("left", string.format(TEXT_LINK, lost))
+  end
+  if not K then return end
+  -- The Steam piece no longer waits and is not "joined" any more: it has left (the window's end, or the host's
+  -- goodbye) and coop_ui.lua's roleTick ends the game (P.gone) in this tick or the next, whichever module runs first.
+  -- Nothing is said or asked here then (no "the host is back" right before "The host left the game"); the hold's
+  -- marks go, the pause stays until P.gone lifts it for its notice.
+  if not lost and not (st and st.state == "joined") then
+    log("the Steam piece is no longer in the host's game (%s) %.1f s after Steam said the host was out: the wait is over, the game ends", tostring(st and st.state), clock - K.t)
+    linkEnd(S)
+    -- the menu module ends the game on the Steam piece's word (it reads that word for 2 s first): the silence rule,
+    -- held back through the window, does not jump in before it (game run s2/E6: it did, one second later, and the
+    -- player read "no answer for 32 s" instead of the plain goodbye). Should that word not come, it decides 30 s from now.
+    P.linkBackT = clock
+    return
+  end
+  local h = S.heard and S.heard.host
+  local quiet = h and (clock - h) or 0
+  if quiet > K.maxQuiet then K.maxQuiet = quiet end
+  local inWorld = valid(S.p1) and valid(S.eng)
+  if inWorld and not C.hold and h and quiet > 1.5 and (S.stats.states or 0) > 0 then
+    if not S.linkHold then
+      S.linkHold = true; K.holds = (K.holds or 0) + 1
+      log("nothing from the host for %.1f s: the game on this copy is held (paused) until its lines come again", quiet)
+    end
+    -- the mod's own pause, as the core sets it when it follows the host: never the player's, never sent
+    local ok, e = pcall(function() if not A.isPaused() then A.setPaused(true) end end)
+    if not ok and not K.holdErr then K.holdErr = true; log("the hold could not pause the game: %s", tostring(e)) end
+    S.setPaused = true; S.agree = false; S.speedHold = clock + 1.0
+  elseif S.linkHold then
+    S.linkHold = nil; S.speedHold = 0
+    log("the host's lines come again (the longest gap was %.1f s): the hold ends, the host's next state line sets pause and speed", K.maxQuiet)
+  end
+  if lost then return end
+  -- the Steam piece no longer waits and is still "joined": the host is back in the lobby
+  if not K.backT then
+    K.backT = clock; P.linkBackT = clock
+    log("the host is back in the lobby %.1f s after Steam said it was out; the silence rule starts afresh", clock - K.t)
+  end
+  if S.linkHold or (h and quiet > 1.5) then return end       -- its lines are not back yet: held, the silence rule decides
+  if K.maxQuiet > 2.0 then
+    local J = C.join
+    log("the host's lines stopped for %.1f s: lines may be missing, one repair is asked for", K.maxQuiet)
+    -- Each lost link is a cause of its own ("linklost1", "linklost2" ...: the host counts repairs by the reason's first
+    -- word). Under one name a second drop within 90 s read as "he still differs after he loaded alone", and the host
+    -- made EVERY copy load, itself too (game run s2, cases E2 and E4).
+    P.linkN = (P.linkN or 0) + 1
+    if J and J.requestRepair then pcall(J.requestRepair, "linklost" .. P.linkN) end
+  end
+  if S.hostHold and S.hostPaused == false then S.hostHold = false; log("the host runs: its 'a screen is open' hold is over (its word may have been lost in the gap)") end
+  C.notify("joined", "Connection to the host is back")
+  P.link = nil
+end
+
+-- (lane 62) the button's normal words come back cfg.labelFor s after "Co-op: the host left the game" went on it
+local function labelStep(clock)
+  if P.label and clock - P.label.t >= P.cfg.labelFor then P.labelBack(string.format("%.0f s have passed", P.cfg.labelFor)) end
 end
 
 -- the silence check. It runs in every state of a friend (world, load, join): S.heard.host is updated by every read of
@@ -205,6 +343,11 @@ local function silenceStep(S, clock)
   -- force a minute after the host's load, and a host killed then was decided after 106 s instead of 30)
   if P.loadT and h > (P.lastHL or 0) + 4.0 then P.loadT = nil; log("the host is back from its load: the limit is %.0f s again", P.cfg.silence) end
   if (S.stats.states or 0) == 0 and not (C.join and C.join.lastLoaded) then return end   -- never in the host's game yet
+  -- (lane 62, part two) while the Steam piece waits for the host (its 30 s window) it decides, not this rule; once
+  -- the host is back in the lobby the limit counts from that moment (neither side calls the other gone before the
+  -- window ends)
+  if P.link and not P.link.backT then P.overT = nil; return end
+  if P.linkBackT and h < P.linkBackT then h = P.linkBackT end
   if S.tIn ~= clock then return end
   local lim = (P.loadT and clock - P.loadT < P.cfg.loadWindow) and P.cfg.loadSilence or P.cfg.silence
   P.limit = lim
@@ -239,13 +382,17 @@ function M.tick(S, clock)
   -- the limit is counted with os.clock: this line shows it keeps pace with the wall clock (os.time) on this runtime
   if clock - (P.ckT or -1e9) >= 120.0 then P.ckT = clock; log("clock check: os.time - os.clock = %.1f s", os.time() - clock) end
   if S.role == "host" then P.hostHadWorld = true; P.byeSent = nil; P.titleT = nil end
+  local okL, eL = pcall(linkStep, S, clock); if not okL and P.linkErr ~= tostring(eL) then P.linkErr = tostring(eL); log("link step: error %s", tostring(eL)) end
   silenceStep(S, clock)
   leavingStep(S, clock)
+  labelStep(clock)
 end
 function M.idle(S, clock)
   ensureHooks()
+  local okL, eL = pcall(linkStep, S, clock); if not okL and P.linkErr ~= tostring(eL) then P.linkErr = tostring(eL); log("link step: error %s", tostring(eL)) end
   silenceStep(S, clock)
   leavingStep(S, clock)
+  labelStep(clock)
   hostIdle(S, clock)
 end
 

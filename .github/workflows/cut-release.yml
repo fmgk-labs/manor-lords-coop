@@ -1,0 +1,57 @@
+# Pushing a tag v<version> publishes the GitHub release, with no browser and no personal token:
+#   1. the maintainers build and test the zip (docs/MAINTAINERS.md, "Cutting a release") and push it to the branch
+#      `release-zips` as ManorLordsCoop-<version>-nexus.zip (it holds the UE4SS loader and the native DLLs, which are
+#      not built here);
+#   2. the release notes are in docs/releases/v<version>.md on the tagged commit, with a list under "## New in <version>";
+#   3. the tag v<version> is pushed.
+# This workflow then creates the release with that zip and starts nexus-release.yml for the tag (a release made by the
+# workflow token does not start other workflows by itself; a workflow_dispatch does).
+name: Cut release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the version and the notes
+        id: v
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          IN_CODE=$(grep '^C.version = ' mod/ManorLordsCoop/Scripts/coop.lua | cut -d'"' -f2 | head -1)
+          if [ "$IN_CODE" != "$VERSION" ]; then echo "The tag says $VERSION but coop.lua says $IN_CODE"; exit 1; fi
+          if [ ! -s "docs/releases/$TAG.md" ]; then echo "docs/releases/$TAG.md is missing"; exit 1; fi
+          if ! grep -q "^## New in $VERSION" "docs/releases/$TAG.md"; then echo "The notes need a heading: ## New in $VERSION"; exit 1; fi
+      - name: Take the tested zip from the release-zips branch
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          git fetch --depth 1 origin release-zips
+          git show "FETCH_HEAD:ManorLordsCoop-${VERSION}-nexus.zip" > "ManorLordsCoop-${VERSION}-nexus.zip"
+          git show "FETCH_HEAD:ManorLordsCoop-${VERSION}-nexus.zip.sha256" > expected.sha256
+          echo "$(cut -d' ' -f1 expected.sha256)  ManorLordsCoop-${VERSION}-nexus.zip" | sha256sum -c -
+          if unzip -l "ManorLordsCoop-${VERSION}-nexus.zip" | grep -q "coop_dev.lua"; then echo "The zip holds the test-only coop_dev.lua"; exit 1; fi
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          gh release create "$TAG" "ManorLordsCoop-${VERSION}-nexus.zip" --repo "$GITHUB_REPOSITORY" \
+            --title "Manor Lords Co-op ${VERSION}" --notes-file "docs/releases/$TAG.md" --verify-tag
+      - name: Send it to Nexus
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh workflow run nexus-release.yml --repo "$GITHUB_REPOSITORY" --ref main -f tag="$TAG"

@@ -9,7 +9,7 @@
 -- own link folder) or the mod folder. A coop_steam.cfg beside the DLL may set linkdir= and savedir= (see the DLL's README).
 --
 -- Use:  Coop.steam.host()   Coop.steam.invite()   Coop.steam.join(lobbyId)   Coop.steam.leave()   Coop.steam.kick(steamId)
---       Coop.steam.status() -> { state, me, lobby, slot, reason, note, info = {appid=..., overlay=..., relay=...},
+--       Coop.steam.status() -> { state, me, lobby, slot, reason, note, lost, lostFriends, reconnecting, hostLost, back, info = {appid=..., overlay=..., relay=...},
 --                                players = { { slot, id, state, ping, name }, ... } }      (re-read at most 4 times a second)
 --       Coop.steam.setPlayerState(slot, "loading" | "playing" | nil)   game facts the mod knows; status() shows them
 -- On a friend's copy the DLL's slot decides the file name: when the status says "slot 2", this module switches the mod's
@@ -53,6 +53,7 @@ ST.host, ST.invite, ST.leave, ST.quit, ST.join, ST.kick = offAnswer, offAnswer, 
 ST.gameState = ST.gameState or {}
 function ST.setPlayerState(slot, state) ST.gameState[tonumber(slot) or -1] = state; ST.readT = nil end
 function ST.status() return { state = "off", reason = ST.why, players = {}, info = {} } end
+function ST.leavePending() return false end
 function ST.tick() end
 
 -- On by default (session 18): without Steam (game not started through Steam, or another shop's copy) the DLL reports
@@ -131,8 +132,20 @@ local function command(s)
   return "sent " .. s
 end
 function ST.host() return command("HOST") end
+-- (lane 62) INVITE: the DLL (0.3) opens Steam's invite window only for a lobby this host is in right now; without one
+-- (never hosted yet, or the lobby was lost) it makes a new lobby first; while Steam is offline it waits and says so
 function ST.invite() return command("INVITE") end
-function ST.leave() return command("LEAVE") end
+function ST.leave() ST.leaveT = os.clock(); ST.readT = nil; return command("LEAVE") end
+-- (lane 62) true while a LEAVE this mod sent is not yet seen in the status file. The file is read at most 4 times a
+-- second and the DLL takes the command at its next tick: for a moment after the mod left, the status still says
+-- "joined", and the menu took that for a new invite and made this copy a friend again (coop_ui.lua roleTick).
+-- Over as soon as a read of the status file shows a state outside a game once (ST.status below), or after 5 s.
+function ST.leavePending()
+  if not ST.leaveT then return false end
+  ST.status()
+  if ST.leaveT and os.clock() - ST.leaveT > 5.0 then ST.leaveT = nil end
+  return ST.leaveT ~= nil
+end
 function ST.quit() return command("QUIT") end
 function ST.join(id) id = tostring(id or ""); if not id:match("^%d+$") then return "a lobby number is needed" end; return command("JOIN " .. id) end
 function ST.kick(id) id = tostring(id or ""); if not id:match("^%d+$") then return "a Steam id is needed" end; return command("KICK " .. id) end
@@ -153,6 +166,16 @@ local function parse(text)
       for k, v in line:sub(6):gmatch("(%S+) (%S+)") do s.info[k] = v end
     elseif line:sub(1, 5) == "note " then
       s.note = line:sub(6)
+    elseif line:sub(1, 5) == "lost " then
+      -- (lane 62) this host lost its own Steam lobby: how often in this run, and the friends connected at the last time
+      local n, fr = line:match("^lost (%d+) (%d+)")
+      s.lost = tonumber(n); s.lostFriends = tonumber(fr)
+    -- (lane 62, part two) the window after a loss sign (DLL 0.4): a host that tries to get back into its lobby
+    -- ("reconnecting <seconds>"), a friend that waits for the host ("hostlost <seconds>"), and how often the link
+    -- came back inside the window in this run ("back <n>")
+    elseif line:sub(1, 13) == "reconnecting " then s.reconnecting = tonumber(line:match("^reconnecting (%d+)")) or 30
+    elseif line:sub(1, 9) == "hostlost " then s.hostLost = tonumber(line:match("^hostlost (%d+)")) or 30
+    elseif line:sub(1, 5) == "back " then s.back = tonumber(line:match("^back (%d+)"))
     else
       local slot, id, pst, ping, name = line:match("^(%d+) (%d+) (%S+) (%-?%d+) (.*)$")
       if slot then
@@ -174,7 +197,12 @@ function ST.status()
   local f = io.open(ST.link .. "steam_status.txt", "rb")
   if not f then return ST.last or { state = "starting", players = {}, info = {} } end
   local text = f:read("a"); f:close()
-  if text and #text > 0 then ST.last = parse(text) end
+  if text and #text > 0 then
+    ST.last = parse(text)
+    -- (lane 62) a LEAVE of the mod's own has been taken by the DLL once the file shows a state outside a game
+    local st = ST.last.state
+    if ST.leaveT and st ~= "joined" and st ~= "joining" and st ~= "hosting" then ST.leaveT = nil end
+  end
   return ST.last or { state = "starting", players = {}, info = {} }
 end
 

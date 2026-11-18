@@ -70,15 +70,18 @@ rem without a game file: the lead's test copy under ML_TEST_ROOT, from the envir
 rem checkout's, else the main checkout's when this is a git worktree). Neither: sigcheck prints its usage and fails.
 if "%~2"=="" if not defined ML_TEST_ROOT call :ml_test_root
 "%OUT%\tools\sigcheck.exe" %2
-if errorlevel 1 set "RC=1"
+rem a crashed test program ends with a NEGATIVE code, which "if errorlevel 1" does not see (lane 72, 2026-11-18)
+if not "%ERRORLEVEL%"=="0" set "RC=1"
 echo.
 echo ===== b. mechanism test (synthetic module, test build of the DLL)
 "%OUT%\test\patch_test.exe"
-if errorlevel 1 set "RC=1"
+rem a crashed test program ends with a NEGATIVE code, which "if errorlevel 1" does not see (lane 72, 2026-11-18)
+if not "%ERRORLEVEL%"=="0" set "RC=1"
 echo.
 echo ===== b2. the shipped DLL against a real image-backed .text (a copy goes to out\test\image\)
 "%OUT%\test\image_test.exe" "%OUT%\coop_patch.dll"
-if errorlevel 1 set "RC=1"
+rem a crashed test program ends with a NEGATIVE code, which "if errorlevel 1" does not see (lane 72, 2026-11-18)
+if not "%ERRORLEVEL%"=="0" set "RC=1"
 echo.
 echo ===== c. dumpbin on the shipped DLL
 dumpbin /nologo /exports "%OUT%\coop_patch.dll" | findstr /c:"coop_patch_tick"

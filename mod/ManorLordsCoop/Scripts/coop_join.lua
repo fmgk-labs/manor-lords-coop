@@ -17,9 +17,27 @@
 --   ALL (the old way; the fallback, and "resync = all" in coop.cfg): the host pauses, saves, tells everyone, and every
 --   copy (the host too) loads that save, so all copies start from the same world.
 --     host    J SYNCING, J LOAD <save> <level>, (every copy loads), friends J READY <save>, host J GO <save>
---   The host falls back to ALL when a friend asks for a repair of the same kind again within cfg.failWindow seconds
---   after it loaded alone (it still differs), when it has loaded alone cfg.maxSingles times for one kind (or twice
---   that many times for any reason) within cfg.countWindow seconds, and when the save for a single load fails.
+--   The host falls back to ALL (lane 63) when a friend asks again for a repair of the same kind of reason after he
+--   loaded alone for it and nothing since says that load put him right, whatever the time in between: ONE failed load
+--   alone is enough. "Put right" is known for the daily comparison only: the friend's REPAIR line says how many of
+--   his days compared equal since his last load (eq<n>); for every other kind a second ask is a failure. Also when he
+--   has loaded alone cfg.maxSingles times for one kind (or twice that many for any reason) within cfg.countWindow
+--   seconds, and when the save for a single load fails. (Before lane 63 the rule was "asked again within 90 s of his
+--   load". A friend's daily comparison can ask again only after his catch-up, two counted days and 75 s of the same
+--   difference, so it nearly always came later than that. On the first public new game, 2026-11-17, two friends
+--   alternated through six loads alone, three each; the 7th ask, his 4th, came 85 s after his load and met the 90 s
+--   rule by 5 s; the count rule, 3 per friend in 600 s, would have caught that same ask.)
+--
+--   THE BREAKER (lane 63): when a difference of a kind is still there after every copy loaded for that kind, no more
+--   loads for it: no repair of that kind for cfg.breakFirst s, then at most one load of every copy per cfg.breakEvery s.
+--   The players are told once, in plain words; the host logs the ask, each friend logs its whole difference and
+--   sends it to the host's log (J BREAK, J DIFF). Reason kind "test" (COOP_TEST_REPAIR) is never held by either rule.
+--
+--   A NEW WORLD (lane 63): a world the game GENERATED differs from the same world loaded from its save (the first
+--   public new game: five buildings near the start camp had no owner on the host and the player as owner on every
+--   friend, who had loaded it). So a host whose world was generated saves and loads it itself (J.begin, every copy
+--   loads) cfg.freshSettle s after it is up, before any friend may load alone; the player is told why. Once per new
+--   world, never for a world that was loaded.
 --
 -- Friends never save: on a friend's copy every save request is blanked before the game acts on it.
 --   status: save by name + finished signal, save block: proven live on one copy (README session 14, lane_j probes J2, J5)
@@ -42,10 +60,17 @@ J.cfg = J.cfg or {}
 for k, v in pairs({
   single = true,        -- only the copy that differs (or joins) loads
   awayMax = 240.0,      -- seconds the host counts a friend as "loading alone" (no "left the game" notice, no second load for him)
-  failWindow = 90.0,    -- a repair of the same kind asked again within this many seconds after a friend loaded alone: every copy loads
+  failWindow = 90.0,    -- kind "test" only (COOP_TEST_REPAIR): asked again within this many seconds after he loaded alone: every copy loads
   maxSingles = 3,       -- this many loads alone of one friend for one kind of reason (twice as many for any reason) ...
   countWindow = 600.0,  -- ... within this many seconds: the next one is a load of every copy
+  breakFirst = 900.0,   -- (lane 63) the breaker: no repair of a kind that every copy's load did not fix, for this many seconds ...
+  breakEvery = 3600.0,  -- ... then at most one load of every copy for it per this many seconds
+  freshSettle = 10.0,   -- (lane 63) a generated world: seconds after it is up before the host saves and loads it
 }) do if J.cfg[k] == nil then J.cfg[k] = v end end
+local TEXT_PREP = "Preparing the new game for co-op..."
+local TEXT_READY = "The new game is ready for co-op"
+-- (two lines of the game's banner: in one line the 125 letters ran off both sides of the screen, lane 63 test copies)
+local TEXT_BREAK = "The games differ in a way a resync cannot fix (%s). Play goes on.\nPlease send a bug report: Co-op > Make Bug Report."
 do
   local here = debug.getinfo(1, "S").source:gsub("^@", ""):gsub("\\", "/")
   local modDir = here:match("^(.*)/Scripts/[^/]*$")
@@ -59,12 +84,24 @@ do
   if v == "all" then J.cfg.single = false elseif v == "single" then J.cfg.single = true end
 end
 J.q = J.q or {}; J.away = J.away or {}; J.hist = J.hist or {}
+-- (lane 63) the breaker's state, by reason kind, for this host's role: allFor = when a load of every copy that was
+-- asked for because of that kind ended; brk = { t = tripped, next = the next load allowed, n = loads since }; wantKinds
+-- = the kinds a wanted load of every copy is for; goKinds = those of the load under way
+J.allFor = J.allFor or {}; J.brk = J.brk or {}; J.brkSaid = J.brkSaid or {}; J.wantKinds = J.wantKinds or {}
 
 local function gi() return FindFirstOf("MLGameInstance") end
 local function GS() return StaticFindObject("/Script/Engine.Default__GameplayStatics") end
 local function enc(s) return (tostring(s):gsub("[^%w]", function(ch) return string.format("%%%02X", ch:byte()) end)) end
 
 -- ---- hooks (registered from tick; callbacks only record or blank a parameter)
+-- (lane 63) how the next world starts ("new" / "load"), stamped with the number of worlds attached so far (the core's
+-- S.loads): the world it speaks for is the next one, S.loads + 1. A copy attaches a world as idle without telling the
+-- modules (no onWorld), so the note cannot be handed on at a world change; it is matched by that number instead.
+function J.noteStart(how)
+  local S = C.s
+  J.lastStart = { how = how, t = os.clock(), loads = (S and S.loads) or 0 }
+end
+
 local function ensureHooks(S)
   _G.__coop_join_hooks = _G.__coop_join_hooks or {}
   local H = _G.__coop_join_hooks
@@ -89,7 +126,21 @@ local function ensureHooks(S)
     Jn.finished = { name = s, ok = okS, t = os.clock() }
   end)
   if ok3 then H.fin = true end
-  if H.block and H.thumb and H.fin then H.done = true; A.log("join hooks registered") end
+  -- (lane 63) how the next world starts: the menu's own "start a new game" and "load this save" (title screen and
+  -- pause menu are the same widget). Only a note of which came last; savefileToLoad is the second witness (M.onWorld).
+  -- The menu's class exists only once a menu was shown: tried every 2 s, apart from the three above.
+  local MW = "/Game/UI/Main_Menu/mainMenu_widget.mainMenu_widget_C:"
+  if not H.ng and (H.ngTries or 0) < 600 then
+    H.ngTries = (H.ngTries or 0) + 1
+    H.ng = pcall(RegisterHook, MW .. "startNewGame", function() local Jn = _G.Coop and _G.Coop.join; if Jn and Jn.noteStart then Jn.noteStart("new") end end) or nil
+  end
+  if not H.lg and (H.lgTries or 0) < 600 then
+    H.lgTries = (H.lgTries or 0) + 1
+    H.lg = pcall(RegisterHook, MW .. "LoadGame", function() local Jn = _G.Coop and _G.Coop.join; if Jn and Jn.noteStart then Jn.noteStart("load") end end) or nil
+  end
+  if H.block and H.thumb and H.fin and not H.said then H.said = true; A.log("join hooks registered") end
+  if H.ng and H.lg and not H.saidM then H.saidM = true; A.log("join: the menu's new-game and load-game hooks are registered") end
+  if H.block and H.thumb and H.fin and ((H.ng and H.lg) or (H.ngTries or 0) >= 600) then H.done = true end
 end
 
 local function levelOf(name)
@@ -103,7 +154,7 @@ end
 
 -- works with or without a world: at the main menu there is no lord, so the game instance is the context object
 local function loadSave(S, name, level)
-  J.loading = { name = name, t = os.clock() }; J.lastLoaded = name
+  J.loading = { name = name, t = os.clock() }; J.lastLoaded = name; J.noteStart("load")
   if C.men and C.men.loadBegins then pcall(C.men.loadBegins) end   -- (lane 43) the native table of held men empties now
   C.hold = true                                   -- ignore the host's state until the new world is up (and, when every copy loads, until the host says go)
   S.replay = nil
@@ -123,15 +174,24 @@ function J.begin()
   -- the game comes back from a load at speed 1 and running: remember how the players had it, to put it back after "go"
   J.before = { paused = A.isPaused(), speed = tonumber(S.eng.gameSpeed) or 1.0 }
   if J.before.speed <= 0.001 then J.before.speed = 1.0 end
-  if C.notify then C.notify("syncing", "Syncing with the host") end
+  -- (lane 63) a generated world that has not been through a load yet: this load is the one that prepares it
+  -- (J.fresh ends when the host's own load is done: M.onWorld). The player was told why a moment ago (prepStep).
+  if J.fresh then J.prep = true end
+  if C.notify and not J.prep then C.notify("syncing", "Syncing with the host") end
   A.send("J SYNCING")
   A.setPaused(true)
   J.finished = nil; J.ready = {}; J.t = os.clock(); J.state = "saving"; J.want = nil; J.lastBegin = os.clock()
+  J.goKinds = J.wantKinds or {}; J.wantKinds = {}                   -- (lane 63) the kinds of reason this load is for (the breaker)
+  for _, q in pairs(J.q) do if q.join then J.joiner = q.join end end   -- a player who waited to join comes in with this load
   J.q = {}                                                          -- whoever waited for a load of his own is served by this one
   if C.scrubQuests then pcall(C.scrubQuests, S) end                 -- the save reads every quest's regions without a null check (crash guard 2)
   local ok = S.p1:requestSaveFile(J.name, J.name)
   A.log("join: saving as %s (accepted %s); every copy will load it", J.name, tostring(ok))
-  if not ok then J.state = nil; return "the game refused to save" end
+  if not ok then
+    J.state = nil; J.wantKinds = J.goKinds or {}; J.goKinds = nil
+    if not J.before.paused then A.setPaused(false) end              -- (lane 63) not left paused by a save that never began
+    return "the game refused to save"
+  end
   return "saving as " .. J.name
 end
 
@@ -158,14 +218,78 @@ local function queued(p) return J.away[p] or J.q[p] or (J.one and J.one.targets[
 -- the whole reason is its kind. Every other reason counts by its first word (fingerprint, families, realm, refused,
 -- settled, test ...): "the daily comparison still differs" is the same kind whichever numbers it names.
 local function reasonKind(r) r = tostring(r); if r:sub(1, 11) == "bandit_camp" then return r end; return r:match("^[^_:]+") or r end
-local function singleFailed(p, reason, clock)
+J.reasonKind = reasonKind
+-- (lane 63) did the load this friend made since he last asked for this kind put him right? The daily comparison says
+-- so: eq = the friend's days that compared equal since his last load (his REPAIR line). No equal day in between: the
+-- load did not fix it, however long ago it was. (For a kind the daily comparison does not cover, such as the lord's
+-- settings, an equal day is taken as "put right" too; the count rule below stays the limit for those.)
+local function putRight(kind, eq) return eq ~= nil and eq > 0 end
+local function singleFailed(p, reason, clock, eq)
   local H = J.hist[p]; if not H then return nil end
   local kind = reasonKind(reason)
-  if H.lastEnd and H.lastKind == kind and clock - H.lastEnd < J.cfg.failWindow then return string.format("he still differs %.0f s after he loaded alone for the same kind of reason", clock - H.lastEnd) end
+  -- ONE failed load alone of this kind is enough, whatever the time since (lane 63). Kind "test" (COOP_TEST_REPAIR)
+  -- is a new cause each time by design: only the count rules below apply to it.
+  local last = H.byKind and H.byKind[kind]
+  if last and kind ~= "test" and not putRight(kind, eq) then
+    return string.format("he still differs after he loaded alone for the same kind of reason (%s, %.0f s ago; equal days since: %s)", kind, clock - last, eq and tostring(eq) or "not known")
+  end
+  if last and putRight(kind, eq) then H.byKind[kind] = nil end         -- that load had put him right: a new cause
+  -- kind "test" keeps the rule of before lane 63 (asked again within cfg.failWindow s of his load), so the test runs
+  -- that use COOP_TEST_REPAIR go on as they did
+  if kind == "test" and H.lastEnd and H.lastKind == kind and clock - H.lastEnd < J.cfg.failWindow then return string.format("he still differs %.0f s after he loaded alone for the same kind of reason", clock - H.lastEnd) end
   local same, all = 0, 0
   for _, e in ipairs(H.ends) do if clock - e.t < J.cfg.countWindow then all = all + 1; if e.kind == kind then same = same + 1 end end end
   if same >= J.cfg.maxSingles then return string.format("he has loaded alone %d times for this kind of reason in the last %.0f s", same, J.cfg.countWindow) end
   if all >= 2 * J.cfg.maxSingles then return string.format("he has loaded alone %d times in the last %.0f s", all, J.cfg.countWindow) end
+end
+J.singleFailed = singleFailed
+
+-- (lane 63) words for a kind of reason, for the players' notice: the daily comparison names its sections
+local FP_WORDS = { B = "buildings", C = "building sites", F = "families", O = "region owners", W = "weather", M = "merchants",
+                   silver = "treasury", influence = "influence", favour = "king's favour", wealth = "regional wealth",
+                   approval = "approval", order = "public order", good = "stock", soldiers = "soldiers" }
+local function kindWords(kind, reason)
+  if kind == "fingerprint" then
+    local seen, t = {}, {}
+    local list = tostring(reason):match(":_?(.*)$") or ""
+    for w in list:gmatch("[^_%s]+") do
+      local key = w:match("^(%a+)") or w
+      local word = FP_WORDS[key] or FP_WORDS[w]
+      if word and not seen[word] then seen[word] = true; t[#t + 1] = word end
+    end
+    return #t > 0 and table.concat(t, ", ") or "the daily comparison"
+  end
+  if kind:sub(1, 11) == "bandit_camp" then return "a bandit camp" end
+  local words = { families = "families", realm = "the lord's settings", refused = "a refused action", settled = "a settled region" }
+  return words[kind] or kind
+end
+J.kindWords = kindWords
+
+-- (lane 63) the breaker trips: a difference of this kind is still there after every copy loaded for it
+local function trip(S, kind, from, reason, clock)
+  local B = { t = clock, next = clock + J.cfg.breakFirst, n = 0, reason = reason, from = from }
+  J.brk[kind] = B
+  A.log("join: THE BREAKER HOLDS %s: %s asks for a repair (%s) %.0f s after every copy loaded for this kind of reason; no repair of this kind for %.0f s, then at most one load of every copy per %.0f s",
+    kind, from, tostring(reason), clock - (J.allFor[kind] or clock), J.cfg.breakFirst, J.cfg.breakEvery)
+  -- every friend writes its whole difference into its log and sends it to this host's log (J DIFF); both copies log
+  -- the daily comparison's building entries for 5 minutes (Coop.fpLog), so the two logs can be set side by side
+  A.send("J BREAK " .. kind .. " " .. tostring(reason))
+  C.fpLog = true; J.fpLogOff = os.clock() + 300.0
+  if not J.brkSaid[kind] then
+    J.brkSaid[kind] = true
+    local text = string.format(TEXT_BREAK, kindWords(kind, reason))
+    if C.notify then C.notify("info", text) end
+    A.send("J NOTE " .. enc(text))
+  end
+end
+J.trip = trip
+
+-- (lane 63) a repair request of a kind the breaker holds: nil = not held; else what to do ("held" / "again")
+local function breakerSays(kind, clock)
+  local B = J.brk[kind]; if not B then return nil end
+  if clock < B.next then return "held" end
+  B.next = clock + J.cfg.breakEvery; B.n = B.n + 1
+  return "again"
 end
 
 -- the host saves while the game runs: no pause, no notice, no load of its own
@@ -192,9 +316,39 @@ local function beginOne(S, clock)
   end
 end
 
+-- (lane 63) a generated world: the host saves and loads it itself (J.begin: every copy loads, so a friend who is
+-- already waiting comes in with it). cfg.freshSettle s after the world is up the player is told why; 3 s later (the
+-- game still runs, so the notice is drawn: a notice is not drawn while the game stands) the save is asked for. A save
+-- the game refuses is asked for again every 5 s. J.fresh ends when the host's own load is done (M.onWorld).
+local function prepStep(S, clock)
+  local F = J.fresh
+  if not F or J.state or J.loading or not A.valid(S.p1) then return end
+  if not F.said then
+    if clock - F.t < J.cfg.freshSettle then return end
+    -- the notice is drawn only while the game runs: while it stands (the pause menu is open, the player paused) this
+    -- waits, up to 60 s more; a friend who said hello meanwhile waits too (the Co-op panel says why: coop_ui.lua)
+    local standing = false; pcall(function() standing = A.isPaused() end)
+    if standing and clock - F.t < J.cfg.freshSettle + 60.0 then
+      if not F.waitSaid then F.waitSaid = true; A.log("join: the new world waits for the game to run before it is prepared (the player is told then)") end
+      return
+    end
+    F.said = clock
+    A.log("join: this host's world was made by the game, not loaded from a save: it saves it and loads it once before any friend may load it alone")
+    if C.notify then C.notify("syncing", TEXT_PREP) end
+    return
+  end
+  if clock - F.said < 3.0 or clock - (F.tryT or -100) < 5.0 then return end
+  F.tryT = clock; F.tries = (F.tries or 0) + 1
+  local r = J.begin()
+  if J.state == "saving" then A.log("join: preparing the new world for co-op: %s (try %d)", tostring(r), F.tries)
+  elseif F.tries == 1 or F.tries % 12 == 0 then A.log("join: preparing the new world for co-op: %s (try %d); asked again every 5 s", tostring(r), F.tries) end
+end
+J.prepStep = prepStep
+
 local function hostTick(S, clock)
   -- every copy loads: not while a friend is loading alone (he would be told to load in the middle of a load)
   if J.want and not J.state and next(J.away) == nil and clock - (J.lastBegin or -100) > 20.0 then J.begin() end
+  prepStep(S, clock)
   local Rs = J.restore
   if Rs and not J.state then
     if clock - Rs.t > 12.0 or Rs.n >= 2 then J.restore = nil
@@ -204,7 +358,9 @@ local function hostTick(S, clock)
     end
   end
   -- SINGLE: friends that wait for a load of their own
-  if next(J.q) ~= nil and not J.state and not J.want then beginOne(S, clock) end
+  -- (lane 63) not while a generated world waits for its first load: the friend would load the save of a world the
+  -- host has not been through itself (J.begin serves him instead)
+  if next(J.q) ~= nil and not J.state and not J.want and not J.fresh then beginOne(S, clock) end
   if J.state == "saving1" then
     local O = J.one
     if J.finished and J.finished.name == O.name then
@@ -234,13 +390,21 @@ local function hostTick(S, clock)
   end
   if J.state == "saving" then
     if J.finished and J.finished.name == J.name then
-      if not J.finished.ok then A.log("join: save failed"); J.state = nil; return end
+      if not J.finished.ok then
+        -- (lane 63) the game as the players had it, and the kinds of reason still wanted (a new world asks again: prepStep)
+        A.log("join: save failed"); J.state = nil; J.wantKinds = J.goKinds or {}; J.goKinds = nil
+        if J.before and not J.before.paused then A.setPaused(false) end
+        return
+      end
       J.level = levelOf(J.name)
       A.send(string.format("J LOAD %s %s", J.name, J.level))
       A.log("join: saved in %.2f s, told friends, reloading", clock - J.t)
       J.state = "loading"; J.t = clock
       loadSave(S, J.name, J.level)
-    elseif clock - J.t > 15.0 then A.log("join: save timed out"); J.state = nil end
+    elseif clock - J.t > 15.0 then
+      A.log("join: save timed out"); J.state = nil; J.wantKinds = J.goKinds or {}; J.goKinds = nil
+      if J.before and not J.before.paused then A.setPaused(false) end   -- (lane 63)
+    end
   elseif J.state == "waiting" then
     local all = true
     -- a friend's load can take minutes (first session between two PCs: over 60 s, and the old 60 s limit started the
@@ -271,15 +435,23 @@ local function hostTick(S, clock)
       J.restore = (not B.paused and B.speed > 0 and math.abs(B.speed - 1.0) > 0.02) and { speed = B.speed, t = clock, n = 0 } or nil
       J.lastGo = os.clock()
       J.hist = {}; J.away = {}                           -- every copy has the same world again: the single loads before it no longer count
-      A.log("join: go (%s), back to %s", all and "all friends ready" or "timed out waiting for a friend", B.paused and "paused" or ("speed " .. B.speed))
+      -- (lane 63) the breaker: the kinds of reason this load of every copy was for. A friend that asks for one of them
+      -- again without an equal day since is a difference this load did not fix.
+      local kinds = {}
+      for k in pairs(J.goKinds or {}) do J.allFor[k] = clock; kinds[#kinds + 1] = k end
+      J.goKinds = nil; table.sort(kinds)
+      A.log("join: go (%s), back to %s%s", all and "all friends ready" or "timed out waiting for a friend", B.paused and "paused" or ("speed " .. B.speed),
+        #kinds > 0 and (" (this load was for: " .. table.concat(kinds, ", ") .. ")") or "")
       local came = false; for _, peer in ipairs(S.peers) do if J.ready[peer] then came = true end end
+      local prep = J.prep; J.prep = nil
+      if prep and C.notify then C.notify("synced", TEXT_READY) end
       if J.joiner and not came then J.joiner = nil; if C.notify then C.notify("synced", "The player did not finish joining") end
       elseif J.joiner then                               -- this resync brought a player in: say so on every copy
         local text = J.joiner .. " joined the game"
         A.send("J NOTE " .. enc(text))
         if C.notify then C.notify("joined", text) end
         J.joiner = nil
-      elseif C.notify then C.notify("synced", "Synced") end
+      elseif C.notify and not prep then C.notify("synced", "Synced") end
       -- friends dropped every state line while they were loading: send everything again now (session 17: a friend
       -- otherwise waited up to 30 s for the host's treasury number)
       if C.world and C.world.keyframe then pcall(C.world.keyframe) end
@@ -299,8 +471,11 @@ function J.requestRepair(reason)
   if S.role == "host" then J.want = true; return end
   if os.clock() - (J.repairT or -100) < 30.0 then J.repairLater = tostring(reason); return end
   J.repairT = os.clock(); J.repairLater = nil
-  A.send("J REPAIR " .. tostring(reason):gsub("%s+", "_"))
-  A.log("join: asked the host for a repair (%s)", tostring(reason))
+  -- (lane 63) and how many of this copy's days compared equal since its last load: the host's word for "that load
+  -- put him right" (a later ask is then a new cause, not a failed load)
+  local eq = math.max(0, ((S.stats and S.stats.w_fpOk) or 0) - (J.eqBase or 0))
+  A.send(string.format("J REPAIR %s eq%d", (tostring(reason):gsub("%s+", "_")), eq))
+  A.log("join: asked the host for a repair (%s); days equal since this copy's last load: %d", tostring(reason), eq)
 end
 C.onDrift = function(reason) J.requestRepair(reason) end
 
@@ -314,7 +489,47 @@ end
 
 local M = {}
 
+-- (lane 63) the first world of a host role (C.setRole gives every role a new S.startWall): what the last co-op game
+-- left in the breaker ends here, and was this world made by the game (a new game) or loaded from a save?
+-- Two witnesses, both logged: the menu's own call that came last before the world (startNewGame / LoadGame, hooked
+-- above; the mod's own loads count as "load"), and the game instance's savefileToLoad ("" for a new game: coop_ui.lua
+-- sets it so before the New Game screen opens; a save's name after a load). The hook decides when it was seen.
+-- the friends that said hello in THIS role (a hello of an earlier co-op game must not hold up this one's loads; one
+-- of this role, also one that came before the host's world, is kept)
+local function expectFor(S)
+  if J.expectKey ~= S.startWall then J.expect = {}; J.expectKey = S.startWall end
+  return J.expect
+end
+local function hostRoleBegins(S)
+  J.fresh = nil; J.prep = nil; J.allFor = {}; J.brk = {}; J.brkSaid = {}; J.wantKinds = {}; J.goKinds = nil
+  expectFor(S)
+  local nm; pcall(function() nm = gi().savefileToLoad:ToString() end)
+  -- the menu's last call counts only when it came just before THIS world (its stamp is this world's number - 1)
+  local ls = J.lastStart
+  local how = (ls and ls.loads == (S.loads or 0) - 1) and ls.how or nil
+  local byName = (nm == "") and "new" or (nm ~= nil and "load" or nil)
+  -- When the two witnesses differ, the world is prepared: a needless load of its own costs the host a few seconds,
+  -- a generated world that is not prepared costs every friend a resync every few minutes (the first public new game).
+  local generated = (how == "new") or (byName == "new") or (how == nil and byName == nil)
+  local differ = how and byName and how ~= byName
+  A.log("join: this host's first world: the menu's last call %s, the game's save name '%s'%s: %s",
+    how and ("'" .. how .. "' " .. string.format("%.0f s ago", os.clock() - ls.t)) or (ls and string.format("'%s' (for world %d, this is world %d: not counted)", ls.how, (ls.loads or 0) + 1, S.loads or 0) or "not seen"),
+    tostring(nm), differ and " - THE TWO DIFFER: prepared to be safe" or "",
+    generated and "a world the game made (a new game): it is saved and loaded once before friends load it" or "a world loaded from a save: nothing to prepare")
+  if generated then J.fresh = { t = os.clock() } end
+end
+J.hostRoleBegins = hostRoleBegins
+
 function M.onWorld(S)
+  if S.role == "host" and J.roleKey ~= S.startWall then
+    J.roleKey = S.startWall
+    if not J.loading then hostRoleBegins(S) end
+  end
+  if S.role == "host" and J.loading and J.fresh then
+    J.fresh = nil
+    A.log("join: the new world has been through a load on this host: friends may load it alone from now on")
+  end
+  if S.role == "friend" and J.loading then J.eqBase = (S.stats and S.stats.w_fpOk) or 0 end   -- (lane 63) equal days are counted from this load on
   -- (lane 27) The host loaded a world that the mod did not ask for (the player loaded another save from the menu)
   -- while friends are connected: every copy loads the host's new world, the way a join does (J.begin: the host saves
   -- it, every copy loads that save). The host's first world of a session is not such a change: nobody had another one.
@@ -363,6 +578,7 @@ end
 local TEST_REPAIR = tonumber(os.getenv("COOP_TEST_REPAIR") or "")
 function M.tick(S, clock)
   ensureHooks(S)
+  if J.fpLogOff and os.clock() > J.fpLogOff then J.fpLogOff = nil; C.fpLog = nil end   -- (lane 63) the breaker's 5 minutes of building entries
   if S.role == "host" then hostTick(S, clock) else friendHello(S, clock) end
   if S.role == "friend" and J.repairLater and not C.hold and not J.loading and os.clock() - (J.repairT or -100) >= 30.0 then J.requestRepair(J.repairLater) end
   if TEST_REPAIR and S.role == "friend" and not C.hold and not J.loading and A.valid(S.p1) then
@@ -373,6 +589,7 @@ end
 
 -- no world yet (a friend waiting at the main menu): keep saying hello so the host starts a join
 function M.idle(S, clock)
+  ensureHooks(S)                                   -- (lane 63) the menu's new-game / load-game hooks are needed at the title screen
   if S.role == "friend" then friendHello(S, clock) end
 end
 
@@ -405,6 +622,16 @@ function M.onMessage(S, from, kind, w, line)
     elseif w[4] == "LOAD" then J.single = nil; loadSave(S, w[5], w[6] or "Mission01_ROBBER")      -- every copy loads
     elseif w[4] == "SYNCING" then if C.notify then C.notify("syncing", "Syncing with the host") end
     elseif w[4] == "NOTE" and w[5] then if C.notify then C.notify("info", (w[5]:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))) end
+    elseif w[4] == "BREAK" and w[5] then
+      -- (lane 63) the host's breaker holds a kind of reason: this copy's whole difference into this log, and to the
+      -- host's log (one line, cut at 900 characters there: encoded, a line stays under 3,000); the daily comparison's
+      -- building entries for 5 minutes
+      local wt = C.world and C.world.diffText
+      local ok, text = pcall(function() return wt and wt() or "the world module gives no difference text" end)
+      text = ok and tostring(text) or ("the difference could not be read: " .. tostring(text))
+      A.log("join: the host's breaker holds %s (%s): this copy's difference: %s", tostring(w[5]), tostring(w[6]), text)
+      A.send(string.format("J DIFF %s %s", tostring(w[5]), enc(text:sub(1, 900))))
+      C.fpLog = true; J.fpLogOff = os.clock() + 300.0
     elseif w[4] == "GO" then
       C.hold = false; J.holdT = nil; J.helloT = os.clock()       -- the host's state follows within a moment: no new hello now (session 19: it caused a second join)
       A.log("join: go from the host"); if C.notify then C.notify("synced", "Synced") end
@@ -417,8 +644,9 @@ function M.onMessage(S, from, kind, w, line)
       if a and a.id == w[6] then
         J.away[from] = nil
         if S.heard then S.heard[from] = os.clock() end
-        local H = J.hist[from] or { ends = {} }; J.hist[from] = H
+        local H = J.hist[from] or { ends = {}, byKind = {} }; J.hist[from] = H
         H.ends[#H.ends + 1] = { t = clock, kind = reasonKind(a.reason) }; H.lastEnd = clock; H.lastKind = reasonKind(a.reason)
+        H.byKind = H.byKind or {}; H.byKind[reasonKind(a.reason)] = clock      -- (lane 63) one failed load alone of a kind is enough
         while #H.ends > 12 do table.remove(H.ends, 1) end
         keyframes()
         if C.announceAll then pcall(C.announceAll) end   -- a squad his load did not bring back is made on his copy
@@ -446,7 +674,7 @@ function M.onMessage(S, from, kind, w, line)
         A.send("J NOTE " .. enc("A player's co-op mod version differs from the host's"))
       end
     elseif w[4] == "HELLO" then
-      J.expect = J.expect or {}; J.expect[from] = true
+      expectFor(S)[from] = true
       local who = (S.display and S.display[from]) or from
       A.log("join: hello from %s", from)
       if J.auto and J.cfg.single then
@@ -457,6 +685,9 @@ function M.onMessage(S, from, kind, w, line)
         if not a and not (J.q[from] or (J.one and J.one.targets[from])) and J.state ~= "saving" and J.state ~= "loading" and J.state ~= "waiting" then
           local q = { reason = "join", t = clock, join = who }
           if J.state == "saving1" then J.one.targets[from] = q else J.q[from] = q end
+          -- (lane 63) a generated world not yet through a load: he waits in the queue; the host's own save and load
+          -- (prepStep, a load of every copy) brings him in
+          if J.fresh then A.log("join: %s waits: this new world is being prepared for co-op (the host saves and loads it first), he comes in with that load", from) end
         end
       else
         J.joiner = who                                           -- shown as "<name> joined the game" after the load
@@ -464,8 +695,33 @@ function M.onMessage(S, from, kind, w, line)
         -- yet); only a hello that comes after it needs a join of its own (session 19: one return caused three joins)
         if J.auto and J.state ~= "saving" then J.want = true end
       end
+    elseif w[4] == "DIFF" and w[5] then
+      -- (lane 63) a friend's whole difference, sent when the breaker began to hold its kind
+      A.log("join: the difference a resync did not fix, as %s has it (%s): %s", from, tostring(w[5]), ((w[6] or "-"):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)))
     elseif w[4] == "REPAIR" then
-      local why = J.cfg.single and singleFailed(from, tostring(w[5]), clock) or nil
+      local reason = tostring(w[5]); local kind = reasonKind(reason)
+      local eq = tonumber((w[6] or ""):match("^eq(%d+)$"))
+      if J.state == "saving" or J.state == "loading" or J.state == "waiting" or J.want or (J.lastGo and os.clock() - J.lastGo < 15.0) or queued(from) then
+        -- (the old answers below)
+      elseif kind ~= "test" then
+        -- (lane 63) the breaker. A kind it holds gets no repair (log only, once a minute) until its time comes, then
+        -- one load of every copy; a kind every copy loaded for and that this friend still asks for, without one equal
+        -- day since, makes it hold.
+        local says = breakerSays(kind, clock)
+        if says == "held" then
+          local B = J.brk[kind]
+          if clock - (B.logT or -100) >= 60.0 then B.logT = clock; A.log("join: %s asks for a repair (%s): the breaker holds this kind for %.0f s more; no load", from, reason, B.next - clock) end
+          return true
+        elseif says == "again" then
+          A.log("join: %s asks for a repair (%s): the breaker's time for this kind is up: every copy loads once more (time %d; the next in %.0f s at the earliest)", from, reason, J.brk[kind].n, J.cfg.breakEvery)
+          J.want = true; J.wantKinds[kind] = true
+          return true
+        elseif J.allFor[kind] then
+          if putRight(kind, eq) then J.allFor[kind] = nil       -- that load of every copy put him right: this is a new cause
+          else trip(S, kind, from, reason, clock); return true end
+        end
+      end
+      local why = J.cfg.single and singleFailed(from, reason, clock, eq) or nil
       -- Several friends see the same difference in the same second and each asks. When every copy loads, the resync
       -- that the first one starts answers them all: a request that comes while one is under way, or within 15 s
       -- after it ended (still on its way from a copy that has reloaded since), starts no second one. (2026-11-12,
@@ -475,13 +731,13 @@ function M.onMessage(S, from, kind, w, line)
         A.log("join: %s asks for a repair (%s): a resync is under way or has just ended, no second one", from, tostring(w[5]))
       elseif not J.cfg.single then
         A.log("join: %s asks for a repair (%s)", from, tostring(w[5]))
-        J.want = true
+        J.want = true; if kind ~= "test" then J.wantKinds[kind] = true end
       elseif queued(from) then
         A.log("join: %s asks for a repair (%s): he is loading alone already", from, tostring(w[5]))
       elseif why then
         -- the fallback: the load of his own did not put him right
         A.log("join: %s asks for a repair (%s): %s, so every copy loads", from, tostring(w[5]), why)
-        J.want = true
+        J.want = true; if kind ~= "test" then J.wantKinds[kind] = true end
       else
         -- SINGLE: he loads alone. Friends that ask while the save is being written load the same save.
         A.log("join: %s asks for a repair (%s): he alone will load", from, tostring(w[5]))
@@ -498,6 +754,8 @@ function J.status()
   local t = {}
   for p, a in pairs(J.away) do t[#t + 1] = string.format("%s loads %s alone since %.0f s", p, a.name, os.clock() - a.t) end
   for p in pairs(J.q) do t[#t + 1] = p .. " waits for a load of his own" end
+  if J.fresh then t[#t + 1] = string.format("a new world waits for its first load (%d tries)", J.fresh.tries or 0) end
+  for k, B in pairs(J.brk or {}) do t[#t + 1] = string.format("the breaker holds %s (%.0f s more)", k, math.max(0, B.next - os.clock())) end
   return string.format("join: %s, state %s%s%s", J.cfg.single and "single loads" or "every copy loads", tostring(J.state), J.want and ", a load of every copy is wanted" or "", #t > 0 and (" | " .. table.concat(t, "; ")) or "")
 end
 

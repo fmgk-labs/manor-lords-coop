@@ -40,7 +40,7 @@
 #include <limits.h>
 #include "coop_scan.h"
 
-#define COOP_PATCH_VERSION "0.9.1"
+#define COOP_PATCH_VERSION "0.9.2"    /* 0.9.2 (lane 62): a bug report takes the Steam piece's log and status, names out by line shape */
 #define LOG_CAP            (256u * 1024u)
 #define MAX_LINE           4096       /* lane 22: a TOTALS SET line names every good of a region (512 was too short live) */
 #define READ_CHUNK         65536
@@ -4581,7 +4581,12 @@ static void init(void)
 
 static void tick_body(void)
 {
-    if (!g_inited) { g_inited = 1; init(); }
+    /* (lane 62) The tick that starts the scan's thread never evaluates its hits, also when the thread is done already:
+     * the next tick does. A small module is read in microseconds, and whether the first tick then still saw "busy" was
+     * a race with the log line written after CreateThread: on a loaded PC the image test (a program with a tiny .text)
+     * failed its two "scanning" checks in three runs in a row. In the game the scan takes over 2 s, so nothing changes
+     * there but the order being fixed: first tick "scanning", a later tick the hits. */
+    if (!g_inited) { g_inited = 1; init(); if (!g_scan_done) return; }
     if (g_scan_busy) return;                   /* lane 47: the scan's thread is still reading .text */
     if (!g_scan_done) { g_scan_done = 1; scan_end(); g_dirty = 1; }
     goods_tick();           /* what the hooks left for the tick (before the commands: a write of the mod comes after) */

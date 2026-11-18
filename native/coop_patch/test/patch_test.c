@@ -1596,6 +1596,79 @@ static void test_report(void)
     check(strstr(t, "command: STATUS C:\\Users\\<user>\\x and D:\\Games\\<user>\\y") != NULL && strstr(t, "Real Name") == NULL && strstr(t, "Test Person") == NULL,
           "coop_patch.log: a path in a logged line has <user> in place of the user name");
 
+    /* (lane 62) the Steam piece's log and status in a report: their Steam names go by the SHAPE of the line. None of
+     * the four names below is in the job's name list (the mod does not know them any more after a lobby was lost),
+     * one has 2 letters (the name list takes 3 or more), one has spaces, parentheses and digits. Mock names and ids. */
+    {
+        wchar_t src3[MAX_PATH], src4[MAX_PATH], d4[MAX_PATH];
+        char s3[MAX_PATH * 3], s4[MAX_PATH * 3];
+        _snwprintf(src3, MAX_PATH, L"%srp_src3.txt", g_exedir);
+        _snwprintf(src4, MAX_PATH, L"%srp_src4.txt", g_exedir);
+        _snwprintf(d4, MAX_PATH, L"%sreport_r4-test\\", reports);
+        rp_rmdir(d4);
+        rp_write(src3,
+            "2026-11-17 20:01:02.003 coop_steam 0.2 (protocol 1) started; link folder C:\\Users\\Real Name\\Mods\\link; save transfer on\r\n"
+            "2026-11-17 20:01:05.100 slot 1 given to 76561190000000002\r\n"
+            "2026-11-17 20:01:05.300 Friend One (76561190000000002) connected as friend1\r\n"
+            "2026-11-17 20:01:06.300 Al (76561190000000003) connected as friend2\r\n"
+            "2026-11-17 20:01:07.300 Odd (Name) 5 one (76561190000000004) connected as friend3\r\n"
+            "2026-11-17 20:01:08.000 note: Late Comer is in the lobby but the co-op mod on that PC has not answered for 30 s (mod missing or Steam link off?)\r\n"
+            "2026-11-17 20:02:00.000 lobby member 76561190000000001 change 0x4\r\n"
+            "2026-11-17 20:02:00.001 friend1 (76561190000000002) left: left the Steam lobby\r\n"
+            "2026-11-17 20:02:01.000 76561190000000002 connected as friend1\r\n"
+            "2026-11-17 20:02:02.000 note: the co-op mod of friend2 (76561190000000003) has not answered for 30 s\n"
+            /* the raw bytes of a callback as the DLL logs them once per kind (made-up bytes here): on a real PC they hold a lobby id and whole Steam ids in hex */
+            "2026-11-17 20:02:02.500 first callback 506 (LobbyChatUpdate, our size 32, delivered on thread 100, game thread 100): first bytes 7b 00 f8 06 00 00 86 01 02 f0 4b ff 00 00 10 01 02 f0 4b ff 00 00 10 01 \r\n"
+            "2026-11-17 20:02:03.000 Last One (76561190000000005) connected as friend4");
+        rp_write(src4,
+            "hosting 76561190000000001 109775240000000123\n"
+            "info appid 1363080 overlay 1 relay ok loggedon 1 build 17000001 proto 1 dll 0.2\n"
+            "note Late Comer is in the lobby but the co-op mod on that PC has not answered for 30 s (mod missing or Steam link off?)\n"
+            "lost 1 2\n"
+            "0 76561190000000001 connected 0 Host Player\n"
+            "1 76561190000000002 connected 35 Friend One\n"
+            "2 76561190000000003 connecting -1 Al\n"
+            "3 76561190000000004 disconnected -1 Odd (Name) 5 one\n");
+        rp_utf8(src3, s3, sizeof(s3)); rp_utf8(src4, s4, sizeof(s4));
+        start("RP4: REPORT with the Steam piece's log and status: names out by line shape, ids cut to 4 digits", m, NULL, NULL, NULL);
+        _snprintf(text, sizeof(text), "open 0\nzip 0\nname Wilhelmina\tfriend 1\nsteamlog %s\tcoop_steam.log\t2097152\nsteamstatus %s\tsteam_status.txt\t0\nfile %s\tplain_copy.txt\t0\n", s3, s4, s3);
+        rp_write(job, text);
+        cmd("REPORT r4-test");
+        check(rp_wait(), "the report's thread finished within 30 s");
+        if (!status_line("REPORT folder report_r4-test 3 no zip asked", 1)) printf("%s\n", read_file(g_status));
+        check(status_line("REPORT folder report_r4-test 3 no zip asked", 1), "status: folder kept, 3 files copied");
+        _snwprintf(p, MAX_PATH, L"%scoop_steam.log", d4);
+        t = read_file(p);
+        check(strstr(t, "20:01:05.300 friend 1 (<id..0002>) connected as friend1\r\n") != NULL, "steam log: '<name> (<id>) connected as friendN' has the slot in place of the name, the id cut");
+        check(strstr(t, "20:01:06.300 friend 2 (<id..0003>) connected as friend2\r\n") != NULL, "steam log: a 2-letter name goes too (the name list would have left it)");
+        check(strstr(t, "20:01:07.300 friend 3 (<id..0004>) connected as friend3\r\n") != NULL, "steam log: a name with spaces, parentheses and digits goes whole");
+        check(strstr(t, "20:01:08.000 note: <name> is in the lobby but the co-op mod on that PC has not answered") != NULL, "steam log: the 'has not answered' note has <name>");
+        check(strstr(t, "lobby member <id..0001> change 0x4\r\n") != NULL && strstr(t, "friend1 (<id..0002>) left: left the Steam lobby\r\n") != NULL &&
+              strstr(t, "20:02:01.000 <id..0002> connected as friend1\r\n") != NULL && strstr(t, "note: the co-op mod of friend2 (<id..0003>) has not answered for 30 s\n") != NULL,
+              "steam log: lines without a name keep their text (ids cut); DLL 0.3 lines are left as they are");
+        check(strstr(t, "20:02:03.000 friend 4 (<id..0005>) connected as friend4") != NULL, "steam log: a last line without a line end is handled too");
+        check(strstr(t, "first callback 506 (LobbyChatUpdate, our size 32, delivered on thread 100, game thread 100): first bytes <left out>\r\n") != NULL &&
+              !strstr(t, "02 f0 4b ff 00 00 10 01") && !strstr(t, "7b 00 f8"),
+              "steam log: the raw bytes of a first callback (a whole Steam id in hex) are left out");
+        check(strstr(t, "link folder C:\\Users\\<user>\\Mods\\link") != NULL, "steam log: the user folder is <user>");
+        check(!strstr(t, "Friend One") && !strstr(t, " Al ") && !strstr(t, "Odd") && !strstr(t, "Late Comer") && !strstr(t, "Last One") && !strstr(t, "Real Name") && !strstr(t, "7656119"),
+              "steam log: no name and no whole Steam id is left in the copy");
+        _snwprintf(p, MAX_PATH, L"%ssteam_status.txt", d4);
+        t = read_file(p);
+        check(strstr(t, "hosting <id..0001> 109775240000000123\n") != NULL && strstr(t, "\nlost 1 2\n") != NULL && strstr(t, " dll 0.2\n") != NULL, "steam status: the header, info and lost lines keep their text (own id cut)");
+        check(strstr(t, "\n0 <id..0001> connected 0 host\n") != NULL && strstr(t, "\n1 <id..0002> connected 35 friend 1\n") != NULL &&
+              strstr(t, "\n2 <id..0003> connecting -1 friend 2\n") != NULL && strstr(t, "\n3 <id..0004> disconnected -1 friend 3\n") != NULL,
+              "steam status: every player line has its slot name in place of the Steam name (any length, any characters)");
+        check(strstr(t, "\nnote <name> is in the lobby but the co-op mod") != NULL, "steam status: the note has <name>");
+        check(!strstr(t, "Host Player") && !strstr(t, "Friend One") && !strstr(t, " Al") && !strstr(t, "Odd") && !strstr(t, "Late Comer") && !strstr(t, "7656119"),
+              "steam status: no name and no whole Steam id is left in the copy");
+        _snwprintf(p, MAX_PATH, L"%splain_copy.txt", d4);
+        t = read_file(p);
+        check(strstr(t, "Friend One (<id..0002>) connected as friend1") != NULL, "the same log listed as a plain file keeps the name: the line-shape rule is what takes it out");
+        rp_rmdir(d4);
+        DeleteFileW(src3); DeleteFileW(src4);
+    }
+
     rp_rmdir(d1);
     DeleteFileW(zip); DeleteFileW(src1); DeleteFileW(src2); DeleteFileW(job);
     SetEnvironmentVariableW(L"USERNAME", nu ? oldUser : NULL);

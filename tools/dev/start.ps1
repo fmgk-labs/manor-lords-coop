@@ -22,7 +22,19 @@ $set['COOP_STEAM'] = 'off'
 foreach ($pair in ($Extra -split '\s+')) { if ($pair -match '^([A-Z_0-9]+)=(.*)$') { $set[$Matches[1]] = $Matches[2] } }
 foreach ($k in 'COOP_ROLE', 'COOP_NAME', 'COOP_IO', 'COOP_STEAM', 'COOP_TEST_REPAIR', 'COOP_LINKDIR') { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
 foreach ($k in $set.Keys) { Set-Item "Env:$k" $set[$k] }
+# the window in front right now (the user's own work, or his own running game): a new copy takes the focus when its
+# window opens, so a hidden watcher puts this window back in front for the next 90 s (focus_back.ps1)
+$prevFg = 0
+try {
+    Add-Type -Namespace MLStart -Name Fg -MemberDefinition '[DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow();' -ErrorAction Stop
+    $prevFg = [MLStart.Fg]::GetForegroundWindow().ToInt64()
+} catch { $prevFg = 0 }
 $p = Start-Process $Exe -ArgumentList '-windowed', "-ResX=$ResX", "-ResY=$ResY", "-WinX=$WinX", "-WinY=$WinY", '-nosound', "-saveddirsuffix=$Suffix" -PassThru
 foreach ($k in $set.Keys) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
+# ML_NO_FOCUS_BACK=1 (set by a run that uses the real mouse or keyboard on its copies, while the user is away): no
+# watcher, because it would take the focus away from a copy that was just clicked and the next key would land elsewhere
+if ($prevFg -ne 0 -and $p -and $env:ML_NO_FOCUS_BACK -ne '1') {
+    Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $PSScriptRoot 'focus_back.ps1')`"", '-NewPid', $p.Id, '-Prev', $prevFg | Out-Null
+}
 "$Role pid $($p.Id)"
 if ($PidFile) { $p.Id | Set-Content $PidFile }

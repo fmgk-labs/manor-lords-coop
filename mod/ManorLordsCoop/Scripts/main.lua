@@ -43,6 +43,22 @@ local function load(name)
   return true
 end
 
+-- (lane 62) One co-op copy per install. A second copy of the game started from this install while the first still
+-- runs would share the first copy's link folder, logs and Steam status (live: it took the first copy's place with
+-- the host and starved it). coop_guard.lua finds a living first process (a lock file the first keeps open); then
+-- nothing of the mod is loaded here but coop_second.lua, which only tells the player in the menu. Before the core:
+-- nothing has written a file yet. Not for copies with a forced role or name (COOP_ROLE / COOP_NAME: the test harness
+-- runs several copies from one test install on purpose), and not with "guard = off" in coop.cfg.
+if load("coop_guard.lua") and _G.COOP_GUARD and _G.COOP_GUARD.check then
+  local okG, eG = pcall(_G.COOP_GUARD.check, cfg.guard == "off")
+  if not okG then print("[ManorLordsCoop] guard: " .. tostring(eG) .. " (the mod starts as usual)\n") end
+  if okG and _G.COOP_GUARD.second then
+    load("coop_second.lua")
+    print("[ManorLordsCoop] Manor Lords is already running with co-op on this PC: the mod is off in this second copy (" .. tostring(_G.COOP_GUARD.state) .. ")\n")
+    return
+  end
+end
+
 if not load("coop.lua") then return end
 -- optional modules: present in a full install, absent in a core-only test
 -- coop_x_*.lua: actions added per area in their own files (they use the town module's api and load after it)

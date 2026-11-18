@@ -35,10 +35,11 @@ The crashed session is kept: the mod keeps the logs of your last 5 game starts.
 
 | File | What it is |
 |---|---|
-| `report_info.txt` | mod version, game version, mod loader version, host or friend, how many players were connected, the save's name, the time |
+| `report_info.txt` | mod version, game version, mod loader version, host or friend, how many players were connected, the save's name, the time; which process made the report and which process and game start wrote each log (so a second copy of the game is not mistaken for the session) |
 | `current_<name>_log.txt` | the mod's log of this game start (`host`, `friend1` ... or `idle` for the title screen) |
 | `previous_<name>_....txt` | the mod's log of the game start before (after a crash: the crashed one) |
 | `patch_status.txt`, `coop_patch.log` | the state and the log of the mod's native part |
+| `coop_steam.log`, `steam_status.txt` | the log and the state of the mod's Steam link (since 0.2.3): the lobby, who joined and left, lost connections |
 | `UE4SS.log` | the mod loader's log |
 
 Very long logs keep their start and their end; the middle is left out, so the zip stays small.
@@ -48,6 +49,7 @@ Logs written by a mod version before 0.2.2 are left out (they can hold Steam nam
 
 The zip has **no Windows user name** (it is replaced by `<user>`), **no Steam names** (replaced by `host`, `friend 1` ...)
 and **no whole Steam IDs** (only the last 4 digits stay). The mod's own logs are written that way too.
+In the Steam link's two files every player's name is replaced by `host`, `friend 1` ... (or `<name>`) when the zip is made.
 Nothing is sent anywhere: the zip stays on your PC until you post it.
 
 **Do not post the raw log files** from the game folder in public. Post the zip.
