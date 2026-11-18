@@ -91,3 +91,14 @@ The project is under the MIT licence: see [LICENSE](../LICENSE). By sending a co
 ## About `research/` and `ledger.md`
 
 Some code comments and READMEs point to `research/...` or `ledger.md`. Those are the author's private test notes: logs of hundreds of test runs. They are not in this repo. The code and the docs here are complete without them. If a comment's reason is unclear, ask in an issue or on Discord.
+
+## How work is tracked
+
+1. **Every fault gets one GitHub issue.** Players report in Discord (`#bug-reports`, with the Make Bug Report zip). When a moderator gives a post the tag **confirmed**, an issue is opened here by itself and linked in the post.
+2. **A fix is a pull request that says `Refs #<issue>`.** Never `Fixes #<issue>`: GitHub would close the issue at the merge. Say in the pull request how you tested (two copies, two PCs, native tests).
+3. **Merged is not done.** After the merge the issue moves to **Fixed, awaiting live proof** on the project board and gets the label `live-proof-needed` when only real play can show it.
+4. **An issue is closed when the fix is seen working in a real session** on a released version: by the reporter, the owner or a tester. Say which version and what you saw.
+5. **One milestone per version.** The release notes are the milestone's issues.
+6. Typos and small doc changes need no issue.
+
+Board columns: **Open**, **In progress**, **Fixed, awaiting live proof**, **Verified live**.

@@ -1,0 +1,41 @@
+# Discord #bug-reports forum -> GitHub issues, every 15 minutes.
+# A post becomes an issue when a moderator gives it the forum tag "confirmed" (so spam and questions never do).
+# One-time setup by the repo owner: a Discord bot in the server (View Channel, Read Message History, Send Messages in
+# Threads, and the Message Content intent), its token as the repository secret DISCORD_BOT_TOKEN.
+# Without the secret this workflow does nothing. See docs/MAINTAINERS.md.
+name: Discord bug posts to issues
+
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "1 = only list what would be opened"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: discord-issues
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Open issues for confirmed Discord posts
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          DISCORD_GUILD_ID: "1572268478230954279"
+          DISCORD_FORUM_ID: "1572269102800838756"
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: node tools/ci/discord_issues.mjs

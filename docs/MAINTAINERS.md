@@ -76,3 +76,9 @@ Every player must use **the same zip**. A different mod version is refused at th
 9. **Discord:** `#github-feed` posts the release by itself. Write the announcement in `#announcements`.
 
 Never send a test build to players: test builds contain `coop_dev.lua`.
+
+## Discord posts to GitHub issues
+
+`.github/workflows/discord-issues.yml` runs every 15 minutes. It reads the `#bug-reports` forum and opens an issue for every post that has the forum tag **confirmed** (a moderator adds it), with the labels `from-discord` and `bug` (`crash`, `desync`, `needs-logs` by the post's tags and files). It answers in the post with the issue's link. Player names are not copied.
+
+One-time setup (the owner): a Discord bot in the server with View Channel, Read Message History, Send Messages in Threads, and the **Message Content intent**; its token as the repository secret `DISCORD_BOT_TOKEN`. Without the secret the workflow does nothing. Try it from the Actions tab with `dry_run` = 1.

@@ -43,3 +43,7 @@ Cases:
 - [ ] No Windows user names, local paths, Steam names or crash records in the commit.
 - [ ] `C.version` changed in `coop.lua` if players must update.
 - [ ] `docs/KNOWN_ISSUES.md` updated if a known issue changed.
+
+## The issue for this change
+
+Refs #<number> (write `Refs`, not `Fixes`: the issue is closed only after the fix is seen in a real session).
