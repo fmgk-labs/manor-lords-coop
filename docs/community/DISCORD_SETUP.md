@@ -9,9 +9,9 @@ Replace these before you post anything.
 | Placeholder | Put in |
 |---|---|
 | `https://discord.gg/cK9HzVxzaY` | the server's permanent invite link |
-| `<NEXUS_PAGE>` | the mod's Nexus Mods page |
-| `<RELEASE_DATE>` | the date 0.2.1 goes public |
-| `<RELEASE_DATE_022>` | the date 0.2.2 goes public |
+| `https://www.nexusmods.com/manorlords/mods/454` | the mod's Nexus Mods page |
+| `2026-11-17` | the date 0.2.1 goes public |
+| `2026-11-17` | the date 0.2.2 goes public |
 
 The GitHub links are already filled in: the repository is https://github.com/fmgk-labs/manor-lords-coop.
 
@@ -178,7 +178,7 @@ This server is for **Manor Lords Co-op**, a fan-made mod that lets you play **on
 6. Want to play with others? #test-sessions
 
 **Links**
-Download (Nexus Mods): <NEXUS_PAGE>
+Download (Nexus Mods): https://www.nexusmods.com/manorlords/mods/454
 Source code (GitHub): https://github.com/fmgk-labs/manor-lords-coop
 
 This mod is not made by, and not connected to, Slavic Magic or Hooded Horse. Please do not report mod bugs to them.
@@ -194,7 +194,7 @@ This mod is not made by, and not connected to, Slavic Magic or Hooded Horse. Ple
 3. **No piracy.** Only the Steam version of Manor Lords is supported. No links to cracked games, and no help with them.
 4. **Do not report mod bugs to the game's developer or publisher.** Report them here. The developer asked players not to report bugs while they use mods.
 5. **Protect privacy.** Log files and crash records can hold your Windows user name and Steam names. Check them before you post. Never post other people's personal data.
-6. **Download only from the official pages:** <NEXUS_PAGE> or https://github.com/fmgk-labs/manor-lords-coop. Do not share other builds or re-uploads.
+6. **Download only from the official pages:** https://www.nexusmods.com/manorlords/mods/454 or https://github.com/fmgk-labs/manor-lords-coop. Do not share other builds or re-uploads.
 7. **One bug per post** in #bug-reports. Use the template.
 8. **No spam and no ads.** No self-promotion, no advertising in DMs.
 9. **No NSFW content.**
@@ -210,7 +210,7 @@ Breaking the rules can lead to a warning, a timeout or a ban.
 
 Play **one Manor Lords town together**. Every player runs the game; the host's save is the town. Up to 8 players: a host and 7 friends.
 
-**Download:** <NEXUS_PAGE>
+**Download:** https://www.nexusmods.com/manorlords/mods/454
 **Needs:** Manor Lords **0.8.117** on Steam, Windows. The mod loader is included. Everyone installs the **same** zip.
 
 **What is shared**
@@ -257,7 +257,7 @@ Before you report a bug: is it on this list?
 ```md
 # Download and install
 
-**Download:** <NEXUS_PAGE>
+**Download:** https://www.nexusmods.com/manorlords/mods/454
 
 1. Close the game.
 2. Steam: right-click **Manor Lords** > **Manage** > **Browse local files**.
@@ -341,7 +341,7 @@ Full guide: https://github.com/fmgk-labs/manor-lords-coop/blob/HEAD/docs/REPORTI
 For 0.2.2:
 
 ```md
-# 0.2.2 (<RELEASE_DATE_022>)
+# 0.2.2 (2026-11-17)
 
 - New: **Make Bug Report** in the Co-op menu (title screen, and Esc > Co-op in a game). It makes one zip with the logs and opens its folder. Drag the zip into your post in #bug-reports.
 - The logs of your last 5 game starts are kept, so a crashed session is still there after you start the game again.
@@ -354,7 +354,7 @@ Everyone must use 0.2.2. Older versions are refused at the join.
 For 0.2.1:
 
 ```md
-# 0.2.1 (<RELEASE_DATE>), first public version
+# 0.2.1 (2026-11-17), first public version
 
 Compared with the private test builds (0.1.0 to 0.1.6):
 - A friend's own drop to speed 1 when an enemy is spotted is no longer sent to the others as a player's speed change (new in 0.2.1).

@@ -9,7 +9,7 @@ Report them here:
 |---|---|
 | Discord, channel **#bug-reports** (crashes: **#crash-reports**) | `https://discord.gg/cK9HzVxzaY` |
 | GitHub issues | https://github.com/fmgk-labs/manor-lords-coop/issues |
-| Nexus Mods, Bugs tab | `<NEXUS_PAGE>` |
+| Nexus Mods, Bugs tab | https://www.nexusmods.com/manorlords/mods/454 |
 
 Before you post, look at [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Your bug may be there already.
 

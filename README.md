@@ -9,7 +9,7 @@ Each player runs the game on their own PC. The host's save is the town.
 | **Status** | **Beta**: for testing with friends |
 | **Game version** | Manor Lords **0.8.117** on Steam, exactly |
 | **Players** | up to 8: a host and 7 friends (tested: 5 copies on one PC, 2 players for real) |
-| **Download** | Nexus Mods: `<NEXUS_PAGE>` |
+| **Download** | Nexus Mods: https://www.nexusmods.com/manorlords/mods/454 |
 | **Help and bug reports** | Discord: `https://discord.gg/cK9HzVxzaY` · GitHub issues: https://github.com/fmgk-labs/manor-lords-coop/issues |
 
 > **Please do not report bugs to the game's developer while you use this mod.**
@@ -283,7 +283,7 @@ Steam names. For the curious, `Win64` below is `<game folder>\ManorLords\Binarie
 3. Post it:
    - Discord: `https://discord.gg/cK9HzVxzaY` (channel **#bug-reports**)
    - GitHub issues: https://github.com/fmgk-labs/manor-lords-coop/issues
-   - Nexus Mods: `<NEXUS_PAGE>` (Bugs tab)
+   - Nexus Mods: https://www.nexusmods.com/manorlords/mods/454 (Bugs tab)
 
 Please **do not** report bugs to Slavic Magic or Hooded Horse while you use mods.
 
