@@ -63,7 +63,7 @@ if not load("coop.lua") then return end
 -- optional modules: present in a full install, absent in a core-only test
 -- coop_x_*.lua: actions added per area in their own files (they use the town module's api and load after it)
 for _, m in ipairs({ "coop_town.lua", "coop_world.lua", "coop_join.lua", "coop_realm.lua", "coop_patch.lua", "coop_snap.lua", "coop_sites.lua", "coop_ui.lua", "coop_steam.lua", "coop_session.lua", "coop_focus.lua",
-                     "coop_x_town.lua", "coop_x_build.lua", "coop_x_lord.lua", "coop_x_army.lua", "coop_x_men.lua", "coop_x_merch.lua", "coop_x_events.lua", "coop_x_people.lua", "coop_x_jobs.lua", "coop_facts.lua", "coop_x_scene.lua", "coop_dev.lua" }) do
+                     "coop_x_town.lua", "coop_x_build.lua", "coop_x_lord.lua", "coop_x_army.lua", "coop_x_men.lua", "coop_x_merch.lua", "coop_x_maint.lua", "coop_x_events.lua", "coop_x_people.lua", "coop_x_jobs.lua", "coop_facts.lua", "coop_x_scene.lua", "coop_dev.lua" }) do
   local t = io.open(scripts .. "/" .. m, "r")
   if t then t:close(); load(m) end
 end

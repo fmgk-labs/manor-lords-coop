@@ -462,6 +462,92 @@ end
 -- notice functions stayed at 0 through two claims, session 17), so the host watches the list itself. Friends add an
 -- entry with the game's own addLogIfNew, which skips what that copy already shows.
 --   status: see README session 17
+-- (lane 66) notices a friend's game adds by itself outside PawnCPP:addLog / addLogIfNew (they append to the list inline:
+-- addResourceAddedLogs "reward", ChangeTreasury "treasury", settleRegion "outpost" / "settling", updateSquadVisibility
+-- "Enemy" (enemy_squad_spotted, which coop.lua's speed watcher reads) and "Army" (army_sighted), constructionComplete
+-- "construction_finished"; measured lane 66 run 1: without "Army" a friend showed army_sighted twice).
+-- NOLOG does not hold them: with NOLOG on, this copy's own entries of these kinds are taken out (ownLocalPrune) and the
+-- host's lines are added like every other notice.
+local LOCAL_TAGS = { reward = true, treasury = true, outpost = true, settling = true, enemy = true, army = true }   -- compared in lower case (the game writes "Enemy", "Army")
+-- one entry by its text, place and time (the place and the time differ between this copy's own entry and the host's)
+local function logKey(e)
+  local x, y = 0, 0; pcall(function() x, y = e.Location.X, e.Location.Y end)
+  return e.LogText:ToString() .. "|" .. string.format("%.0f,%.0f|%.2f", x, y, e.Timestamp)
+end
+local function isLocalKind(e)
+  local ok, r = pcall(function() return LOCAL_TAGS[e.Tag:ToString():lower()] or e.LogText:ToString():find("^construction_finished") ~= nil end)
+  return ok and r and true or false
+end
+-- (lane 66, release re-check) a notice's actor: the game shows its name in brackets after the text ("Construction
+-- finished. (Burgage Plot (Level 1))") and jumps to it on a click. Carried by a building's copy-independent key (type and
+-- place, the town module's way); an actor that is not a building of the world's list is not carried ("-"). Before
+-- lane 66 R LOG carried no actor at all (0.2.3: the friend's own line, with its actor, stood beside the host's).
+local function actorKey(e)
+  local ok, k = pcall(function()
+    local a = e.Actor
+    if not (a and a:IsValid()) then return "-" end
+    local t = A.btype(a); if type(t) ~= "number" then return "-" end
+    local l = a:K2_GetActorLocation()
+    return string.format("%d@%d,%d", t, math.floor(l.X / 10 + 0.5), math.floor(l.Y / 10 + 0.5))
+  end)
+  return (ok and k) or "-"
+end
+local function buildingByKey(S, key)
+  if not key or key == "-" then return nil end
+  local hit = R.bCache and R.bCache[key]
+  if hit and valid(hit) then return hit end
+  R.bCache = R.bCache or {}
+  local arr = S.eng.buildingArr; local n = #arr
+  for i = 1, n do
+    local b = un(arr[i])
+    if valid(b) then
+      local ok, k = pcall(function() local l = b:K2_GetActorLocation(); return string.format("%d@%d,%d", A.btype(b), math.floor(l.X / 10 + 0.5), math.floor(l.Y / 10 + 0.5)) end)
+      if ok and k == key then R.bCache[key] = b; return b end
+    end
+  end
+end
+-- add one of the host's notices here through the mod's mark (NOLOG on) with its actor; remembered as the host's
+local function addHostLine(S, P, h)
+  local actor = buildingByKey(S, h.actor)
+  P.markLog(); S.p1:addLog(FName(h.tag), h.text, h.descr, h.opens, h.pos, actor)
+  local la = S.p1.log; local n = #la
+  if n > 0 then R.relayed[logKey(la[n])] = true end
+end
+-- (lane 66, release re-check) the kinds this copy's game adds by itself outside the two notice routines (LOCAL_TAGS):
+-- the host's line is the only one, as for every other notice. This copy's own line of such a kind is taken out at the
+-- next look (ten times a second) with the game's own PawnCPP:removeLogEntry and then the game's own updateLogUI, so the
+-- list on screen follows in the same frame (removal alone left a line on screen for seconds: 0.2.4 re-check, 06:27:10
+-- to 06:27:16). Measured lane 66 run 4 with the other way (keep this copy's own line when it comes within 0.9 s, else
+-- the host's): the own line often came later than that, and both stood for 1.5 s; each copy sees armies, squads and
+-- finished sites at its own moment, so waiting for it can never be exact.
+-- This copy's own "enemy_squad_spotted" also drops its game speed (updateSquadVisibility calls SetGameSpeed): the speed
+-- watcher in coop.lua is told (S.spotT) before the line is taken out, so the drop is never sent as the player's.
+local function ownLocalPrune(S, clock)
+  local P = rawget(C, "patch")
+  if not (P and P.nlOn == true and R.on.notices) then return end
+  local la = S.p1.log; local n = #la
+  if not R.pruneBase then                              -- the first look in this world: what the loaded list holds (the
+    R.pruneBase = true                                 -- host's save) stays; only what comes after is judged
+    for i = 1, n do local ok, k = pcall(logKey, la[i]); if ok then R.relayed[k] = true end end
+    return
+  end
+  local out = 0
+  for i = n, math.max(1, n - 29), -1 do
+    local e = la[i]
+    if isLocalKind(e) then
+      local ok, k = pcall(logKey, e)
+      if ok and not R.relayed[k] then
+        local text = e.LogText:ToString()
+        if text:find("enemy_squad_spotted", 1, true) then S.spotT = os.clock(); S.spGameWhy = "enemy squad spotted" end
+        local okR, eR = pcall(function() S.p1:removeLogEntry(e) end)
+        out = out + 1; R.stats.ownOut = (R.stats.ownOut or 0) + 1
+        log("realm: notice %s of this copy's own game taken out (%s); the host's line is the one shown", text, okR and "ok" or ("FAILED " .. tostring(eR)))
+        break                                           -- the list changed: one at a time, the next one at the next look
+      end
+    end
+  end
+  if out > 0 then pcall(function() S.p1:updateLogUI() end) end
+end
 local function logSig(e) return e.Tag:ToString() .. "|" .. e.LogText:ToString() .. "|" .. string.format("%.1f", e.Timestamp) end
 local function logPoll(S)
   local arr = S.p1.log; local n = #arr
@@ -470,6 +556,11 @@ local function logPoll(S)
   if n == R.logN and last == R.logLast then return end
   local from = n + 1
   if R.logLast == "" then from = 1
+  elseif n > R.logN and n < 100 then
+    -- (lane 66) the list grew and is under the game's cap (100 entries; addLog drops the oldest only at the cap): the
+    -- new entries are the last ones. A second notice equal to the last one (same tag, text and time) was lost by the
+    -- search below; R LOG is now a friend's only source of notices
+    from = R.logN + 1
   else
     for i = n, 1, -1 do if logSig(arr[i]) == R.logLast then from = i + 1; break end end
     if from == n + 1 and last ~= R.logLast and n > R.logN then from = R.logN + 1 end   -- the last seen one was dismissed
@@ -477,7 +568,8 @@ local function logPoll(S)
   for i = math.max(from, n - 9), n do
     local e = arr[i]
     local x, y, z = 0, 0, 0; pcall(function() x, y, z = e.Location.X, e.Location.Y, e.Location.Z end)
-    A.send(string.format("R LOG %s %s %s %d %.0f %.0f %.0f", enc(e.Tag:ToString()), enc(e.LogText:ToString()), enc(e.fullDescr:ToString()) .. "-", e.opensMenu, x, y, z))
+    -- (lane 66) the 12th word: the notice's actor, a building by its key ("-": none)
+    A.send(string.format("R LOG %s %s %s %d %.0f %.0f %.0f %s", enc(e.Tag:ToString()), enc(e.LogText:ToString()), enc(e.fullDescr:ToString()) .. "-", e.opensMenu, x, y, z, actorKey(e)))
     R.stats.notices = (R.stats.notices or 0) + 1
   end
   R.logN = n; R.logLast = last
@@ -492,7 +584,7 @@ end
 
 local function fresh(S)
   if R.S == S and R.world == S.worlds then return end
-  R.S = S; R.world = S.worlds; R.logN = nil; R.logLast = nil
+  R.S = S; R.world = S.worlds; R.logN = nil; R.logLast = nil; R.relayed = {}; R.pruneBase = nil; R.bCache = {}
   R.known = {}; R.want = {}; R.famHost = {}; R.gHost = {}; R.claimSent = {}; R.regions = nil; R.tPoll = 0; R.tKey = -1e9
 end
 
@@ -534,7 +626,8 @@ local function poll(S, clock)
   end
   local okG, eG = pcall(pollGlobal, S, clock, key30)
   if not okG then R.lastErr = tostring(eG) end
-  if S.role == "host" and R.on.notices then local okL, eL = pcall(logPoll, S); if not okL then R.lastErr = tostring(eL) end end
+  -- (lane 66) the host's notices are looked at ten times a second in M.tick (they were every 0.5 s here: a friend showed a
+  -- notice up to a second after the host)
 end
 
 local M = {}
@@ -543,6 +636,8 @@ function M.tick(S, clock)
   fresh(S)
   if C.hold then return end                                -- a join or repair is running
   if clock - R.tPoll >= POLL then R.tPoll = clock; poll(S, clock) end
+  if S.role == "host" and R.on.notices and clock - (R.tLog or 0) >= 0.1 then R.tLog = clock; local okL, eL = pcall(logPoll, S); if not okL then R.lastErr = tostring(eL) end end
+  if S.role == "friend" and clock - (R.tPrune or 0) >= 0.1 then R.tPrune = clock; local okP, eP = pcall(ownLocalPrune, S, clock); if not okP then R.lastErr = tostring(eP) end end   -- (lane 66)
 end
 function M.onMessage(S, from, kind, w, line)
   if kind ~= "R" then return false end
@@ -551,8 +646,20 @@ function M.onMessage(S, from, kind, w, line)
   if verb == "LOG" then
     if S.role == "friend" and R.on.notices and w[5] and w[6] and w[7] then
       local tag, text, descr = dec(w[5]), dec(w[6]), dec((w[7]:gsub("%-$", "")))
+      local pos = { X = (tonumber(w[9]) or 0) + 0.0, Y = (tonumber(w[10]) or 0) + 0.0, Z = (tonumber(w[11]) or 0) + 0.0 }
+      local P = rawget(C, "patch")
+      local nl = P and P.nlOn == true
+      local opens, akey = tonumber(w[8]) or 0, w[12] or "-"
       local ok, e = pcall(function()
-        S.p1:addLogIfNew(FName(tag), text, descr, tonumber(w[8]) or 0, { X = (tonumber(w[9]) or 0) + 0.0, Y = (tonumber(w[10]) or 0) + 0.0, Z = (tonumber(w[11]) or 0) + 0.0 }, nil)
+        if nl then
+          -- (lane 66) NOLOG on: this copy has no notice of its own (the kinds its game adds by itself are taken out by
+          -- ownLocalPrune), the host's line is the only one. addLog, not addLogIfNew, so that two equal notices of the
+          -- host in the same moment are two here too; the mark lets exactly this call into the game's routine; the
+          -- actor (the name in brackets, the click target) by its key
+          addHostLine(S, P, { tag = tag, text = text, descr = descr, opens = opens, pos = pos, actor = akey })
+        else
+          S.p1:addLogIfNew(FName(tag), text, descr, opens, pos, buildingByKey(S, akey))
+        end
       end)
       R.stats.notices = (R.stats.notices or 0) + 1
       if not ok then log("realm: notice %s / %s not added: %s", tag, text, tostring(e)) end

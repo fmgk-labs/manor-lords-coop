@@ -248,6 +248,27 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 - **Basis:** owner's live play (seen in a friend's log); the reason by code reading. It never causes a resync: the daily comparison looks at the player's own town only.
 - **Workaround:** none needed.
 
+### G8. A notice shows twice on a friend for a few seconds (0.2.4)
+
+- **You see:** on a friend, "Another Ruler's Army was sighted." or "Enemy Unit has been spotted!" shows as two lines for 2 to 6 seconds, then one. The host shows one.
+- **Numbers:** 0.2.4: on test copies with real clicks, 3 cases in 8 minutes at speed 4. In 0.2.3 the second line stayed. Every other kind of notice shows once, with the host's words and building.
+- **Basis:** lane 63's real-click run on the 0.2.4 zip; lane 66's runs. The friend's own line leaves the notice list at once but stays drawn for a few seconds.
+- **Workaround:** none needed.
+
+### G9. A game event window on a friend only
+
+- **You see:** a friend may get the game's "Cold!" or "Hunger!" window while the host does not. It stays until **Close** is clicked.
+- **Numbers:** seen in 3 test runs on one friend copy. Each copy decides these windows from its own fuel and food numbers, once per 180 days.
+- **Basis:** lane 66's reading of the game file; lane 63's real-click runs.
+- **Workaround:** click **Close**. The host's numbers are the true ones.
+
+### G10. The building panel's "Yield" line differs
+
+- **You see:** a building's "Yield" can read "None" on a friend and "Modest" on the host, or "Excellent" against "Average".
+- **Numbers:** seen on a Logging Camp, a quarry and a sawpit on test copies. Productivity, maintenance and stock are equal; only the yield word differs.
+- **Basis:** lane 67's runs: the line reads each copy's own 30-day production log, which is not carried yet (being built).
+- **Workaround:** read the host's panel.
+
 ---
 
 ## H. Other limits

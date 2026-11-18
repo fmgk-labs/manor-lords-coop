@@ -15,6 +15,7 @@ one is two hooked function entries, not a byte patch.
 | REFORM | `REFORM <comp> <h>` | calls reformSquad(SquadComponent, squad) | native4 section 2 |
 | FINISH | `FINISH <building>` | calls finishConstruction(SMBuildingMaster) at RVA 4d0b370: the game's own "site complete" routine | lane_w report_W answer 1 |
 | NF1 + NF2 | `NOFINISH ON/OFF` | the game's two own calls of finishConstruction are jumped over (`74` becomes `EB`; both or neither) | session 20 |
+| NT | `NOTHEFT ON/OFF` | the bandits' daily theft routine (4d64460) calls the squad walk that robs the nearest region for every encamped bandit squad; that call (4d646d8) becomes `EB 03` (jumped over), so a friend's copy never rolls a theft; the host's theft is told by the events module | lane 66 |
 | BURN, FIREOUT | `BURN <building>`, `FIREOUT <building>` | call progressFire(building, 1e6) and extinguishFire(building) | lane_f Q3 |
 | GOODS | `GOODS ON [lord]/OFF` | the first instruction (5 bytes) of recountStorage (4d18fc0) and of the region's refreshBuildingStorageCache (4c49700) becomes a jump to a stub of this DLL: the game's own changes of a building's stock are put back; the mod's own write stays | lane 14 report |
 | CURSOR | `CURSOR <pawn> <x> <y> <z>`, `CURSOR <pawn> GET` | writes (or logs) the lord pawn's cached cursor point, three doubles at +4E8; the game rewrites it only while the OS pointer is over its window (updateCursor 4b75b90). Needs the CURSOR signature once and the known build | lane 26 report part 3 |
@@ -55,7 +56,7 @@ Relative folders are taken from the DLL's folder, and `%VARS%` are expanded.
 | `patch_status.txt` | the DLL | rewritten atomically (temp file, then `MoveFileEx` replace) on every change and on `STATUS` |
 | `coop_patch.log` | the DLL | one line per event with a local timestamp; above 256 KB it becomes `coop_patch.log.old` |
 
-**Commands:** `NOKILL ON|OFF`, `NOROUT ON|OFF`, `NOREFORM ON|OFF`, `NOFINISH ON|OFF`, `ROUT <address> <handle>`,
+**Commands:** `NOKILL ON|OFF`, `NOROUT ON|OFF`, `NOREFORM ON|OFF`, `NOFINISH ON|OFF`, `NOTHEFT ON|OFF`, `ROUT <address> <handle>`,
 `REFORM <address> <handle>`, `FINISH <address>`, `BURN <address>`, `FIREOUT <address>`,
 `GOODS ON [address of the player's lord]`, `GOODS OFF`, `GOODS AUDIT`, `GOODS STATS`, `PILEGONE <address>`,
 `TOTALS ON|OFF|FORGET|AUDIT|DUMP`, `TOTALS SET|SETR <region> <good>=<amount>,... [ALL]` (or `-` for none), `ALLOFF`,
@@ -1074,3 +1075,27 @@ Status: `REPORT idle | running report_<stamp> | done report_<stamp>.zip <files> 
 folder report_<stamp> <files> <why> [opened] | refused report_<stamp> <why> | refused - <why>`. Offline RP1-RP3.
 
 **0.9.2 (lane 62): the Steam piece's two files.** Two more job verbs, with the fields of `file`: `steamlog <source><TAB><name><TAB><cap>` for `coop_steam.log` and `steamstatus ...` for `steam_status.txt`. Their Steam names are taken out by the SHAPE of the line before the common scrub (`coop_scrub.h`, `scrub_steam`), because the mod may not know those names any more (after a lobby was lost the status lists nobody; the log holds names of earlier sessions) and the name list takes only names of 3 bytes or more: in the log `<name> (<id>) connected as friendN` gets `friend N` for the name and the "is in the lobby but the co-op mod ..." note gets `<name>`; in the status a player line `<slot> <id> <state> <ping> <name>` gets `host` or `friend <slot>`; the log's `first callback ...: first bytes <hex>` lines (raw callback bytes: whole Steam ids in hex, which the rule for decimal ids does not see) lose their bytes. A job takes 40 files now (24 before). Offline RP4 (a name not in the job, a 2-letter name, a name with spaces, parentheses and digits, a last line without a line end, a first-callback line; mock names and ids): 718 passed, 0 failed (702 before).
+## MAINT: a building's maintenance on the host's word (lane 67)
+
+Evidence: `research\2026-11-10-game-probe\lanes\lane_s21_67\report.txt`. A building's MaintenanceComponent
+(SMBuildingMaster +348h) has no reflected fields. Its trackers are a map at +A8h (the game's TSet: elements of 20h
+bytes, the key's goods list at +0, DurabilityLeft at +10h; allocation bits inline at +B8h or on the heap at +C8h, their
+count at +D0h); the cached status is the byte at +A0h, the slider the int32 at +F8h. The day routine wears each tracker
+by 1, 2 or 4 (4bb3410), a work hit or a delivery refills one from the building's own stock (4d16b40). On a friend that
+stock is the host's word, so its trackers only ran down.
+
+**Commands.** `MAINT READ <c>,...` writes `maint.txt` ("<c> <status> <slider> <goods+goods>=<left>,...", "?" for
+what does not look like a component, `END`). `MAINT SET <c> <status> <goods>=<left>,...|-` keeps the host's word for
+that component and writes it now and at every tick while the object's number (+0Ch) and name (+18h) are as at SET (a
+type the component lacks is counted as a miss). `MAINT DROP <c>,...`, `MAINT FORGET` (also ALLOFF). The slider is not
+held (a player action: coop_town.lua MAINT). Data only: nothing is called, no code is patched.
+
+**Signatures:** MSTAT (4b98590, the status +A0h and the map +A8h), MDECAY (4bb3410, the slider +F8h and the map),
+MDECSUB (4bb35eb, a tracker of 20h bytes, +10h). Known build only; anything else: `MAINT unavailable <why>`.
+
+**Status:** `MAINT available held= sets= writes= reads= misses= gone= bad= faults=`.
+
+**Offline tests (2026-11-17):** 80 of 80 signatures hold on the lane's game file; mechanism test 727 passed (MT1 to
+MT4: READ of a synthetic component, SET writes held types only, the next tick puts this copy's own wear back, another
+object at the address drops the entry, DROP, FORGET, seven bad forms, ALLOFF, another build, a pattern twice, a wear at
+another offset); image test 18 passed.

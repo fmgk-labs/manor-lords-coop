@@ -213,6 +213,7 @@ typedef struct {
     size_t finish, tsr, reform, stub, combat, combat2, morale, p3a, p3b;     /* offsets in .text */
     size_t nf1_patch, nf2_patch;                                             /* the two NOFINISH jumps */
     size_t jg_patch;                                                         /* lane 19: the JOBGATE je */
+    size_t nt_patch;                                                         /* lane 66: the NOTHEFT call */
     size_t p1_patch, p1_patch2, p2_patch, p3a_patch, p3b_patch;
     size_t helper, recount, refresh, addinv, konst;                          /* GOODS */
     size_t addlist, notify;                                                  /* TOTALS */
@@ -259,6 +260,7 @@ typedef struct {
     int pace;               /* lane 52 (last: some tests fill this record by position): 0 = no pace rule, 1 = one (both calls reach the lookup), 2 = its second call reaches another routine */
     int fell;               /* lane 54: 0 = neither FELL pattern, 1 = both, 2 = the lookup twice, 3 = a stroke that writes +1Ch, 4 = only the lookup */
     int endtask;            /* lane 49, round four: 0 = no ENDTASK, 1 = one (and two callers) */
+    int maint;              /* lane 67: 0 = none of MAINT's patterns, 1 = all three, 2 = MSTAT twice, 3 = a wear that writes +14h */
 } opts_t;
 
 static void emit_hex(img_t *m, const char *s)
@@ -350,6 +352,11 @@ static void emit_nofinish(img_t *m)
     emit_hex(m, "48 8B CF E8 00 00 00 00 48 8B 93 A8 10 00 00 48 63 8B B0 10 00 00 4C 8D 04 8A 49 3B D0");
     m->jg_patch = m->pos;
     emit_hex(m, "74 11 39 02 0F 84 00 00 00 00 CC CC");
+    /* lane 66: the NOTHEFT site (the theft routine's call of the squad walk), the call at %8 == 0 as in the game (4d646d8) */
+    align_to(m, 8, 3);
+    emit_hex(m, "48 8B 8F A0 00 00 00 48 8D 44 24 70 45 33 C0 48 89 44 24 40 48 8D 54 24 40 48 89 7C 24 48 48 8B 89 D0 02 00 00");
+    m->nt_patch = m->pos;
+    emit_hex(m, "E8 03 AE FF FF 4C 8D 5C 24 50 CC CC");
 }
 
 /* combat(unit rcx, args rdx): rsi = unit (health at +0x2E8), rbp = args (avoidKilling byte at +0x448), xmm15 = 0 */
@@ -1078,6 +1085,22 @@ static void emit_guide(img_t *m, int variant)
 /* lane 54: FELL. The lookup of a tree being felled from its entry to the read of a record's first double (the game's
  * 4c63c60), and a felling stroke (4dc5a97); both dead code here (the DLL never calls them). Variant 2: the lookup
  * twice; variant 3: a stroke that writes the record's +1Ch (a build whose record changed: no site); 4: no stroke. */
+/* lane 67: MAINT. GetMaintenanceStatus with the start of the function after it, the day's wear's entry and its
+ * subtraction; dead code here (the DLL never calls them). Variant 2: MSTAT twice; 3: a subtraction at +14h. */
+static void emit_maint(img_t *m, int variant)
+{
+    int k;
+    for (k = 0; k < (variant == 2 ? 2 : 1); k++) {
+        align_to(m, 16, 0);
+        emit_hex(m, "0F B6 81 A0 00 00 00 C3 CC CC CC CC CC CC CC CC 48 89 5C 24 08 57 48 83 EC 20 48 8B 05 00 00 00 00 48 8D B9 A8 00 00 00 48 8B DA");
+        emit_hex(m, "C3");
+    }
+    align_to(m, 16, 0);
+    emit_hex(m, "48 8B C4 48 89 58 10 48 89 70 18 55 57 41 56 48 8D 68 A1 48 81 EC 90 00 00 00 0F B6 91 F8 00 00 00 4C 89 78 08 85 D2 74 18 83 EA 01 74 05 83 FA 01 74 07 BB 02 00 00 00 EB 0C BB 04 00 00 00 EB 05 BB 01 00 00 00 4C 8D B1 A8 00 00 00");
+    emit_hex(m, variant == 3 ? "48 C1 E0 05 48 03 01 48 8D 4D FF 29 58 14 8B 45 03 F7 D0 21" : "48 C1 E0 05 48 03 01 48 8D 4D FF 29 58 10 8B 45 03 F7 D0 21");
+    emit_hex(m, "C3");
+}
+
 static void emit_fell(img_t *m, int variant)
 {
     int k;
@@ -1173,6 +1196,7 @@ static img_t *build_image(const opts_t *o)
         if (o->endtask) emit_endtask(m);                        /* lane 49, round four */
         if (o->guide) { emit_guide(m, o->guide); if (o->guide == 2) { size_t keep = m->guide; emit_guide(m, 1); m->guide = keep; } }   /* lane 49 */
         if (o->fell) emit_fell(m, o->fell);         /* lane 54 */
+        if (o->maint) emit_maint(m, o->maint);      /* lane 67 */
         if (m->pos > TEXT_SIZE - 0x100) { printf("synthetic .text too small (%Iu bytes used)\n", m->pos); exit(3); }
     }
     memcpy(m->snapshot, m->text, TEXT_SIZE);
@@ -1216,6 +1240,8 @@ static int status_line(const char *prefix, int exact)
 static int status_has(const char *sub) { const char *s = read_file(g_status); return strstr(s, sub) != NULL; }
 /* (lane 52) the number after <key> in the status file as it is (-1: not there) */
 static long status_val(const char *key) { const char *t = read_file(g_status), *p = strstr(t, key); return p ? strtol(p + strlen(key), NULL, 10) : -1; }
+/* (lane 67) the number after <key> on the MAINT line (-1: not there) */
+static long mt_val(const char *key) { const char *t = read_file(g_status), *m = strstr(t, "MAINT available"), *p = m ? strstr(m, key) : NULL; return p ? strtol(p + strlen(key), NULL, 10) : -1; }
 
 static void append_raw(const char *text)
 {
@@ -1895,6 +1921,15 @@ int main(void)
         check(bytes_are(m->text + m->jg_patch, "74 11") && status_line("JG off", 1), "JOBGATE OFF restored 74 11");
         cmd("JOBGATE ON"); cmd("ALLOFF");
         check(bytes_are(m->text + m->jg_patch, "74 11") && status_line("JG off", 1), "ALLOFF restores JG");
+
+        /* lane 66: NOTHEFT ON|OFF (the theft routine's call of the squad walk -> jmp over it) */
+        check(status_line("NT off", 1), "NT found exactly once, off");
+        cmd("NOTHEFT ON");
+        check(bytes_are(m->text + m->nt_patch, "EB 03 AE FF FF") && status_line("NT on", 1), "NOTHEFT ON wrote EB 03, status NT on");
+        cmd("NOTHEFT OFF");
+        check(bytes_are(m->text + m->nt_patch, "E8 03 AE FF FF") && status_line("NT off", 1), "NOTHEFT OFF restored E8 03");
+        cmd("NOTHEFT ON"); cmd("ALLOFF");
+        check(bytes_are(m->text + m->nt_patch, "E8 03") && status_line("NT off", 1), "ALLOFF restores NT");
 
         cmd("NOKILL ON"); cmd("NOROUT ON");
         cmd("TESTFAULT");
@@ -4211,6 +4246,112 @@ int main(void)
         m = build_image(&o);
         start("E3: ENDHOLD without setTask's signature", m, NULL, NULL, NULL);
         check(status_line("ENDHOLD unavailable SETTASK signature has 0 hits", 0), "ENDHOLD unavailable without setTask");
+    }
+
+    /* ======================================================== MT: MAINT, a building's maintenance on the host's word (lane 67) */
+    {
+        static __declspec(align(16)) uint8_t mcomp[0x1000], novt[0x1000];
+        static __declspec(align(16)) uint8_t el[4 * 0x20];
+        static int32_t g0[1] = { 21 }, g1[2] = { 30, 12 }, g3[1] = { 7 };
+        opts_t o = { 1 };
+        img_t *m;
+        uint64_t vt;
+        wchar_t rp[MAX_PATH];
+        const char *rf;
+        char want[128];
+        int32_t num = 4, nb = 4;
+        o.known = 1; o.maint = 1;
+        m = build_image(&o);
+        vt = (uint64_t)(uintptr_t)(m->text + 0x40);
+#define MT_ARM() do { memset(mcomp, 0, sizeof(mcomp)); memset(el, 0, sizeof(el)); memcpy(mcomp, &vt, 8); *(uint32_t *)(mcomp + 0x0C) = 4711; *(uint64_t *)(mcomp + 0x18) = 0x123456789ull; \
+            mcomp[0xA0] = 1; *(uint8_t **)(mcomp + 0xA8) = el; memcpy(mcomp + 0xB0, &num, 4); *(uint32_t *)(mcomp + 0xB8) = 0xB; memcpy(mcomp + 0xD0, &nb, 4); *(int32_t *)(mcomp + 0xF8) = 1; \
+            *(int32_t **)(el + 0x00) = g0; *(int32_t *)(el + 0x08) = 1; *(int32_t *)(el + 0x10) = 10; \
+            *(int32_t **)(el + 0x20) = g1; *(int32_t *)(el + 0x28) = 2; *(int32_t *)(el + 0x30) = 4; \
+            *(int32_t **)(el + 0x40) = g0; *(int32_t *)(el + 0x48) = 1; *(int32_t *)(el + 0x50) = 77; \
+            *(int32_t **)(el + 0x60) = g3; *(int32_t *)(el + 0x68) = 1; *(int32_t *)(el + 0x70) = 6; } while (0)
+        MT_ARM();
+        memset(novt, 0, sizeof(novt));
+        start("MT1: MAINT (known build)", m, NULL, NULL, NULL);
+        check(status_line("MAINT available held=0 sets=0 writes=0 reads=0 misses=0 gone=0 bad=0 faults=0", 1), "MAINT found: the status at +A0h, the trackers at +A8h, the slider at +F8h, a tracker of 20h bytes with what is left at +10h");
+        cmd("MAINT READ %llX,%llX,zz", (unsigned long long)(uintptr_t)mcomp, (unsigned long long)(uintptr_t)novt);
+        _snwprintf(rp, MAX_PATH, L"%smaint.txt", g_io); rf = read_file(rp);
+        _snprintf(want, sizeof(want), "%llX 1 1 21=10,12+30=4,7=6\r\n", (unsigned long long)(uintptr_t)mcomp);
+        if (!strstr(rf, want)) printf("maint.txt: [%s]\n", rf);
+        check(strstr(rf, want) != NULL, "READ: status, slider, each allocated tracker with its goods sorted (the free slot 2 left out)");
+        _snprintf(want, sizeof(want), "%llX ?\r\nzz ?\r\nEND\r\n", (unsigned long long)(uintptr_t)novt);
+        check(strstr(rf, want) != NULL, "READ: an object without a vtable in the module and a bad address are '?'; END last");
+        cmd("MAINT SET %llX 3 21=0,30+12=8,99=5", (unsigned long long)(uintptr_t)mcomp); cmd("STATUS");
+        check(*(int32_t *)(el + 0x10) == 0 && *(int32_t *)(el + 0x30) == 8 && *(int32_t *)(el + 0x50) == 77 && *(int32_t *)(el + 0x70) == 6 && mcomp[0xA0] == 3 && *(int32_t *)(mcomp + 0xF8) == 1,
+              "SET: the two held types written (the goods' order does not matter), the free slot and the unnamed type left alone, the status written, the slider not");
+        check(status_has("MAINT available held=1 sets=1 writes=3 ") && status_has("misses=1 "), "one entry held; a type this copy lacks is counted");
+        *(int32_t *)(el + 0x30) = 6; mcomp[0xA0] = 2; cmd("STATUS");
+        check(*(int32_t *)(el + 0x30) == 8 && mcomp[0xA0] == 3 && status_has("writes=5 "), "this copy's own wear and status put back at the next tick");
+        cmd("STATUS"); check(status_has("writes=5 "), "nothing written while the values are the host's");
+        cmd("MAINT SET %llX 1 21=12", (unsigned long long)(uintptr_t)mcomp); cmd("STATUS");
+        check(*(int32_t *)(el + 0x10) == 12 && mcomp[0xA0] == 1 && status_has("MAINT available held=1 sets=2 "), "a second SET of the same component replaces its entry");
+        *(uint32_t *)(mcomp + 0x0C) = 4712; *(int32_t *)(el + 0x10) = 3; cmd("STATUS");
+        check(*(int32_t *)(el + 0x10) == 3 && status_has("MAINT available held=0 ") && status_has("gone=1 "), "another object at the address (its number changed): the entry is dropped, nothing written");
+        MT_ARM();
+        cmd("MAINT SET %llX 1 21=9", (unsigned long long)(uintptr_t)mcomp); cmd("MAINT DROP %llX", (unsigned long long)(uintptr_t)mcomp); *(int32_t *)(el + 0x10) = 2; cmd("STATUS");
+        check(*(int32_t *)(el + 0x10) == 2 && status_has("MAINT available held=0 "), "DROP: not written any more");
+        cmd("MAINT SET %llX 1 21=9", (unsigned long long)(uintptr_t)mcomp); cmd("MAINT FORGET"); *(int32_t *)(el + 0x10) = 2; cmd("STATUS");
+        check(*(int32_t *)(el + 0x10) == 2 && status_has("MAINT available held=0 "), "FORGET: every entry out");
+        cmd("MAINT SET %llX 1 21=9", (unsigned long long)(uintptr_t)novt);
+        cmd("MAINT SET %llX 7 21=9", (unsigned long long)(uintptr_t)mcomp);
+        cmd("MAINT SET %llX 1 21=", (unsigned long long)(uintptr_t)mcomp);
+        cmd("MAINT SET %llX 1 21+x=3", (unsigned long long)(uintptr_t)mcomp);
+        cmd("MAINT SET %llX 1", (unsigned long long)(uintptr_t)mcomp);
+        num = 500; memcpy(mcomp + 0xB0, &num, 4); num = 4;
+        cmd("MAINT SET %llX 1 21=9", (unsigned long long)(uintptr_t)mcomp);
+        cmd("MAINT MAYBE"); cmd("STATUS");
+        if (!status_has("MAINT available held=0 ") || !status_has("bad=7 ")) printf("%s\n", read_file(g_status));
+        check(status_has("MAINT available held=0 ") && status_has("bad=7 ") && status_has("faults=0"), "7 bad forms refused (no vtable, status 7, an empty number, a bad good, too few words, a map of 500 elements, an unknown word)");
+        MT_ARM(); mcomp[0xA0] = 2; cmd("MAINT SET %llX 1 -", (unsigned long long)(uintptr_t)mcomp); cmd("STATUS");
+        check(mcomp[0xA0] == 2 && *(int32_t *)(el + 0x10) == 10 && status_has("MAINT available held=1 "), "'-' on a component that has trackers: held, but its status is not written (nothing proves it is that building)");
+        MT_ARM(); num = 0; memcpy(mcomp + 0xB0, &num, 4); num = 4; mcomp[0xA0] = 2; cmd("MAINT SET %llX 1 -", (unsigned long long)(uintptr_t)mcomp); cmd("STATUS");
+        check(mcomp[0xA0] == 1, "'-' on a component without trackers: the status is written");
+        cmd("MAINT FORGET");
+        MT_ARM(); { long ms0 = mt_val("misses="); cmd("MAINT SET %llX 3 99=5", (unsigned long long)(uintptr_t)mcomp); cmd("STATUS");
+        check(mcomp[0xA0] == 1 && mt_val("misses=") == ms0 + 1, "no held type found in the component: nothing written, not even the status"); }
+        cmd("MAINT FORGET");
+        MT_ARM(); cmd("MAINT SET %llX 1 21=9", (unsigned long long)(uintptr_t)mcomp); *(uint64_t *)(mcomp + 0x10) = 0x5555; *(int32_t *)(el + 0x10) = 2; { long g0v = mt_val("gone="); cmd("STATUS");
+        check(*(int32_t *)(el + 0x10) == 2 && mt_val("gone=") == g0v + 1, "another class at the address: the entry is dropped, nothing written"); }
+        MT_ARM(); cmd("MAINT SET %llX 1 21=9", (unsigned long long)(uintptr_t)mcomp); *(uint32_t *)(mcomp + 0x08) = 0x40000000u; *(int32_t *)(el + 0x10) = 2; { long g0v = mt_val("gone="); cmd("STATUS");
+        check(*(int32_t *)(el + 0x10) == 2 && mt_val("gone=") == g0v + 1, "an object flagged garbage (bit 30, as the day loop tests): dropped, nothing written"); }
+        { long b0 = mt_val("bad="); cmd("MAINT SET %llX 1 21=9", (unsigned long long)(uintptr_t)mcomp); cmd("STATUS");
+        check(*(int32_t *)(el + 0x10) == 2 && mt_val("bad=") == b0 + 1 && status_has("MAINT available held=0 "), "SET on a flagged object is refused"); }
+        MT_ARM(); cmd("MAINT SET %llX 1 21=9", (unsigned long long)(uintptr_t)mcomp); num = 500; memcpy(mcomp + 0xB0, &num, 4); num = 4; { long g0v = mt_val("gone="); cmd("STATUS");
+        check(mt_val("gone=") == g0v + 1 && status_has("MAINT available held=0 "), "a map that stops looking like one at a tick: dropped"); }
+        MT_ARM(); cmd("MAINT SET %llX 1 -", (unsigned long long)(uintptr_t)mcomp);
+        cmd("ALLOFF"); cmd("STATUS");
+        check(status_has("MAINT available held=0 "), "ALLOFF empties the held entries");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "MAINT never writes to .text");
+#undef MT_ARM
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.maint = 1;
+        m = build_image(&o);
+        start("MT2: MAINT on another game build", m, NULL, NULL, NULL);
+        check(status_line("MAINT unavailable another game build", 0), "MAINT unavailable: another build");
+        cmd("MAINT READ 1000"); cmd("STATUS"); check(status_has("MAINT unavailable"), "a command is refused");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.maint = 2;
+        m = build_image(&o);
+        start("MT3: MAINT's status pattern twice", m, NULL, NULL, NULL);
+        check(status_line("MAINT unavailable MSTAT signature has 2 hits", 0), "MAINT unavailable: two hits");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.maint = 3;
+        m = build_image(&o);
+        start("MT4: a wear that writes another offset", m, NULL, NULL, NULL);
+        check(status_line("MAINT unavailable MDECSUB signature has 0 hits", 0), "MAINT unavailable: no subtraction site");
     }
 
     test_report();                              /* lane 61 */

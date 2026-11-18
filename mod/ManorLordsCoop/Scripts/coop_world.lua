@@ -685,6 +685,7 @@ end
 --   bl buildings: owner, built, level, on fire, asleep     bw workers and work settings      bs stock
 --   hv house values (fuel day, water, market days)         an animals and carts              bd lists the game derives
 --   bx what the players set on a building                  fd fields                         ro regions: owner, kind
+--   mt maintenance of a building that has it: status, slider, need, each tracker (lane 67; trk per type as t<goods>)
 --   rp people of a region    ap approval and its inputs    rw wealth, supplies               li livestock per kind
 --   rs what the players set on a region                    fa families: home, workplace, stall, members
 --   fc families: hunger, cold, sickness ...                un units of the world per kind    sc raid and camp schedule
@@ -708,6 +709,11 @@ local WIDE = {
   -- crop field proper. An entry that is the game's default (crop rotation on, nothing else) is not stored.
   { "fd", { "bRotateCrops", "fieldOperationMode", "forceHarvest", "field_ploughingPerc", "field_sowingPerc", "field_growingPerc",
             "field_harvestingPerc", "field_numReadyToHarvest", "field_numUnplowed", "field_numSown", "yield", "plannedHarvest_PredictedYield" }, sparse = true },
+  -- (lane 67) maintenance, for every building that has a MaintenanceComponent: the game's GetMaintenanceStatus (0 none
+  -- needed, 1 maintained, 2 pending, 3 unmaintained), GetSliderValue (0 half, 1 normal, 2 double),
+  -- DoesBuildingNeedMaintaining, and each tracker as <goods joined by +>=<what is left> (read by the native piece
+  -- through coop_x_maint.lua, at most a second old; "-" without it). A building without the component has no entry.
+  { "mt", { "status", "slider", "need", "trk" } },
   -- every region
   { "ro", { "regionName", "owner", "isSettled", "settlementLevel", "tier" } },
   { "rp", { "workerFamilies", "residents", "population", "homeless", "corpses", "squadsPresent" } },
@@ -866,6 +872,15 @@ local function wideBuilding(P, b)
     .. "|" .. wv(b, "field_growingPerc") .. "|" .. wv(b, "field_harvestingPerc") .. "|" .. wv(b, "field_numReadyToHarvest") .. "|" .. wv(b, "field_numUnplowed")
     .. "|" .. wv(b, "field_numSown") .. "|" .. wv(b, "yield") .. "|" .. wv(b, "plannedHarvest_PredictedYield")
   if s ~= WIDE_BY.fd.zero then P.fd[k] = s end
+  local okm, mc = pcall(gField, b, "MaintenanceComponent")
+  if okm and mc and valid(mc) then
+    local st, sl, nd = "?", "?", "?"
+    pcall(function() st = wFmt(mc:GetMaintenanceStatus()) end)
+    pcall(function() sl = wFmt(mc:GetSliderValue()) end)
+    pcall(function() nd = wFmt(mc:DoesBuildingNeedMaintaining()) end)
+    local M = rawget(C, "maint"); local trk = (M and M.trkOf) and M.trkOf(k) or "-"
+    P.mt[k] = st .. "|" .. sl .. "|" .. nd .. "|" .. trk
+  end
 end
 
 local function wideNew(tag, day, done)
@@ -918,7 +933,7 @@ local function wideStep(S, st)
     if st.i > 0 and st.lastB and (st.i > #arr or addr(arr[st.i]) ~= st.lastB) then
       st.redo = (st.redo or 0) + 1; bump("w_wideRedo")
       if st.redo <= 2 then
-        for _, s in ipairs({ "bl", "bw", "bs", "hv", "an", "bd", "bx", "fd" }) do P[s] = {} end
+        for _, s in ipairs({ "bl", "bw", "bs", "hv", "an", "bd", "bx", "fd", "mt" }) do P[s] = {} end
         P.keyOf = {}; P.dup = 0; st.i = 0; st.lastB = nil
         return 0.5
       end
@@ -1045,12 +1060,15 @@ local function wideMark(sec, field, hv, mv)
     if field == "lastBanditCampSpawnedDay" and W.on.holdCamp then return "held" end
     if field == "damagingRain" and W.on.fire and mv == "0" then return "held" end
     if field == "scenario_nextActionDay" and W.on.holdDirector then return "held" end
-  elseif sec == "en" and field == "lastUniqueID" then return "per-copy" end
+  elseif sec == "en" and field == "lastUniqueID" then return "per-copy"
+  -- (lane 67) a tracker read within a day step of the other copy's (1, 2 or 4 a day by the slider): the two samples
+  -- are taken at each copy's own day change and the friend's held value can be up to a second behind the host's
+  elseif sec == "mt" and field:sub(1, 1) == "t" and field ~= "trk" and tonumber(hv) and tonumber(mv) and math.abs(tonumber(hv) - tonumber(mv)) <= 4 then return "dayStep" end
 end
 
 -- friend: whose is the thing a difference is about? A building's owner (section bl), a region's owner (section ro; a
 -- family is its region's). P = the player's own town: that is what a later resync rule would look at first.
-local WIDE_KIND = { bl = "b", bw = "b", bs = "b", hv = "b", an = "b", bd = "b", bx = "b", fd = "b", ro = "r", rp = "r", ap = "r", rw = "r", li = "r", rs = "r", fa = "f", fc = "f" }
+local WIDE_KIND = { bl = "b", bw = "b", bs = "b", hv = "b", an = "b", bd = "b", bx = "b", fd = "b", mt = "b", ro = "r", rp = "r", ap = "r", rw = "r", li = "r", rs = "r", fa = "f", fc = "f" }
 local function wideOwner(sec, key, Hs, Ms)
   local kind = WIDE_KIND[sec]; if not kind then return nil end
   if kind == "b" then
@@ -1088,7 +1106,14 @@ local function wideCompareSec(spec, Hs, Ms)
     for i, f in ipairs(fields) do
       local p, q = x[i] or "", y[i] or ""
       if p ~= q then
-        if f == "goods" then                               -- per good: g<type> host/here
+        if f == "trk" and p ~= "?" and q ~= "?" then      -- (lane 67) per maintenance type: t<goods> host/here
+          local tp, tq = {}, {}
+          for g, n in p:gmatch("([%d+]+)=(%-?%d+)") do tp[g] = n end
+          for g, n in q:gmatch("([%d+]+)=(%-?%d+)") do tq[g] = n end
+          for g, n in pairs(tp) do if tq[g] ~= n then item(key, "t" .. g, n, tq[g] or "absent") end end
+          for g, n in pairs(tq) do if tp[g] == nil then item(key, "t" .. g, "absent", n) end end
+          if next(tp) == nil and next(tq) == nil then item(key, f, p, q) end
+        elseif f == "goods" then                           -- per good: g<type> host/here
           local gp, gq = {}, {}
           for g, n in p:gmatch("(%d+):(%-?%d+)") do gp[g] = n end
           for g, n in q:gmatch("(%d+):(%-?%d+)") do gq[g] = n end

@@ -43,7 +43,7 @@ typedef struct {
 } sig_def;
 
 /* Indexes used by the DLL. Keep the order: entries first (the patches point at them). */
-enum { S_TSR = 0, S_REFORM, S_P1, S_P2, S_P3A, S_P3B, S_NF1, S_NF2, S_JG /* lane 19 */, S_FINISH, S_BURN, S_FIREOUT, S_RECOUNT, S_REFRESH, S_ADDINV,
+enum { S_TSR = 0, S_REFORM, S_P1, S_P2, S_P3A, S_P3B, S_NF1, S_NF2, S_JG /* lane 19 */, S_NT /* lane 66 */, S_FINISH, S_BURN, S_FIREOUT, S_RECOUNT, S_REFRESH, S_ADDINV,
        S_ADDLIST /* lane 22 */, S_NOTIFY, S_TS1, S_TS2, S_TS3, S_TS4, S_TS5, S_TS6,
        S_CURSOR /* lane 26 */, S_LMBDOWN, S_LMBUP, S_RMBDOWN, S_RMBUP /* lane 26 */,
        S_CHOOSE /* lane 23 */,
@@ -62,10 +62,12 @@ enum { S_TSR = 0, S_REFORM, S_P1, S_P2, S_P3A, S_P3B, S_NF1, S_NF2, S_JG /* lane
        S_GUIDE /* lane 49 */,
        S_WALLREB /* lane 53 (WALLSET) */, S_WALLINS /* lane 53 */, S_PACE /* lane 52 (MEN: the squad's pace rule) */,
        S_TREEFIND /* lane 54 (FELL) */, S_FELLHIT /* lane 54 */,
-       S_ENDTASK /* lane 49, round four */, S_DLL_COUNT };
+       S_ENDTASK /* lane 49, round four */,
+       S_LOGADD /* lane 66 (NOLOG) */, S_LOGNEW /* lane 66 */,
+       S_MSTAT /* lane 67 (MAINT) */, S_MDECAY, S_MDECSUB /* lane 67 */, S_DLL_COUNT };
 #define HOLD_GATES 10                   /* lane 31: S_HAPPR .. S_HPREM and S_HPRMALL are hooked at their entry; S_HWMON is a store site; lane 36: S_HEMIG */
 #define TOTALS_SITES 6
-#define S_PATCH_LAST S_JG      /* the patch sites are S_P1..S_PATCH_LAST */
+#define S_PATCH_LAST S_NT      /* the patch sites are S_P1..S_PATCH_LAST */
 
 static const sig_def SIGS[] = {
     /* report 5 / sigs5 "FUNCTION ENTRY": TriggerSquadRetreat(USquadComponent*, int handle), void */
@@ -110,6 +112,18 @@ static const sig_def SIGS[] = {
     { "JG", "given tasks start while the job list is full (executeTask)",
       "48 8B CF E8 ?? ?? ?? ?? 48 8B 93 A8 10 00 00 48 63 8B B0 10 00 00 4C 8D 04 8A 49 3B D0 74 11 39 02 0F 84",
       K_FIXED, 29, 2, {0x74, 0x11}, {0xEB, 0x11}, -1, 0x4df99e6, 1 },
+    /* ---- lane 66 (NOTHEFT): the bandits' theft (TemporalComponent routine at rva 4d64460, reached once a game day by
+     * the tail jump at 4d638a6 of the raids-and-camps job 4d63380). On its theft day (daysTotal > 90, an even month,
+     * dayOfTheMonth = ((30 / month + month - 1) mod 29) + 1; the debug flag "overdriveStealing" skips the date test) it
+     * calls the squad component's walk over every squad (4d5f4e0) with a step (4d625a0) that, for each encamped bandit
+     * squad, takes 3 to 15 of one random good from the nearest settled region (Region::consumeGood), puts it in the
+     * camp's Inventory and adds the lord's notice "theft". On a friend's copy that call is jumped over ("E8 rel32" ->
+     * "EB 03", as P2): the friend never rolls a theft of its own; the host's theft is told by the events module.
+     * The pattern holds the whole call (rel32 included), so its target is pinned. Source: lane 66 (static read; the
+     * whole rule is in the "bandit thefts" section of mod/ManorLordsCoop/Scripts/coop_x_events.lua). */
+    { "NT", "no own theft (the bandits' daily theft)",
+      "48 8B 8F A0 00 00 00 48 8D 44 24 70 45 33 C0 48 89 44 24 40 48 8D 54 24 40 48 89 7C 24 48 48 8B 89 D0 02 00 00 E8 03 AE FF FF 4C 8D 5C 24 50",
+      K_FIXED, 37, 2, {0xE8, 0x03}, {0xEB, 0x03}, -1, 0x4d646b3, 1 },
     /* lanes\lane_w\report_W.txt answer 1: finishConstruction(SMBuildingMaster*), called by the builder's hammer
      * handler 4dc5270 and the async construction callback 4cbdb1e */
     { "FINISH", "finishConstruction entry",
@@ -476,6 +490,37 @@ static const sig_def SIGS[] = {
     { "ENDTASK", "the end of a unit's tasks (entry; hooked by ENDHOLD)",
       "4C 8B DC 55 56 49 8D 6B A1 48 81 EC B8 00 00 00 4D 89 6B D8 48 8B F1 45 33 ED C6 81 25 0D 00 00 00 41 8B C5 4C 89 6D 67 48 89 81 90 08 00 00",
       K_ENTRY, -1, 0, {0}, {0}, -1, 0x4dfb960, 1 },
+    /* ---- lane 66 (NOLOG): the game's notices. A notice (the lord's log, PawnCPP.log at +5C0h: 100 entries of A0h,
+     * Text +0, Location +10h, fullDescr +28h, Timestamp +38h, opensMenu +3Ch, Actor +40h, Tag +90h, day +98h) is added
+     * by PawnCPP::addLog (4b29190) or addLogIfNew (4b292b0): 58 of the game's call sites (theft, deaths, drought,
+     * stocks soaked, crafting botched, ...). Both append, refresh the log (4ac8630) and play the tag's alert. Five more
+     * routines append inline (addResourceAddedLogs, ChangeTreasury, constructionComplete, settleRegion,
+     * updateSquadVisibility): not hooked, see coop_nolog.h. NOLOG hooks both entries; on a friend's copy a call the
+     * mod did not mark just before (coop_patch_mark, same thread, 50 ms) is the game's own and is dropped.
+     * The entry patterns start AFTER the hooked bytes (5 and 8), so a hooked entry is still found. */
+    { "LOGADD", "PawnCPP::addLog, from its 6th byte (hooked by NOLOG)",
+      "48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 20 83 B9 C8 05 00 00 63 48 8D B9 C0 05 00 00",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4b29195, 1 },
+    { "LOGNEW", "PawnCPP::addLogIfNew, from its 9th byte (hooked by NOLOG)",
+      "48 81 EC 00 01 00 00 49 89 5B 08 49 8B C0 48 8B 5D 7F 0F 57 C9 49 89 73 10 0F 57 C0 49 89 7B 18",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4b292b8, 1 },
+    /* ---- lane 67 (MAINT): GetMaintenanceStatus (4b98590: "movzx eax,byte [rcx+A0h]; ret") and the first bytes of
+     * GetMaintenanceStatusForTypes after it (4b985a0: "lea rdi,[rcx+A8h]", the trackers' map). Never called or patched:
+     * the status's displacement (+3) and the map's (+36) are checked. */
+    { "MSTAT", "a building's maintenance status at +A0h and its trackers at +A8h (used by MAINT)",
+      "0F B6 81 A0 00 00 00 C3 CC CC CC CC CC CC CC CC 48 89 5C 24 08 57 48 83 EC 20 48 8B 05 ?? ?? ?? ?? 48 8D B9 A8 00 00 00 48 8B DA",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4b98590, 1 },
+    /* ---- lane 67 (MAINT): the day's wear of a building's trackers (4bb3410, called by TemporalComponent::updateDay for
+     * a built building with workers): 1, 2 or 4 by the slider at +F8h ("movzx edx,byte [rcx+F8h]", +29), the map at
+     * +A8h ("lea r14,[rcx+A8h]", +73). Never called or patched. */
+    { "MDECAY", "the day's wear of a building's maintenance (used by MAINT)",
+      "48 8B C4 48 89 58 10 48 89 70 18 55 57 41 56 48 8D 68 A1 48 81 EC 90 00 00 00 0F B6 91 F8 00 00 00 4C 89 78 08 85 D2 74 18 83 EA 01 74 05 83 FA 01 74 07 BB 02 00 00 00 EB 0C BB 04 00 00 00 EB 05 BB 01 00 00 00 4C 8D B1 A8 00 00 00",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4bb3410, 1 },
+    /* ---- lane 67 (MAINT): inside the wear (4bb35eb): "shl rax,5; add rax,[rcx]; lea rcx,[rbp-1]; sub [rax+10h],ebx": a
+     * tracker element is 20h bytes (+3) and what is left of it is the int32 at +10h (+13). Not a function entry. */
+    { "MDECSUB", "the wear's subtraction: a tracker of 20h bytes, what is left at +10h (used by MAINT)",
+      "48 C1 E0 05 48 03 01 48 8D 4D FF 29 58 10 8B 45 03 F7 D0 21",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4bb35eb, 1 },
 
     /* ---- below: only checked by the offline tool (sigs5.txt lists them; the DLL does not use them) ---- */
     { "ALT-A", "arrows pass avoidKilling=1 (updateProj)",

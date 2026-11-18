@@ -19,6 +19,9 @@
 --   owners     The host owns who holds each region (a rival lord winning a claim, rebels).
 --              host -> friends   E O <tag>=<P|B|A<n>|->,...   when it changes and every 30 s
 --   people     The host owns who the villagers are (names). host -> friends  E P ...  (see "people" below)
+--   thefts     (lane 66) The host owns the bandits' theft. host -> friends  E T <serial> <camp> <good> <amount> <victim> <region>
+--              when a camp's loot grows on the host's theft day; a friend's copy never rolls one (native NOTHEFT) and
+--              gets the game's own notice "theft" like every notice, by the realm module's R LOG. See "thefts".
 -- Re-loadable (state lives in Coop.events).
 
 local C = rawget(_G, "Coop")
@@ -27,12 +30,13 @@ local A = C.api
 local un, valid = A.un, A.valid
 local E = C.events or {}
 C.events = E
-E.version = "0.9"
+E.version = "0.10"
 E.on = E.on or {}
 local DEFAULT_ON = {
   quests = true,       -- the host's quest lists are pushed and compared
   questStart = true,   -- a quest the host has is started on a friend's copy (Director:startQuestFromPreset)
   answers = true,      -- answers travel friend -> host -> every copy
+  extraClose = true,   -- (lane 66) an offer this copy has more often than the host: the extra messages are closed unanswered
   camps = true,        -- the host's bandit camps are pushed and compared
   campRemove = true,   -- a camp gone on the host is removed here: the town module's DEMOLISH through the helper lord (lane 12)
   campMake = true,     -- a camp the friend lacks is made here: the engine's own spawnBanditCamp, then moved to the host's place (5 of 5 in sessions 4 to 7)
@@ -44,12 +48,15 @@ local DEFAULT_ON = {
   homes = true,        -- a family lives where it lives on the host (Region:SetFamilyHome)
   deaths = true,       -- a family member the host's family no longer has dies here too (SMUnit:just_die)
   vdeaths = true,      -- a villager who dies on the host is named at once (E PD) and dies here too (lane 24)
+  thefts = true,       -- (lane 66) the host's bandit thefts are told (E T); a friend watches its camps' loot for a theft of its own
+
 }
 for k, v in pairs(DEFAULT_ON) do if E.on[k] == nil then E.on[k] = v end end
 E.stats = E.stats or {}
 E.S = nil                                              -- a hot reload: state is set up again, everything is told and judged again
 local LISTS = { "quests", "proposedQuests", "questOpportunities" }
 local POLL, KEY, CAMP_EVERY, OWNER_EVERY, PEOPLE_EVERY, CAMP_TYPE = 1.0, 30.0, 3.0, 2.0, 5.0, 100
+local OFFER_WAIT = 3.0       -- (lane 66) an offer the host has and this copy lacks is started after this many seconds
 
 local function log(fmt, ...) A.log("events: " .. fmt, ...) end
 local function bump(k) E.stats[k] = (E.stats[k] or 0) + 1 end
@@ -113,12 +120,14 @@ local function fresh(S)
   if E.S == S and E.world == S.worlds then return end
   E.S = S; E.world = S.worlds
   E.sentQ = nil; E.tKey = -1e9; E.tPoll = 0; E.hostQ = nil; E.quiet = 0; E.lastDiff = nil; E.tried = {}; E.rows = nil
+  E.offerSince = {}; E.extraSince = {}; E.extraDone = {}; E.extraShut = {}; E.extraBase = nil
   E.sentK = nil; E.tKeyK = -1e9; E.tCamp = 0; E.scan = nil; E.hostK = nil; E.campSince = {}; E.campAsked = {}
   E.campGone = {}; E.hostKline = nil; E.listSig = nil; E.tQuick = 0
   E.sentO = nil; E.tKeyO = -1e9; E.tOwner = 0; E.hostO = nil; E.ownSince = {}; E.ownTried = {}
   E.pscan = nil; E.sentP = {}; E.tKeyP = -1e9; E.tPeople = 0; E.hostP = {}; E.lastKind = nil; E.peopleNow = nil
   E.homeT = {}; E.deadSig = {}; E.deadT = {}; E.famSeen = {}
   E.vill = nil; E.tVill = 0; E.pdQ = {}
+  E.campMap = nil; E.loot = {}; E.tTheft = 0; E.theftN = 0; E.theftSeen = {}; E.theftWant = {}; E.theftDay = nil; E.ownGrow = {}
   log("reset for world %d", S.worlds)
 end
 
@@ -147,6 +156,13 @@ local function isPreset(S, name)
 end
 
 -- friend: start here what the host has (the director's own function), and say what still differs
+-- (lane 66) is a quest message (questMessageElaborate_C) on screen? One the mod closed (taken out of its grid) keeps its
+-- own visibility and is still found by FindAllOf: measured lane 66 run 1, the host's answer was replayed on such a
+-- closed message and the open one stayed. Only a message with a living parent is on screen.
+local function onScreen(w)
+  local ok, r = pcall(function() local p = w:GetParent(); return p ~= nil and p:IsValid() end)
+  return ok and r == true
+end
 local function friendQuests(S, clock)
   local H = E.hostQ; if not H then return end
   if clock < (E.quiet or 0) then return end            -- an answer was just given here: the host's word is on its way
@@ -166,7 +182,19 @@ local function friendQuests(S, clock)
           local tried = E.tried[key] or 0
           -- an offer: as many as the host has. A running quest: once per world, and only if this copy has it nowhere
           -- (a quest this copy already finished is not started again)
-          local want = offer and ((cM[it.n] or 0) < cH[it.n] and tried < cH[it.n]) or (not offer and not any[it.n] and tried == 0)
+          -- (lane 66 run 2) an extra entry this copy closed still counts in its list: it is not one of the host's offers
+          local mineN = (cM[it.n] or 0) - (offer and (E.extraShut[it.n] or 0) or 0)
+          local want = offer and (mineN < cH[it.n] and tried < cH[it.n]) or (not offer and not any[it.n] and tried == 0)
+          -- (lane 66) an offer is started here only after it has been missing for OFFER_WAIT s. The game offers some by
+          -- itself on every copy where the same thing happens: soldiers that loot a bandit camp (SMUnit::proximityAction
+          -- 4dcd8c5: collapseBuilding, then Director startQuestFromPreset "spoils_of_war" for the soldiers' lord). The
+          -- host's word comes about as fast as this copy's own offer (live, 2026-11-17: the mod's start 0.1 s before the
+          -- camp went here, this copy's own offer a second later: two offers, two messages).
+          if want and offer then
+            local sk = l .. "|" .. it.n .. "|" .. (mineN + 1)
+            E.offerSince[sk] = E.offerSince[sk] or clock
+            if clock - E.offerSince[sk] < OFFER_WAIT then want = false; E.tPoll = clock - POLL + 0.5 end
+          end
           if want and not done[it.n] and isPreset(S, it.n) then
             done[it.n] = true; E.tried[key] = tried + 1    -- one per second
             local D = S.eng.questDirector
@@ -188,6 +216,46 @@ local function friendQuests(S, clock)
   end
   table.sort(diff); local d = table.concat(diff, " ")
   if d ~= E.lastDiff then E.lastDiff = d; if d == "" then log("quests equal to the host's") else log("quests differ from the host's: %s", d); bump("q_diff") end end
+  -- (lane 66) an offer this copy has more often than the host: its game made one of its own. The extra entry cannot be
+  -- taken out of the lord's list by name (the game's removal and answer calls take the quest record by reference, which
+  -- a script cannot hand over), and an answered offer stays in the list on every copy anyway; what the player sees and
+  -- can answer is the message. So the extra open messages are closed, unanswered (questMessageElaborate_C, taken off
+  -- the screen), once the surplus has stood for 2 s: as many as this copy has more than the host, never more.
+  if E.on.extraClose then
+    local cH, cM = {}, {}
+    for _, it in ipairs(H.proposedQuests) do cH[it.n] = (cH[it.n] or 0) + 1 end
+    for _, it in ipairs(mine.proposedQuests) do cM[it.n] = (cM[it.n] or 0) + 1 end
+    if not E.extraBase then                            -- the first comparison in this world (or after a hot reload): what
+      E.extraBase = true                               -- differs already is not new and is never closed
+      for n, k in pairs(cM) do local x = k - (cH[n] or 0); if x > 0 then E.extraShut[n] = x end end
+    end
+    for n, k in pairs(cM) do
+      local extra = k - (cH[n] or 0) - (E.extraShut[n] or 0)   -- (lane 66 run 1) an extra entry stays in the list after its message was closed: counted once
+      local ek = n .. "|" .. k
+      if extra > 0 then
+        E.extraSince[ek] = E.extraSince[ek] or clock
+        if clock - E.extraSince[ek] >= 2.0 and not E.extraDone[ek] then
+          E.extraDone[ek] = true
+          local open = {}
+          for _, w in ipairs(FindAllOf("questMessageElaborate_C") or {}) do
+            local okN, wn = pcall(function() return w.Quest.Name:ToString() end)
+            if valid(w) and okN and wn == n then
+              local pressed = false; pcall(function() pressed = w.Pressed and true or false end)
+              if not pressed and onScreen(w) then open[#open + 1] = w end
+            end
+          end
+          local shut = 0
+          for i = #open, math.max(1, #open - extra + 1), -1 do
+            local ok = pcall(function() open[i]:RemoveFromParent() end)
+            if ok then shut = shut + 1 end
+          end
+          E.extraShut[n] = (E.extraShut[n] or 0) + extra      -- this surplus is dealt with (its message closed, or none was open)
+          log("quest %s: offered %d time(s) here, %d on the host: %d extra message(s) of this copy's own closed unanswered (%d open before)", n, k, cH[n] or 0, shut, #open)
+          bump(shut > 0 and "q_extraClosed" or "q_extraNone")
+        end
+      end
+    end
+  end
 end
 
 -- ---- answers. The game's own calls on a copy's lord are seen by hooks; E.seen runs for each (on every copy).
@@ -228,7 +296,7 @@ local function doAnswer(S, verb, name, done)
   for _, w in ipairs(FindAllOf("questMessageElaborate_C") or {}) do
     if valid(w) and wquest(w) == name then
       local pressed = false; pcall(function() pressed = w.Pressed and true or false end)
-      if not pressed then scroll = w end
+      if not pressed and onScreen(w) then scroll = w end   -- (lane 66) a message the mod closed is no longer on screen: never that one
     end
   end
   if not scroll then done(false, "no message for this quest on this copy"); return end
@@ -287,7 +355,10 @@ local function hostAnswer(S, from, w)
   doAnswer(S, verb, a, function(ok, how)
     log("%s's answer (%s %s): %s here (%s)", tostring(from), VERB[verb], a, ok and "given" or "NOT given", tostring(how))
     bump(ok and "q_answers" or "q_refused")
-    if ok then A.send(string.format("E DID %s %s %s", tostring(from), verb, enc(a))) end
+    if ok then A.send(string.format("E DID %s %s %s", tostring(from), verb, enc(a)))
+    -- (lane 66) not given here: another player's answer to the same offer came first (both inside the link's second),
+    -- or the offer was this copy's own duplicate. The host's first answer stands; the sender is told.
+    else A.send(string.format("E NOTGIVEN %s %s %s", tostring(from), verb, enc(a))) end
     E.sentQ = nil                                      -- and the lists as they are now
   end)
 end
@@ -892,6 +963,156 @@ local function friendVillagers(S, clock)
   end
 end
 
+-- ---------------------------------------------------------------- bandit thefts (lane 66)
+-- What the game does (lane 66, static read of the game file with dumpbin; rvas of this build, exe 560451df):
+--   The raids-and-camps job (4d63380, queued once a game day by updateDay) ends with a jump into the theft routine
+--   (4d64460). That routine acts only on the theft day: daysTotal > 90, an even month, and
+--   dayOfTheMonth == ((30 // month + month - 1) % 29) + 1 (the debug flag "overdriveStealing" skips the date test,
+--   "stealing" only logs). Then, for every bandit squad that is ENCAMPED (Control 4, its camp set), it finds the
+--   nearest settled region of any lord but the off-map one, picks one random good the region holds (rand), takes
+--   min(stock, 3 + 0..12) of it with Region::consumeGood(good, n, none, true, true, true), ADDS it to the camp's
+--   Inventory (the loot a player gets back by looting the camp) and, only when consumeGood said yes, gives the
+--   region's lord the notice PawnCPP:addLog("theft", "goods_stolen+(+<n> <img id="ItemID_<good>"></> +)",
+--   "goods_stolen_descr", 0, <camp's place>, none): the banner. The call is native, so no hook sees it.
+-- In co-op every copy reached that day with its own encamped squads and rolled its own good: the banner on every copy,
+-- each copy taking from its own stock; a friend's stock and its camps' loot are then put back to the host's (facts
+-- module, exact mode, item camps). Rule now: the theft happens only on the host, by the game's own code. A friend's
+-- copy never rolls one (coop_patch item NT, NOTHEFT: the routine's walk over the squads is jumped over). The host
+-- sees a theft as a camp whose loot grew on its theft day and tells it (E T); the stock and the loot reach the friend
+-- through the facts module as before; the notice "theft" reaches a friend by the realm module's R LOG.
+local THEFT_EVERY = 0.5
+local function invOf(b)
+  local m = {}; local inv = b.Inventory; local n = #inv
+  for j = 1, n do
+    local x = inv[j]; local t, a = x.Type, x.amt
+    if type(t) ~= "number" then x = un(x); t, a = x.Type, x.amt end
+    if type(t) == "number" and type(a) == "number" and a ~= 0 then m[t] = (m[t] or 0) + a end
+  end
+  return m
+end
+-- the game's theft day, read from the calendar as the theft routine does; also true while "overdriveStealing" is set
+local function theftDay(S)
+  local T = S.eng.TemporalComponent
+  local total, month, dom = tonumber(S.eng:getDaysTotal()), tonumber(T.month), tonumber(T.dayOfTheMonth)
+  local over = false
+  pcall(function() local f = S.eng.drawDebugFlags; local n = #f; for i = 1, n do if un(f[i]):ToString() == "overdriveStealing" then over = true end end end)
+  local want = (month and month > 0) and ((math.floor(30 / month) + month - 1) % 29) + 1 or -1
+  local day = total and month and dom and total > 90 and month % 2 == 0 and dom == want
+  return (day or over) and true or false, over, total, month, dom, want
+end
+-- the region the theft routine would rob for a camp at (x, y): the nearest settled region with a lord who is not the
+-- off-map one (the routine's further test, a count above 1 in an unreflected list, is not checked here)
+local function victimOf(S, x, y)
+  local best, bd
+  local arr = S.eng.regions; local n = #arr
+  for i = 1, n do
+    local r = un(arr[i])
+    if valid(r) then
+      pcall(function()
+        if not r.isSettled then return end
+        local o = r.ownerPawn; if not valid(o) then return end
+        -- the lord's traits on their own: a failed read does not drop the region (the off-map lord holds no settled town)
+        local off = false
+        pcall(function() local tr = o.traits; local tn = #tr; for j = 1, tn do if un(tr[j]):ToString() == "off_map_lord" then off = true end end end)
+        if off then return end
+        local l = r:K2_GetActorLocation(); local d = (l.X - x) ^ 2 + (l.Y - y) ^ 2
+        if not bd or d < bd then bd = d; best = r end
+      end)
+    end
+  end
+  if best then return ownerCode(S, best.ownerPawn), rkey(best) or "-" end
+  return "-", "-"
+end
+local function noTheft()
+  local P = rawget(C, "patch")
+  if P and type(P.noTheft) == "function" then local ok, s = pcall(P.noTheft); if ok then return s end end
+  return "missing"
+end
+local function logLen(S) local ok, n = pcall(function() return #S.p1.log end); return ok and n or -1 end
+
+-- one look at the camps' loot (every 0.5 s, on the handles of the last camp list)
+local function theftTick(S, clock, host)
+  local map = E.campMap; if not map then return end
+  -- once a game day: say when it is the theft day, and (host) what was seen on the last one
+  -- (the calendar and the debug flags are read once a game day; the theft runs in the day's queued job, after the change)
+  local okT, today = pcall(function() return tonumber(S.eng:getDaysTotal()) end)
+  if okT and today and today ~= (E.theftDay and E.theftDay.total) then
+    local okD, isDay, over, total, month, dom = pcall(theftDay, S)
+    if not okD then isDay, total = false, today end
+    local last = E.theftDay
+    if host and last and last.is then log("thefts: theft day %d over: %d theft(s) seen on the host", last.total, last.n) end
+    E.theftDay = { total = total, is = isDay, n = 0 }
+    if isDay then
+      local enc = 0
+      for _, c in pairs(map) do if valid(c.b) then enc = enc + 1 end end
+      log("thefts: day %d (month %s, day %s of the month%s) is the game's theft day; %d camp(s) here; %s", total, tostring(month), tostring(dom),
+        over and ", overdriveStealing is set" or "", enc, host and "the host's game takes the goods" or ("this copy's own theft: NOTHEFT " .. noTheft()))
+    end
+  end
+  for k, c in pairs(map) do
+    if valid(c.b) then
+      local okI, now = pcall(invOf, c.b)
+      if okI then
+        local old = E.loot[k]; E.loot[k] = now
+        if old then
+          for g, a in pairs(now) do
+            local d = a - (old[g] or 0)
+            if d > 0 then
+              if host then
+                local okV, vc, vr = pcall(function() local l = c.b:K2_GetActorLocation(); return victimOf(S, l.X, l.Y) end)
+                if not okV then vc, vr = "?", "-" end
+                if E.theftDay and E.theftDay.is then
+                  E.theftN = E.theftN + 1; if E.theftDay then E.theftDay.n = E.theftDay.n + 1 end
+                  A.send(string.format("E T %d %s %d %d %s %s", E.theftN, k, g, d, vc, vr)); bump("t_sent")
+                  -- the region's stock of that good now (Region:getStockOfGood), so the log shows the loss, not only the camp's gain
+                  local left = "?"
+                  pcall(function() local r = regionByKey(S, vr); if valid(r) then left = tostring(r:getStockOfGood(g, false, false)) end end)
+                  log("thefts: bandits of camp %s stole %d of good %d from region %s (lord %s) on the host: told (the region holds %s of it now; the lord's log has %d entries)", k, d, g, vr, vc, left, logLen(S))
+                else
+                  bump("t_offDay"); log("thefts: camp %s gained %d of good %d on the host outside a theft day: not told as a theft", k, d, g)
+                end
+              else
+                -- a friend: the host's word (E T) for this camp and good, before or within 10 s after, makes it the host's
+                local wk = k .. "|" .. g
+                local w = E.theftWant[wk]
+                if w and w.left > 0 then w.left = w.left - d; if w.left <= 0 then E.theftWant[wk] = nil end
+                else E.ownGrow[wk] = { t = clock, d = d, day = E.theftDay and E.theftDay.is } end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  if not host then
+    for wk, o in pairs(E.ownGrow) do
+      local w = E.theftWant[wk]
+      if w and w.left > 0 then E.ownGrow[wk] = nil; w.left = w.left - o.d; if w.left <= 0 then E.theftWant[wk] = nil end
+      elseif clock - o.t > 10.0 and not o.day then
+        E.ownGrow[wk] = nil; bump("t_otherGrow")       -- not a theft day (the facts module catching up after a load): not a theft
+      elseif clock - o.t > 10.0 then
+        E.ownGrow[wk] = nil; bump("t_ownHere")
+        log("thefts: camp %s gained %d of good %s HERE without the host's word (%s; NOTHEFT %s)", wk:match("^(.-)|") or wk, o.d, wk:match("|(.*)$") or "?",
+          o.day and "on the theft day: a theft of this copy's own" or "not a theft day", noTheft())
+      end
+    end
+    for wk, w in pairs(E.theftWant) do if clock - w.t > 30.0 then E.theftWant[wk] = nil end end
+  end
+end
+
+-- friend: the host's theft. The stock and the camp's loot come through the facts module; here the notice, once.
+local function friendTheft(S, w)
+  local serial, k, g, d, vc, vr = tonumber(w[5]), w[6], tonumber(w[7]), tonumber(w[8]), w[9], w[10]
+  if not (serial and k and g and d) then bump("t_badLine"); return end
+  if E.theftSeen[serial] then return end
+  E.theftSeen[serial] = true; bump("t_heard")
+  local wk = k .. "|" .. g
+  local cur = E.theftWant[wk]; E.theftWant[wk] = { t = os.clock(), left = (cur and cur.left or 0) + d }
+  -- (lane 66, part two) the notice itself ("theft") comes like every other notice by the realm module's R LOG, the one
+  -- source of notices on a friend; this line only names the theft for the log and the loot watch above
+  log("thefts: the host's bandits of camp %s stole %d of good %d from region %s (lord %s): its notice comes by R LOG; stock and loot by the facts module (NOTHEFT %s)", k, d, g, tostring(vr), tostring(vc), noTheft())
+end
+
 -- ---------------------------------------------------------------- development console
 -- Two copies on one PC are started with COOP_X_DEV=1 (tools/dev): a file <link>/<name>_x.lua is then run inside the
 -- mod's own Lua state and its result written to <name>_x_out.txt (hot reload of this file, switches, status). Without
@@ -938,9 +1159,10 @@ function M.tick(S, clock)
     if E.scan then guarded("camps", campScan, S)
     elseif clock - E.tCamp >= CAMP_EVERY then
       E.tCamp = clock
-      guarded("camps", campScan, S, function(map) if host then hostCamps(S, os.clock(), map) else friendCamps(S, os.clock(), map) end end)
+      guarded("camps", campScan, S, function(map) E.campMap = map; if host then hostCamps(S, os.clock(), map) else friendCamps(S, os.clock(), map) end end)
     end
   end
+  if E.on.thefts and E.on.camps and clock - (E.tTheft or 0) >= THEFT_EVERY then E.tTheft = clock; guarded("thefts", theftTick, S, clock, host) end
   if E.on.owners and clock - E.tOwner >= OWNER_EVERY then
     E.tOwner = clock
     guarded("owners", host and hostOwners or friendOwners, S, clock)
@@ -973,6 +1195,13 @@ function M.onMessage(S, from, kind, w, line)
       E.hostQ = H
     elseif sub == "DID" then
       local ok, e = pcall(friendDid, S, w); if not ok then log("answer from the host failed: %s", tostring(e)) end
+    elseif sub == "NOTGIVEN" then
+      -- (lane 66) this player's answer did not count on the host (another player answered that offer first)
+      if w[5] == S.name then
+        local a = dec(w[7] or ""); bump("q_notGiven")
+        log("this player's answer (%s %s) was NOT counted on the host: the offer was already answered there", VERB[w[6]] or tostring(w[6]), a)
+        if C.notify then pcall(C.notify, "info", "Co-op: another player answered that offer first; the host's answer counts") end
+      end
     elseif sub == "K" then
       -- only a list in which every entry is a whole camp name is taken (session 2: a list cut at the commas inside
       -- the names made a friend's copy demolish its two real camps)
@@ -991,6 +1220,8 @@ function M.onMessage(S, from, kind, w, line)
       local H = {}
       for k, c in (w[5] or ""):gmatch("([^,=]+)=([^,]+)") do H[k] = c end
       E.hostO = H
+    elseif sub == "T" then
+      if E.on.thefts then local ok, e = pcall(friendTheft, S, w); if not ok then log("thefts: the host's line failed here: %s", tostring(e)) end end
     elseif sub == "PD" then
       if w[5] and E.on.vdeaths then E.pdQ[dec(w[5])] = { t = os.clock(), role = tonumber(w[6]) or -1, age = tonumber(w[7]) or -1, fight = w[8] ~= "0" }; E.tVill = -1e9 end
     elseif sub == "P" then

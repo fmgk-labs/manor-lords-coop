@@ -8,7 +8,7 @@
 
 local C = rawget(_G, "Coop") or {}
 _G.Coop = C
-C.version = "0.2.3"
+C.version = "0.2.4"
 
 -- where the link files live: set by main.lua to "<this mod's folder>/link/"; the development console uses the probe's folder
 local LINK = rawget(_G, "COOP_LINK_DIR")

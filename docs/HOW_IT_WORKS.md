@@ -75,6 +75,7 @@ The third word of a line. Most kinds go one way: from the host to friends (H→F
 | `U` | `coop_x_jobs.lua` | the job board: which villager does which task (H→F) |
 | `MM`, `MF`, `MV` and others | `coop_x_men.lua` | where each man of a squad stands (H→F) |
 | `FM` | `coop_x_merch.lua` | free merchants' places (H→F) |
+| `MC` | `coop_x_maint.lua` | every building's maintenance: status and each tracker (H→F) |
 | `Q` | `coop_x_scene.lua` | small scene pieces: yard gates, stalls, carts (H→F) |
 | `Y` | `coop_x_fields.lua` | fields and gardens (H→F) |
 | `J` | `coop_join.lua` | join and resync |
@@ -98,6 +99,7 @@ Each module registers itself with the core and gets `onWorld` (a world attached)
 | `coop_x_army.lua` | Army panel: militia, mercenaries, retinue, squad names |
 | `coop_x_men.lua` | Each man's place in a squad |
 | `coop_x_merch.lua` | Free merchants |
+| `coop_x_maint.lua` | Building maintenance: status, bar and yield are the host's (native item MAINT) |
 | `coop_x_events.lua` | What the game rolls by itself: quests, raids, bandit camps, region owners |
 | `coop_x_people.lua` | Families and rival buildings made on friends; population |
 | `coop_x_jobs.lua` | The job board: tasks, holds, which villager does what |

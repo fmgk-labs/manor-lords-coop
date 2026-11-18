@@ -155,6 +155,14 @@ function P.status()
   return st
 end
 
+-- (lane 66) the state of item NT (NOTHEFT) on this copy: "on", "off", "unavailable", or "missing" (no native piece, or
+-- one older than 0.9.2 that has no such item)
+function P.noTheft()
+  if not P.fn then return "missing" end
+  local it = P.status().items.NT
+  return it and tostring(it.state) or "missing"
+end
+
 -- ---- replaying the host's decisions (friend's copy). h = this copy's squad number (A.toLocal of the host's number).
 -- TriggerSquadRetreat does not check whether the squad already routs (report native5 answer 5): only when Control ~= 3.
 local function squadControl(S, h)
@@ -609,6 +617,39 @@ function P.fell(region, x, y)
   return true
 end
 
+-- ---- lane 66: NOLOG and the mod's mark
+-- P.markLog() is called right before the mod's own PawnCPP:addLog / addLogIfNew (coop_realm.lua's R LOG on a friend):
+-- while NOLOG is on, that one call goes into the game's routine. It does nothing when the DLL has no such export.
+local markFn, markTried
+function P.markLog()
+  if not P.fn then return false end
+  if not markTried then
+    markTried = true
+    local fn = package.loadlib(P.dll, "coop_patch_mark")
+    if fn then markFn = fn else log("NOLOG: the native piece has no coop_patch_mark (older than 0.9.3): this copy's own notices stay") end
+  end
+  if markFn then pcall(markFn); return true end
+  return false
+end
+-- on: only while this copy plays in the host's world, and only once the item is there and armed ("off"); then "on" is
+-- checked in the status. P.nlOn says whether this copy's own notices are dropped now.
+local function nologStep(S, want)
+  if not P.fn then P.nlOn = false; return end
+  local it = P.status().items.NOLOG
+  local state = it and it.state
+  if want and state == "off" and P.nlSent ~= "on" and P.markLog() then
+    P.nlSent = "on"; P.send("NOLOG ON"); P.tick(); P.stT = nil
+    log("friend copy: NOLOG ON sent (this copy's own notices are dropped; the host's come by R LOG)")
+  elseif not want and P.nlSent == "on" then
+    P.nlSent = "off"; P.send("NOLOG OFF"); P.tick(); P.stT = nil
+    log("friend copy: NOLOG OFF (a load or a hold)")
+  elseif want and P.nlSent == "on" and state == "off" and os.clock() - (P.nlT or 0) > 10.0 then
+    P.nlT = os.clock(); P.nlSent = nil                    -- the host's ALLOFF rule or a role change took it out: ask again
+  end
+  local now = (P.status().items.NOLOG or {}).state == "on"
+  if now ~= (P.nlOn or false) then P.nlOn = now; log("NOLOG is %s on this copy%s", now and "on" or "off", now and "" or ((it and it.state == "unavailable") and (": " .. tostring(it.why)) or "")) end
+end
+
 -- ---- plug-in module
 local function step(S, inWorld)
   if not P.wanted then return end
@@ -642,13 +683,23 @@ local function step(S, inWorld)
       -- before read through a null region in the game's own code and closed a friend's game twice; with this on,
       -- the two routines leave instead (lanes/lane_s21_0/crash_demolish_site)
       P.send("NOREGION ON")
-      log("friend copy, world %d: NOKILL ON, NOROUT ON, NOREGION ON", S.worlds)
+      -- NOTHEFT (lane 66): the bandits' daily theft is rolled by every copy's own game on the same calendar day, each
+      -- with its own random good; on a friend's copy the routine's walk over the bandit squads is jumped over, so a
+      -- theft happens only on the host and the events module tells it (E T). A DLL older than 0.9.2 does not know the
+      -- command and logs it as unknown: then the friend's own theft and banner stay (the events module logs that).
+      P.send("NOTHEFT ON")
+      log("friend copy, world %d: NOKILL ON, NOROUT ON, NOREGION ON, NOTHEFT ON", S.worlds)
     end
     -- NOFINISH: on a friend's copy the game does not finish a building by itself; the host says when (the sites module
     -- calls FINISH). Each copy's builders pick their sites in their own order, so without this a friend could finish a
     -- building long before the host (session 20). It is on only while this copy plays in the host's world, and off
     -- while a save is loading, so a load runs exactly as in the unchanged game.
     local want = inWorld and not C.hold
+    -- NOLOG (lane 66): this copy's game adds no notice of its own; the host's come by the realm module's R LOG and go in
+    -- through the mod's mark (P.markLog, the DLL's coop_patch_mark). Switched on only when the DLL has the item and the
+    -- export (0.9.3 and later) and the item reads "off" (scanned, armed to be switched); while a save loads, off. Without
+    -- either, nothing is sent and this copy's notices stay its own, as before.
+    nologStep(S, want and not (P.test and P.test.nologOff))   -- (test only: Coop.patch.test = { nologOff = true }, the control run of lane 66)
     if want ~= (P.nfOn or false) then
       P.nfOn = want
       P.send(want and "NOFINISH ON" or "NOFINISH OFF")

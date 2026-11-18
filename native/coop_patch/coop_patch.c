@@ -40,7 +40,7 @@
 #include <limits.h>
 #include "coop_scan.h"
 
-#define COOP_PATCH_VERSION "0.9.2"    /* 0.9.2 (lane 62): a bug report takes the Steam piece's log and status, names out by line shape */
+#define COOP_PATCH_VERSION "0.9.3"    /* 0.9.2 (lane 62): a bug report takes the Steam piece's log and status; 0.9.3 (lane 66, provisional): NOTHEFT, NOLOG */
 #define LOG_CAP            (256u * 1024u)
 #define MAX_LINE           4096       /* lane 22: a TOTALS SET line names every good of a region (512 was too short live) */
 #define READ_CHUNK         65536
@@ -257,8 +257,15 @@ static int guide_scan(void);
 static int fell_status(char *buf, size_t len);       /* lane 54: the FELL line */
 static int fell_scan(void);
 static int endhold_status(char *buf, size_t len);    /* lane 49, round four: the ENDHOLD line */
+static int maint_status(char *buf, size_t len);      /* lane 67: the MAINT line (coop_maint.h) */
+static int maint_scan(void);
+static void maint_tick(void);
+static void maint_forget(void);
 static int endhold_scan(void);
 static void endhold_off(const char *why);
+static int nolog_status(char *buf, size_t len);      /* lane 66: the NOLOG line */
+static int nolog_scan(void);
+static void nolog_off(const char *why);
 static int report_status(char *buf, size_t len);     /* lane 61: the REPORT line (coop_report.h) */
 
 static int write_status(void)              /* lane 45: 0 = not written yet (only counters changed): stays dirty */
@@ -304,6 +311,8 @@ static int write_status(void)              /* lane 45: 0 = not written yet (only
     n += guide_status(buf + n, sizeof(buf) - (size_t)n);    /* lane 49 */
     n += fell_status(buf + n, sizeof(buf) - (size_t)n);     /* lane 54 */
     n += endhold_status(buf + n, sizeof(buf) - (size_t)n);  /* lane 49, round four */
+    n += nolog_status(buf + n, sizeof(buf) - (size_t)n);    /* lane 66 */
+    n += maint_status(buf + n, sizeof(buf) - (size_t)n);    /* lane 67 */
     n += report_status(buf + n, sizeof(buf) - (size_t)n);   /* lane 61 */
     n += _snprintf(buf + n, sizeof(buf) - (size_t)n, "process %lu version %s\r\n", GetCurrentProcessId(), COOP_PATCH_VERSION);
 have_text:
@@ -505,6 +514,8 @@ static void scan_end(void)
     if (guide_scan()) any = 1;     /* lane 49 */
     if (fell_scan()) any = 1;      /* lane 54 */
     if (endhold_scan()) any = 1;   /* lane 49, round four */
+    if (nolog_scan()) any = 1;     /* lane 66 */
+    if (maint_scan()) any = 1;     /* lane 67 */
     if (!any) {
         g_off = 1;
         _snprintf(g_off_reason, sizeof(g_off_reason), "nothing matches this game build (timestamp %X)", g_stamp);
@@ -606,6 +617,9 @@ static void restore_all(void)
     __except (EXCEPTION_EXECUTE_HANDLER) { log_line("MEN restore raised exception %08lX", GetExceptionCode()); }
     __try { endhold_off("all patches off"); }   /* lane 49, round four */
     __except (EXCEPTION_EXECUTE_HANDLER) { log_line("ENDHOLD restore raised exception %08lX", GetExceptionCode()); }
+    __try { nolog_off("all patches off"); }      /* lane 66 */
+    __except (EXCEPTION_EXECUTE_HANDLER) { log_line("NOLOG restore raised exception %08lX", GetExceptionCode()); }
+    maint_forget();                             /* lane 67: data only; the held entries are dropped */
     for (k = S_P1; k <= S_PATCH_LAST; k++) {
         site_eval *e = &g_site[k];
         if (e->len == 0 || e->patch_rva == 0 || e->orig[0] == 0 || !g_base) continue;   /* never evaluated: nothing to restore */
@@ -4109,9 +4123,12 @@ static void regset_cmd(int argc, char **argv)
 #include "coop_guide.h"
 /* ------------------------------------------------------------------ FELL (lane 54): its own file */
 #include "coop_fell.h"
+/* ------------------------------------------------------------------ MAINT (lane 67): its own file */
+#include "coop_maint.h"
 
 /* ------------------------------------------------------------------ ENDHOLD (lane 49, round four): its own file */
 #include "coop_endhold.h"
+#include "coop_nolog.h"                     /* lane 66: NOLOG */
 
 /* ------------------------------------------------------------------ REPORT (lane 61): the bug report, its own file */
 #include "coop_report.h"
@@ -4394,7 +4411,8 @@ static void command(char *line)
     if (!line[0] || line[0] == '#') return;
     /* lane 40: FIELD POLL / SET / CHECK come several times a second: counted in the status, not logged one by one */
     if (!(_strnicmp(line, "FIELD POLL", 10) == 0 || _strnicmp(line, "FIELD SET ", 10) == 0 || _strnicmp(line, "FIELD CHECK ", 12) == 0 ||
-          _strnicmp(line, "MEN POLL", 8) == 0 || _strnicmp(line, "MEN SET ", 8) == 0 || _strnicmp(line, "MEN WAYS ", 9) == 0)     /* lane 43: several times a second */
+          _strnicmp(line, "MEN POLL", 8) == 0 || _strnicmp(line, "MEN SET ", 8) == 0 || _strnicmp(line, "MEN WAYS ", 9) == 0 ||   /* lane 43: several times a second */
+          _strnicmp(line, "MAINT READ ", 11) == 0 || _strnicmp(line, "MAINT SET ", 10) == 0)                                      /* lane 67: every second */
         && !snap_quiet_cmd(line) && !co_quiet_cmd(line))                                          /* lane 45: TOTALS SET, DIST SET, REGSET LIST */
         log_line("command: %.160s%s", line, strlen(line) > 160 ? " ..." : "");     /* a TOTALS SET line is long */
     argc = split(line, argv, 8);
@@ -4439,6 +4457,8 @@ static void command(char *line)
     }
     /* lane 19: JOBGATE ON|OFF (site JG): given tasks start on a friend's copy while the job list is full */
     if (_stricmp(argv[0], "JOBGATE") == 0 && argc == 2 && on_off(argv[1], &v)) { set_site(S_JG, v); return; }
+    /* lane 66: NOTHEFT ON|OFF (site NT): a friend's copy never rolls the bandits' daily theft; the host tells it */
+    if (_stricmp(argv[0], "NOTHEFT") == 0 && argc == 2 && on_off(argv[1], &v)) { set_site(S_NT, v); return; }
     /* lane 23: CHOOSE ON|OFF, CHOOSE SET <hex address>,<hex address>,... | CHOOSE SET - (the job chooser, per villager) */
     if (_stricmp(argv[0], "CHOOSE") == 0) { choose_cmd(argc, argv); return; }
     /* the lead: NOREGION ON|OFF (a work hit at a building without a region no longer reads through null) */
@@ -4458,8 +4478,12 @@ static void command(char *line)
     if (_stricmp(argv[0], "GUIDE") == 0) { guide_cmd(argc, argv); return; }
     /* lane 54: FELL <region> <x> <y> (the tree being felled at that place falls at this copy's next stroke) */
     if (_stricmp(argv[0], "FELL") == 0) { fell_cmd(argc, argv); return; }
+    /* lane 67: MAINT READ <c>,... | SET <c> <status> <goods>=<left>,... | DROP <c>,... | FORGET (a building's maintenance) */
+    if (_stricmp(argv[0], "MAINT") == 0) { maint_cmd(argc, argv); return; }
     /* lane 49, round four: ENDHOLD ON|OFF | SET <ceiling ms> <unit>:<type>:<building>,... | RANGE <lo> <hi> */
     if (_stricmp(argv[0], "ENDHOLD") == 0) { endhold_cmd(argc, argv); return; }
+    /* lane 66: NOLOG ON|OFF (a friend's game adds no notice of its own; the mod's, through the script layer, go in) */
+    if (_stricmp(argv[0], "NOLOG") == 0) { nolog_cmd(argc, argv); return; }
     if (_stricmp(argv[0], "ROUT") == 0) { do_call(0, argc, argv); return; }
     if (_stricmp(argv[0], "REFORM") == 0) { do_call(1, argc, argv); return; }
     if (_stricmp(argv[0], "FINISH") == 0) { do_call(2, argc, argv); return; }
@@ -4597,6 +4621,7 @@ static void tick_body(void)
     report_tick();          /* lane 61: a finished bug report */
     field_tick();           /* lane 40: queued plant drawings, audits */
     men_tick();             /* lane 43: a faulted hook taken out */
+    maint_tick();           /* lane 67: the host's maintenance back where this copy's own day wore it */
     goods_tick();           /* and what an audit or a command of this tick left */
     totals_tick();
     hold_tick();
@@ -4664,6 +4689,16 @@ __declspec(dllexport) int __cdecl coop_guard_tick(void *L)
     __try { snap_guard_tick(); } __except (EXCEPTION_EXECUTE_HANDLER) { SN.faults++; }
     wd_out(WD_GUARD);
     g_in_tick = 0;
+    return 0;
+}
+
+/* lane 66: the mod's mark for NOLOG. The mod calls it on the game thread right before its own PawnCPP:addLog or
+ * addLogIfNew: that one call goes into the game's routine while NOLOG is on (coop_nolog.h). Sets three numbers, nothing
+ * else; safe at any time, also before the scan. */
+__declspec(dllexport) int __cdecl coop_patch_mark(void *L)
+{
+    (void)L;
+    nolog_mark();
     return 0;
 }
 
