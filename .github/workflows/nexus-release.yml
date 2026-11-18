@@ -67,7 +67,10 @@ jobs:
           description: Mod ${{ steps.tag.outputs.version }} for Manor Lords 0.8.117 (Steam). Includes the UE4SS loader build it was tested on (MIT). Every player needs this same file.
           category: main
           archive_existing_version: true
-          primary_mod_manager_download: true
+          # Vortex and other mod managers are NOT tested with this zip (it must be unzipped into BinariesWin64),
+          # so the mod manager button stays off until an install through one is proven.
+          primary_mod_manager_download: false
+          allow_mod_manager_download: false
           update_mod_version: true
           mod_id: ${{ env.NEXUS_MOD_ID }}
           changelog: ${{ env.CHANGELOG }}
