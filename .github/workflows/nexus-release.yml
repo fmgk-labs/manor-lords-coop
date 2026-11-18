@@ -1,0 +1,73 @@
+# When a GitHub Release is published, send its *-nexus.zip to the mod's Nexus Mods page as a new file version.
+# One-time setup by the repo owner: Settings > Secrets and variables > Actions > New repository secret
+#   name NEXUSMODS_API_KEY, value = an API key made at https://www.nexusmods.com/settings/api-keys
+# The zip is built and tested by the maintainers before the release (it holds the UE4SS loader and the native DLLs,
+# which are not built here). See docs/MAINTAINERS.md, "How a release is cut".
+name: Nexus release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to send to Nexus (for example v0.2.3)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  NEXUS_MOD_ID: "454"        # nexusmods.com/manorlords/mods/454
+  NEXUS_FILE_ID: "1663"      # the main file that each release replaces with a new version
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find the tag
+        id: tag
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          TAG="${EVENT_TAG:-$INPUT_TAG}"
+          case "$TAG" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "Tag '$TAG' is not like v1.2.3"; exit 1 ;; esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check the Nexus key is set
+        env:
+          KEY: ${{ secrets.NEXUSMODS_API_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then echo "The secret NEXUSMODS_API_KEY is not set: nothing is sent to Nexus."; exit 1; fi
+
+      - name: Download the release zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "ManorLordsCoop-${VERSION}-nexus.zip"
+          ls -l "ManorLordsCoop-${VERSION}-nexus.zip"
+          # the notes' "New in" list becomes the Nexus changelog (plain lines, no markdown)
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > body.md
+          awk '/^## New in/{f=1;next} /^## /{f=0} f && /^- /{sub(/^- /,""); gsub(/\*\*|`/,""); print}' body.md > changelog.txt
+          if [ ! -s changelog.txt ]; then echo "Version ${VERSION}. See the GitHub release notes." > changelog.txt; fi
+          { echo "CHANGELOG<<EOF_CHANGELOG"; cat changelog.txt; echo "EOF_CHANGELOG"; } >> "$GITHUB_ENV"
+
+      - name: Upload to Nexus Mods
+        uses: Nexus-Mods/upload-action@v1.0.0-beta.11
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          file_id: ${{ env.NEXUS_FILE_ID }}
+          filename: ManorLordsCoop-${{ steps.tag.outputs.version }}-nexus.zip
+          version: ${{ steps.tag.outputs.version }}
+          display_name: Manor Lords Co-op ${{ steps.tag.outputs.version }} (game 0.8.117)
+          description: Mod ${{ steps.tag.outputs.version }} for Manor Lords 0.8.117 (Steam). Includes the UE4SS loader build it was tested on (MIT). Every player needs this same file.
+          category: main
+          archive_existing_version: true
+          primary_mod_manager_download: true
+          update_mod_version: true
+          mod_id: ${{ env.NEXUS_MOD_ID }}
+          changelog: ${{ env.CHANGELOG }}
