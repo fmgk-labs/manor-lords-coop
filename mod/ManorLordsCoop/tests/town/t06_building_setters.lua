@@ -4,7 +4,8 @@
 -- Targets: a construction site for SLEEP / CPAUSE / PRIO (fewer side effects: on a workplace setSleep(true) unassigns its
 -- families, lane_t1 T8e), any building that answers for PROTECT, a field for FERTILIZE, a building with an active recipe for
 -- RECIPE_OFF / RECIPE_ON, the first building with a maintenance component for MAINT. CROP only when DO_CROP (changing a field's crop may reset its work; not read).
--- CONFIRMED = each action prints one SEE line, "replay ok", "value back: true" and "extra lines 0".
+-- FERTILIZE is sent only when the setter changes the field's value (lane 75): this call changes it, so one line.
+-- The other actions print one SEE line. All replay with "value back: true" and "extra lines 0".
 -- RISK: low. SetPriority aborts the builders' current task on that site (READ lane_t1 T8f); they pick it up again.
 local DO_CROP = false
 local T = Coop and Coop.town

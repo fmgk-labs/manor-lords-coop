@@ -8,7 +8,7 @@
 
 local C = rawget(_G, "Coop") or {}
 _G.Coop = C
-C.version = "0.2.5"
+C.version = "0.2.6"
 
 -- where the link files live: set by main.lua to "<this mod's folder>/link/"; the development console uses the probe's folder
 local LINK = rawget(_G, "COOP_LINK_DIR")
@@ -1441,6 +1441,67 @@ local function sqBusy(h)
   end)
   return busy
 end
+-- (lane 76) A squad that is gone on the host stood on a friend's map for the 4 s of the rule above: another lord's
+-- army read 36 here when the host had 0, 4.45 s after the host last had 36 (l76e; the owner's bar is 3 s). The 4 s
+-- are there for what may still be in the air. So this copy keeps, for every squad, how long it has been quiet, in
+-- seconds of RUNNING game (a paused game keeps its arrows in the air): since it was first seen, since its last fight
+-- flag or raid, since it began to flee. A squad that has been quiet for over 4 s when the host's word comes has
+-- nothing of its own in the air: it is halted and removed at the next look (0.5 s), not 4 s later. Every other squad
+-- keeps the old rule unchanged. Any doubt (not watched for 4 s yet, a read that fails, a man in a fighting stance
+-- or with a task of his own) means the old rule. C.rmFast = false switches the short way off.
+local function calmNote(clock)
+  local S = C.s
+  local K = S.calm
+  if not K or K.world ~= S.worlds then K = { world = S.worlds, run = 0, last = clock, seen = {}, busy = {}, flee = {} }; S.calm = K end
+  local dt = clock - K.last; K.last = clock
+  -- time counts only while the game really runs: not paused and a speed above 0 (a speed of 0 without the pause
+  -- flag stands still too); unreadable = no time counted
+  local runs = false; pcall(function() runs = not isPaused() and (tonumber(S.eng.gameSpeed) or 0) > 0.001 end)
+  if runs and dt > 0 then K.run = K.run + math.min(dt, 1.0) end
+  local here = {}
+  for _, h in ipairs(allSquads()) do
+    if sqValid(h) then
+      here[h] = true
+      K.seen[h] = K.seen[h] or K.run
+      if sqBusy(h) then K.busy[h] = K.run; S.busyT[h] = clock end
+      -- a raid (skill 19: its men loot, kill or throw torches by their own tasks, the squad shows no fight flag)
+      -- is not quiet; the old rule itself is left as it was (S.busyT is not touched)
+      local okR, raid = pcall(function()
+        local sk = S.sc:GetSquad({ Value = h }).activeSkills
+        for i = 1, #sk do if tonumber(un(sk[i])) == RAIDING then return true end end
+        return false
+      end)
+      if not okR or raid then K.busy[h] = K.run end
+      local okF, fleeing = pcall(function() return S.sc:GetSquad({ Value = h }).Control == FLEEING end)
+      if okF and fleeing then K.flee[h] = K.flee[h] or K.run else K.flee[h] = nil end
+      if not okF then K.busy[h] = K.run end
+    end
+  end
+  for h in pairs(K.seen) do if not here[h] then K.seen[h] = nil; K.busy[h] = nil; K.flee[h] = nil end end
+end
+local function menQuiet(h)
+  local ok, quiet = pcall(function()
+    local arr = C.s.sc:GetSquad({ Value = h }).unitArr
+    for i = 1, #arr do
+      local u = un(arr[i])
+      -- a man with a task of his own (a raider's torch, loot or murder task; an idle soldier has none: 36 of 36
+      -- idle archers read 0 tasks, l76g) or in a fighting stance: not quiet
+      if valid(u) and not u.dead and (u.fightingStance or #u.Tasks > 0) then return false end
+    end
+    return true
+  end)
+  return ok and quiet == true
+end
+-- has this squad been quiet for over 4 s of running game (see above)? fleeing: it has fled for that long (a fleeing
+-- squad throws nothing; it keeps its fight flags)
+local function sqQuiet(h, fleeing)
+  local S = C.s; local K = S.calm
+  if C.rmFast == false or not K or K.world ~= S.worlds then return false end
+  local seen = K.seen[h]; if not seen or K.run - seen < 4.5 then return false end
+  if fleeing then local f = K.flee[h]; return f ~= nil and K.run - f > 4.0 end
+  local b = K.busy[h]; if b and K.run - b <= 4.0 then return false end
+  return menQuiet(h)
+end
 local function removeSafe(h, why)
   local S = C.s; local sc = S.sc; local clock = os.clock()
   S.rmQ = S.rmQ or {}; S.busyT = S.busyT or {}; S.rmDone = S.rmDone or {}
@@ -1454,33 +1515,43 @@ local function removeSafe(h, why)
     log("squad %d removed (%s)", h, why)
     return
   end
-  S.rmQ[h] = { t = clock, why = why, haltT = clock }
+  local fleeing = false; pcall(function() fleeing = sc:GetSquad({ Value = h }).Control == FLEEING end)
+  local fast = sqQuiet(h, fleeing)                -- (lane 76) quiet for over 4 s already: nothing of its own is in the air
+  S.rmQ[h] = { t = clock, why = why, haltT = clock, fast = fast or nil, fled = fleeing or nil }
+  if fast then S.stats.removedFast = (S.stats.removedFast or 0) + 1 end
   -- A squad that flees here (the game's own rout, started with the host's) is not halted and its men are never
   -- "let die" (below): they became bodies in the player's region that the host does not have (lane 4, session 21:
   -- 8 fled bandits killed here, approval 46 against the host's 57 three days later through "unburied", then families
   -- and a resync). It is taken away 4 s later with the game's own "remove squad" whatever its fight flags say (a
   -- fleeing squad keeps "engaged" set here; it throws nothing). Tried on a fleeing squad of 4: gone at once, no
   -- bodies, no crash.
-  local fleeing = false; pcall(function() fleeing = sc:GetSquad({ Value = h }).Control == FLEEING end)
-  if fleeing then log("squad %d is to be removed (%s): it flees here, removed in 4 s without a halt", h, why); return end
+  if fleeing then
+    log("squad %d is to be removed (%s): it flees here, removed %s without a halt", h, why, fast and "at the next look (it has fled for over 4 s)" or "in 4 s"); return
+  end
   pcall(function() sc:SetSkillActive({ Value = h }, HALT, true, true) end)
-  log("squad %d is to be removed (%s): halted, removed in 4 s", h, why)
+  log("squad %d is to be removed (%s): halted, removed %s", h, why, fast and "at the next look (quiet for over 4 s)" or "in 4 s")
 end
-C.removeSafe = removeSafe; C.sqBusy = sqBusy
+C.removeSafe = removeSafe; C.sqBusy = sqBusy; C.sqQuiet = sqQuiet
 -- every 0.5 s on a friend's copy: note which squads are busy, and work the removal queue
 local function removeTick(clock)
   local S = C.s; local sc = S.sc
   S.busyT = S.busyT or {}
-  for _, h in ipairs(allSquads()) do if sqValid(h) and sqBusy(h) then S.busyT[h] = clock end end
+  calmNote(clock)                                  -- (lane 76) also notes the busy squads (S.busyT), as before
   if not S.rmQ then return end
   for h, q in pairs(S.rmQ) do
     if not sqValid(h) then S.rmQ[h] = nil
     else
       local n = sc:GetUnitCount({ Value = h })
       local fleeing = false; pcall(function() fleeing = sc:GetSquad({ Value = h }).Control == FLEEING end)
-      if n > 0 and fleeing and clock - q.t < 4.0 then
+      -- (lane 76) the short way holds only while the squad stays as it was when the host's word came: still quiet
+      -- (or still fleeing). Anything else: the old rule, counted from the word's own time.
+      if q.fast and not ((q.fled and fleeing) or (not q.fled and not fleeing and sqQuiet(h, false))) then
+        q.fast = nil; log("squad %d did not stay quiet: removed by the 4 s rule", h)
+      end
+      local wait = q.fast and 0.4 or 4.0
+      if n > 0 and fleeing and clock - q.t < wait then
         -- a fleeing squad: wait the 4 s, then remove it (next branch); never halted, never killed
-      elseif n == 0 or (clock - q.t >= 4.0 and (fleeing or clock - (S.busyT[h] or -100) > 4.0)) then
+      elseif n == 0 or (clock - q.t >= wait and (fleeing or clock - (S.busyT[h] or -100) > 4.0)) then
         sc:RequestRemoveSquad({ Value = h }); S.rmQ[h] = nil; S.rmDone = S.rmDone or {}; S.rmDone[h] = clock; S.stats.removed = (S.stats.removed or 0) + 1
         log("squad %d removed (%s, after %.1f s)", h, q.why, clock - q.t)
       elseif clock - q.t > 8.0 and not q.killed then
@@ -1492,6 +1563,7 @@ local function removeTick(clock)
     end
   end
 end
+C.removeTickFn = removeTick      -- (lane 76) for the desk test
 
 -- this copy just changed squad h on the host's behalf: do not report that change back as a player order
 local function touch(h) local S = C.s; S.known[h] = nil; S.mirT[h] = os.clock() end
@@ -2276,11 +2348,122 @@ local function mirror(H)
   end
 end
 
+-- friend: one "N" line of the host: a squad was created there
+--   N <host number> <unit type> <owner> <x> <y> <z> <count> <raised by> [R] [camp=..]
+local function makeSquad(S, sc, w)
+  local hh = tonumber(w[4])
+  -- (join) "R" at the end: the host names every squad again after a friend loaded alone (C.announceAll). A copy
+  -- that has the squad makes nothing: the host's number is tied to a local squad, or a local squad carries the
+  -- host's own number, is tied to no other host squad and is of the same unit type (both have it from one save).
+  local again = false
+  if hh and w[12] == "R" then
+    local have = S.h2l[hh] ~= nil
+    if not have and sqValid(hh) and not S.l2h[hh] then
+      local okT, typ = pcall(function() return sc:GetSquad({ Value = hh }).unitType:ToString() end)
+      have = okT and typ == w[5]
+    end
+    if have then hh = nil else again = true end
+  end
+  if hh and not again and not S.h2l[hh] and w[11] and w[11] ~= "-" then
+    local who, mineH = w[11]:match("^([^:]+):(%d+)$"); mineH = tonumber(mineH)
+    if who == S.name and mineH and sqValid(mineH) then
+      S.h2l[hh] = mineH; S.l2h[mineH] = hh
+      log("the unit this player raised (%d) is unit %d on the host", mineH, hh)
+    end
+  end
+  if hh and not S.h2l[hh] then
+    local owner = S.p1
+    if w[6] == "B" then for _, pw in ipairs(pawns()) do if valid(pw) and pw.isBandit then owner = pw end end
+    elseif w[6]:sub(1, 1) == "A" then local pw = S.eng:getPawnBySetupIndex(tonumber(w[6]:sub(2)) or -1); if valid(pw) then owner = pw end end
+    local lh, how
+    -- The player's own new militia unit (army panel, "+"): on the host it starts empty and fills when rallied. Make
+    -- it here the same way, with the game's own call, so it is a real militia unit of this town's families and not
+    -- a ready-made stand-in (session 19: the stand-in had 32 soldiers against the host's 0).
+    -- The same for a RIVAL lord's new militia unit (2026-11-12, two runs of the test save, day 368: the host's
+    -- "spearMilitia A2" had 0 soldiers, the ready-made stand-in here 32, a militia unit is never trimmed, and the
+    -- daily comparison asked for a resync: soldiersA2:0/32). Only when that lord's own pawn was found here.
+    local milOwner = (w[6] == "P") and S.p1 or ((w[6]:sub(1, 1) == "A" and valid(owner) and owner ~= S.p1) and owner or nil)
+    if milOwner and w[5]:find("Militia") and (tonumber(w[10]) or 0) == 0 then
+      local before = {}
+      local arr = milOwner.commandedSquads; for i = 1, #arr do before[arr[i].Value] = true end
+      pcall(function() milOwner:addMilitiaSquad(milOwner:getClosestOwnedRegion(), FName(w[5])) end)
+      arr = milOwner.commandedSquads; for i = 1, #arr do local v = arr[i].Value; if v ~= 0 and not before[v] then lh = v; how = "militia unit" end end
+    end
+    -- (lane 32) An empty squad that is not a militia unit (seen: the player's retinue_tier1 made on the host, 0 men,
+    -- when the player won a settled region in battle) is not made here as a full ready-made squad: the stand-in had
+    -- 36 men against the host's 0 and the daily comparison asked for a resync (soldiersP 45/81, sitting s6).
+    if not lh and (tonumber(w[10]) or 0) == 0 then
+      S.emptyN = S.emptyN or {}
+      if not S.emptyN[hh] then S.emptyN[hh] = true; log("host squad %d (%s, %s) has no men: nothing made here", hh, w[5], w[6]) end
+      lh = -1
+    end
+    -- (lane 48, round 3) a new camp's brigands: the camp and the game's own squad of it (E.campAt), not a squad
+    -- of its own beside the one the camp's making brings (m2, t7: that one stood 0.6-1.4 km away for 4.4 s)
+    if not lh and w[6] == "B" and C.events and C.events.campAt then
+      local cx, cy, cz; for i = 12, #w do local a, b, c = (w[i] or ""):match("^camp=(%-?%d+),(%-?%d+),(%-?%d+)$"); if a then cx, cy, cz = tonumber(a), tonumber(b), tonumber(c) end end
+      if cx then
+        local okC, hc, why = pcall(C.events.campAt, S, cx * 10.0, cy * 10.0, cz, tonumber(w[7]), tonumber(w[8]), tonumber(w[9]), owner)   -- the camp at the dm the host's camp list names
+        if okC and hc then lh = hc; how = "camp and its squad"; S.campSq = S.campSq or {}; S.campSq[hc] = true; log("%s", tostring(why))
+        else log("host squad %d holds a new camp: not made with it here (%s)", hh, tostring(okC and why or hc)) end
+      end
+    end
+    if not lh then
+      lh = S.eng:spawnCompleteUnit(FName(w[5]), { X = tonumber(w[7]), Y = tonumber(w[8]), Z = tonumber(w[9]) }, { Pitch = 0.0, Yaw = 0.0, Roll = 0.0 }, owner, 0, 0).Value
+      how = "squad"
+    end
+    if lh == -1 or not lh or lh == 0 then
+    else
+    S.modSquadT = os.clock()                             -- the speed watcher: a speed change right now is the game's answer, not the player's
+    S.h2l[hh] = lh; S.l2h[lh] = hh; S.pawnsT = 0; S.stats.created = (S.stats.created or 0) + 1
+    S.madeHere = S.madeHere or {}; S.madeHere[lh] = true      -- (lane 48) made by this copy: never a host number's own
+    -- (lane 48) the camp's squad was made at the place the game rolled and its men were put at the host's: its
+    -- target place goes there too, or they would walk back (the mirror takes over from the host's next state)
+    if how == "camp and its squad" then pcall(function() touch(lh); moveOrder(lh, { X = tonumber(w[7]), Y = tonumber(w[8]), Z = tonumber(w[9]) }) end) end
+    -- (lane 52, round 3, second helper: holding its men where they were put until the host's first line was tried and
+    -- taken out. q9: they still ran 5.8 m towards the place the game had rolled for half a second, held or not; q10:
+    -- the move order above let them go again, they were held at the put places once more and stood 7 to 8 m behind
+    -- the host's squad for 2.5 s while it walked to its camp)
+    -- a squad made from a repeated announcement is an older squad of the host's that may have lost men: its
+    -- head count follows the host's from the start (the mirror's rule for a squad that has matched once)
+    if again then S.mir[lh] = { t = os.clock(), pt = 0, matched = true }; S.stats.madeAgain = (S.stats.madeAgain or 0) + 1 end
+    log("created %s for host %d as local %d (%s, %s)%s", how, hh, lh, w[5], w[6], again and ": this copy did not have it after loading alone" or "")
+    end
+  end
+end
+
+-- (lane 76) NEW SQUADS OF ONE HOST TICK ARE MADE IN ONE TICK HERE. The host announces the squads it made in one tick
+-- as N lines in a row, before the state line (S) of the same look. A friend used to make each squad as its line was
+-- read: session l76i, a rival army of four squads announced within 6 ms was made at +0, +53, +65 and +85 ms across two
+-- of this copy's ticks, and for one frame the lord had 18 soldiers here where the host had 126 (a count the host never
+-- had). Now N lines wait in S.pendN and are made together:
+--   * when the host's next line that is not N arrives (the state line follows the N lines of one look). A line about
+--     soldiers of another squad (D, G, MT) lets them wait on; one that names a waiting squad makes them first;
+--   * or 0.15 s after the first one waited (cfg.newHold), whatever comes first.
+-- Order is kept: the waiting squads are made before the line that ends the wait is handled. A wait that began in
+-- another world, or ends while a join holds this copy, is dropped (the join brings the host's squads).
+-- C.nBatch = false: every squad at its own line, as before.
+local function flushNew(S, sc, why)
+  local Q = S.pendN; if not Q then return end
+  S.pendN = nil
+  if Q.world ~= S.worlds or C.hold then log("%d new squad line(s) of the host dropped: %s", #Q, C.hold and "a join holds this copy" or "another world"); return end
+  for _, w in ipairs(Q) do
+    local ok, e = pcall(makeSquad, S, sc, w)
+    if not ok then countErr(S, "makeSquad", e) end
+  end
+  S.stats.newBatches = (S.stats.newBatches or 0) + 1
+  if #Q > 1 then log("%d new squads of the host made in one tick (%s, the first waited %.0f ms)", #Q, why, (os.clock() - Q.t) * 1000) end
+end
+C.flushNew = flushNew
+
 local function friendInbox()
   local S = C.s; local sc = S.sc
   local lines, ends = recv("host")
   for i, line in ipairs(lines) do
     local w = words(line); local kind = w[3]
+    -- (lane 76) new squads that wait are made before the first line that is not about them (see flushNew)
+    if S.pendN and kind ~= "N" and not ((kind == "D" or kind == "G" or kind == "MT") and not S.pendN.set[tonumber(w[4]) or -1]) then
+      flushNew(S, sc, "before the host's " .. tostring(kind) .. " line")
+    end
     S.lineEnd = ends[i]                                -- (join) where this line ends in the host's file as this copy has it
     -- (lane 44) the host's goodbye (BYE) and "loading" (HL) count in every state, also during a join (coop_session.lua)
     if (kind == "BYE" or kind == "HL") and C.session then pcall(C.session.line, S, w) end
@@ -2419,87 +2602,17 @@ local function friendInbox()
       local h = toLocal(tonumber(w[4])); if C.men and C.men.squadGone then pcall(C.men.squadGone, h) end   -- (lane 43)
       if sqValid(h) then removeSafe(h, "gone on the host") end
     elseif kind == "N" then       -- N <host number> <unit type> <owner> <x> <y> <z> <count>: a squad was created on the host
-      local hh = tonumber(w[4])
-      -- (join) "R" at the end: the host names every squad again after a friend loaded alone (C.announceAll). A copy
-      -- that has the squad makes nothing: the host's number is tied to a local squad, or a local squad carries the
-      -- host's own number, is tied to no other host squad and is of the same unit type (both have it from one save).
-      local again = false
-      if hh and w[12] == "R" then
-        local have = S.h2l[hh] ~= nil
-        if not have and sqValid(hh) and not S.l2h[hh] then
-          local okT, typ = pcall(function() return sc:GetSquad({ Value = hh }).unitType:ToString() end)
-          have = okT and typ == w[5]
-        end
-        if have then hh = nil else again = true end
-      end
-      if hh and not again and not S.h2l[hh] and w[11] and w[11] ~= "-" then
-        local who, mineH = w[11]:match("^([^:]+):(%d+)$"); mineH = tonumber(mineH)
-        if who == S.name and mineH and sqValid(mineH) then
-          S.h2l[hh] = mineH; S.l2h[mineH] = hh
-          log("the unit this player raised (%d) is unit %d on the host", mineH, hh)
-        end
-      end
-      if hh and not S.h2l[hh] then
-        local owner = S.p1
-        if w[6] == "B" then for _, pw in ipairs(pawns()) do if valid(pw) and pw.isBandit then owner = pw end end
-        elseif w[6]:sub(1, 1) == "A" then local pw = S.eng:getPawnBySetupIndex(tonumber(w[6]:sub(2)) or -1); if valid(pw) then owner = pw end end
-        local lh, how
-        -- The player's own new militia unit (army panel, "+"): on the host it starts empty and fills when rallied. Make
-        -- it here the same way, with the game's own call, so it is a real militia unit of this town's families and not
-        -- a ready-made stand-in (session 19: the stand-in had 32 soldiers against the host's 0).
-        -- The same for a RIVAL lord's new militia unit (2026-11-12, two runs of the test save, day 368: the host's
-        -- "spearMilitia A2" had 0 soldiers, the ready-made stand-in here 32, a militia unit is never trimmed, and the
-        -- daily comparison asked for a resync: soldiersA2:0/32). Only when that lord's own pawn was found here.
-        local milOwner = (w[6] == "P") and S.p1 or ((w[6]:sub(1, 1) == "A" and valid(owner) and owner ~= S.p1) and owner or nil)
-        if milOwner and w[5]:find("Militia") and (tonumber(w[10]) or 0) == 0 then
-          local before = {}
-          local arr = milOwner.commandedSquads; for i = 1, #arr do before[arr[i].Value] = true end
-          pcall(function() milOwner:addMilitiaSquad(milOwner:getClosestOwnedRegion(), FName(w[5])) end)
-          arr = milOwner.commandedSquads; for i = 1, #arr do local v = arr[i].Value; if v ~= 0 and not before[v] then lh = v; how = "militia unit" end end
-        end
-        -- (lane 32) An empty squad that is not a militia unit (seen: the player's retinue_tier1 made on the host, 0 men,
-        -- when the player won a settled region in battle) is not made here as a full ready-made squad: the stand-in had
-        -- 36 men against the host's 0 and the daily comparison asked for a resync (soldiersP 45/81, sitting s6).
-        if not lh and (tonumber(w[10]) or 0) == 0 then
-          S.emptyN = S.emptyN or {}
-          if not S.emptyN[hh] then S.emptyN[hh] = true; log("host squad %d (%s, %s) has no men: nothing made here", hh, w[5], w[6]) end
-          lh = -1
-        end
-        -- (lane 48, round 3) a new camp's brigands: the camp and the game's own squad of it (E.campAt), not a squad
-        -- of its own beside the one the camp's making brings (m2, t7: that one stood 0.6-1.4 km away for 4.4 s)
-        if not lh and w[6] == "B" and C.events and C.events.campAt then
-          local cx, cy, cz; for i = 12, #w do local a, b, c = (w[i] or ""):match("^camp=(%-?%d+),(%-?%d+),(%-?%d+)$"); if a then cx, cy, cz = tonumber(a), tonumber(b), tonumber(c) end end
-          if cx then
-            local okC, hc, why = pcall(C.events.campAt, S, cx * 10.0, cy * 10.0, cz, tonumber(w[7]), tonumber(w[8]), tonumber(w[9]), owner)   -- the camp at the dm the host's camp list names
-            if okC and hc then lh = hc; how = "camp and its squad"; S.campSq = S.campSq or {}; S.campSq[hc] = true; log("%s", tostring(why))
-            else log("host squad %d holds a new camp: not made with it here (%s)", hh, tostring(okC and why or hc)) end
-          end
-        end
-        if not lh then
-          lh = S.eng:spawnCompleteUnit(FName(w[5]), { X = tonumber(w[7]), Y = tonumber(w[8]), Z = tonumber(w[9]) }, { Pitch = 0.0, Yaw = 0.0, Roll = 0.0 }, owner, 0, 0).Value
-          how = "squad"
-        end
-        if lh == -1 or not lh or lh == 0 then
-        else
-        S.modSquadT = os.clock()                             -- the speed watcher: a speed change right now is the game's answer, not the player's
-        S.h2l[hh] = lh; S.l2h[lh] = hh; S.pawnsT = 0; S.stats.created = (S.stats.created or 0) + 1
-        S.madeHere = S.madeHere or {}; S.madeHere[lh] = true      -- (lane 48) made by this copy: never a host number's own
-        -- (lane 48) the camp's squad was made at the place the game rolled and its men were put at the host's: its
-        -- target place goes there too, or they would walk back (the mirror takes over from the host's next state)
-        if how == "camp and its squad" then pcall(function() touch(lh); moveOrder(lh, { X = tonumber(w[7]), Y = tonumber(w[8]), Z = tonumber(w[9]) }) end) end
-        -- (lane 52, round 3, second helper: holding its men where they were put until the host's first line was tried and
-        -- taken out. q9: they still ran 5.8 m towards the place the game had rolled for half a second, held or not; q10:
-        -- the move order above let them go again, they were held at the put places once more and stood 7 to 8 m behind
-        -- the host's squad for 2.5 s while it walked to its camp)
-        -- a squad made from a repeated announcement is an older squad of the host's that may have lost men: its
-        -- head count follows the host's from the start (the mirror's rule for a squad that has matched once)
-        if again then S.mir[lh] = { t = os.clock(), pt = 0, matched = true }; S.stats.madeAgain = (S.stats.madeAgain or 0) + 1 end
-        log("created %s for host %d as local %d (%s, %s)%s", how, hh, lh, w[5], w[6], again and ": this copy did not have it after loading alone" or "")
-        end
+      if C.nBatch == false then makeSquad(S, sc, w)
+      else
+        local Q = S.pendN
+        if not Q then Q = { t = os.clock(), world = S.worlds, set = {} }; S.pendN = Q end
+        Q[#Q + 1] = w; local hh = tonumber(w[4]); if hh then Q.set[hh] = true end
       end
     elseif kind then C.dispatch("host", w, line) end
   end
+  if S.pendN and (os.clock() - S.pendN.t >= (S.cfg.newHold or 0.15) or S.pendN.world ~= S.worlds or C.hold) then flushNew(S, sc, "no other line came") end
 end
+C.friendInboxFn = friendInbox    -- (lane 76) for the desk test
 
 -- friend's copy never decides a fight: enemy lords' decisions off, nobody can hurt anybody
 local function friendUpkeep()

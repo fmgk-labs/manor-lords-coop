@@ -509,6 +509,9 @@ local function friendGrow(S, clock)
   -- demolishes a house, and the town module's DEMOLISH must not find the family still there (fin2: homeless for a
   -- moment while this copy's day was a moment behind). The lines are taken in order: places refer to the host's list.
   local function waits(ev)
+    -- A replayed birth already happened after the save. With FAMROLL on there is
+    -- likewise no local birth to wait for. friendGrowOne checks the actual family size.
+    if ev.replayed or (C.values and C.values.frOn) then return false end
     if ev.kind == "X" then return false end
     if ev.kind == "M" then
       local more = true
@@ -1244,7 +1247,7 @@ function M.onMessage(S, from, kind, w, line)
       local rk, day, kind, place = w[5], tonumber(w[6]), w[7], math.tointeger(tonumber(w[8]) or 0.5)
       if place and place < 1 then place = nil end        -- (lane 55) a place in the game's family list: 1 or more, whole
       if rk and day and place and (kind == "F" or kind == "M" or kind == "X") and P.on.grow then
-        local ev = { rk = rk, day = day, kind = kind, place = place, t = os.clock() }
+        local ev = { rk = rk, day = day, kind = kind, place = place, t = os.clock(), replayed = S.replay ~= nil }
         if kind == "M" then ev.n = tonumber(w[9]) or 0; ev.home = w[10] or "-" else ev.home = w[9] or "-" end
         P.gq = P.gq or {}; P.gq[#P.gq + 1] = ev; bump("g_got")
         -- (lane 64) the events module keeps the host's homes, the newest word first: this line is one

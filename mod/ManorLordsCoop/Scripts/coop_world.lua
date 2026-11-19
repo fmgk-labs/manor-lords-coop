@@ -125,6 +125,12 @@ local DEFAULT_CFG = {
   wideLogMax = 12,       -- wide sample: differences named per section line in the friend's log (the rest is counted)
   wideKeep = 60,         -- wide sample: days of summaries kept for Coop.world.wide()
   wideUnits = true,      -- wide sample: count the world's units per kind (false: section "un" stays empty)
+  -- (lane 76) the timing proof, a TEST TOOL (see Check.proofTick): off for players
+  proof = false,         -- keep dated reads of the rows players see: the host sends them when a friend names a field, a friend fills its own series
+  proofEvery = 0.25,     --   a round over every row starts this many seconds after the last one started
+  proofMs = 12,          --   and takes at most this many milliseconds of a tick
+  proofKeep = 20,        --   seconds of reads kept
+  proofSecs = "bl bs an cs rp rw li ap fa fc",   --   wide sections read (the fingerprint's parts are always read)
 }
 W.on = W.on or {}
 for k, v in pairs(DEFAULT_ON) do if W.on[k] == nil then W.on[k] = v end end
@@ -136,7 +142,9 @@ local DERIVF = { sf = "supplies_food", sw = "supplies_wood" }   -- (lane 45) one
 -- weather targets pushed once per day (lane_w W4f; all in dumps/TemporalComponent.txt): name, kind f/i/b
 local WX = { { "targetRaining", "f" }, { "targetSnowing", "f" }, { "targetCloudiness", "f" }, { "windTarget", "f" },
              { "snowTarget", "f" }, { "droughtLevel", "f" }, { "rainMeter", "i" }, { "daysWithoutRainVariation", "i" },
-             { "isDrought", "b" }, { "enableThunderstorm", "b" } }
+             { "isDrought", "b" }, { "enableThunderstorm", "b" },
+             { "Season", "i" }, { "isWinter", "b" }, { "wind", "f" }, { "snowLevel", "f" }, { "snowing", "f" },
+             { "raining", "f" }, { "wetness", "f" }, { "cloudiness", "f" }, { "rainfall", "f" }, { "snowfall", "f" }, { "fogLevel", "f" }, { "month", "i" } }
 
 -- ---------------------------------------------------------------- small helpers
 local un, valid = A.un, A.valid
@@ -402,7 +410,8 @@ local function fresh(S)
   W.fr = { reg = {}, lord = {}, bld = {}, bdirty = {}, firePend = {}, hostFires = {}, ownFire = {}, ownOut = {}, hadHostFire = {}, dirty = false,
            hold = {}, holdGen = {}, holdDirty = false }
   -- the wide sample (log only): the sample being taken, the host's lines, both copies' samples, what the host last sent
-  W.wd = { run = nil, posts = {}, inb = {}, host = {}, mine = {}, sent = {}, serial = (W.wd and W.wd.serial) or 0, tickN = 0 }
+  W.fpLater = nil
+  W.wd = { watches = {}, batches = {}, samples = {}, fpSamples = {}, details = {}, early = {}, objects = {}, run = nil, posts = {}, inb = {}, host = {}, mine = {}, sent = {}, serial = (W.wd and W.wd.serial) or 0, tickN = 0 }
   log("reset for world %d (%s)", S.worlds, session and "new session" or "world loaded")
 end
 
@@ -423,18 +432,99 @@ end
 -- and named by the region's tag. It used to be read for "the owned region nearest to this copy's camera": with two
 -- owned regions and two players looking at different towns, the copies compared different regions and asked for a
 -- resync every two game days (lane 3). Region ids are not used either: they differ per copy and per load.
+local Check = {}  -- read-only three-second follow-ups, shared by the fingerprint and wide checks
 local FP_ORDER = { "D", "B", "C", "F", "O", "W", "M", "N", "R", "S", "Q" }
 local function fpEncode(P) local t = {}; for _, s in ipairs(FP_ORDER) do t[#t + 1] = s .. (P[s] or "-") end; return table.concat(t, " ") end
 local function fpDecode(w, from) local P = {}; for i = from, #w do local s = w[i]; P[s:sub(1, 1)] = s:sub(2) end; return P end
 local function sec(P, tag, fn) local ok, v = pcall(fn); P[tag] = ok and tostring(v) or "ERR" end
 
+local function fpSoldiers(S)
+  if not valid(S.sc) then return "ERR" end
+  local sum = {}
+  for _, pw in ipairs(A.pawns()) do
+    if valid(pw) then
+      local code = ownerCode(pw); local arr = pw.commandedSquads
+      for i = 1, #arr do
+        local h = arr[i].Value
+        if h and h ~= 0 and S.sc:IsValidSquad({ Value = h }) then
+          local fleeing = false
+          pcall(function() fleeing = S.sc:GetSquad({ Value = h }).Control == 3 end)          -- 3 = Fleeing
+          if not fleeing and S.role == "friend" and S.mir and S.mir[h] and S.mir[h].routed then fleeing = true end
+          if not fleeing then sum[code] = (sum[code] or 0) + S.sc:GetUnitCount({ Value = h }) end
+        end
+      end
+    end
+  end
+  local t = {}; for code, n in pairs(sum) do if n > 0 then t[#t + 1] = code .. "=" .. n end end
+  table.sort(t); return table.concat(t, ",")
+end
+
+local function fpOwners(eng, P)
+  local t, arr = {}, eng.regions
+  for i = 1, #arr do
+    local r = un(arr[i])
+    if valid(r) then
+      local k, owner = W.rkey(r), ownerCode(r.ownerPawn)
+      t[#t + 1] = k .. "=" .. owner
+      P.detail.O[k] = owner
+    end
+  end
+  table.sort(t); return string.format("%x", H(table.concat(t, ",")))
+end
+
+local function fpBuilding(st, b)
+  -- The pile a demolished or moved building leaves behind (type 88, "supply_dump") is not compared: each copy's own
+  -- carriers empty it at their own pace, so one copy still has it when the other does not. Seen in session 21: after
+  -- a demolish at speed 4 the pile stayed on one copy for days and forced a resync. Its goods are stock, which the
+  -- stock rules already keep equal.
+  local dump = false; if valid(b) then pcall(function() dump = b:GetType() == 88 end) end
+  if valid(b) and not dump and mine(b.ownerPawn) then
+    local ok, e = pcall(function()
+      local k = W.bkey(b); local built = b:IsConstructed()
+      local lv, workers, residents = b.lv, b:getNumActiveWorkerFamilies(), b:getNumResidingFamilies()
+      local fire, sleep = b.onFire, b.sleep
+      st.B[#st.B + 1] = k .. (built and "B" or "u") .. lv .. "w" .. workers .. "r" .. residents .. (fire and "F" or "") .. (sleep and "S" or "")
+      local P = st.P
+      P.detail.B[k] = P.detail.B[k] and "?" or table.concat({ built and 1 or 0, lv, workers, residents, fire and 1 or 0, sleep and 1 or 0 }, "|")
+      P.at.rows[k] = Check.clock(W.S)
+      -- A building being upgraded (storehouse, granary, house level) keeps working: its inventory is its normal
+      -- stock, which each copy's own carriers move, not construction deliveries. Comparing it forced a resync
+      -- every two days for as long as the upgrade lasted (session 21). Only fresh sites are compared here; the
+      -- end of an upgrade comes from the host through the sites rule.
+      local upgrading = false; pcall(function() upgrading = b.isBeingUpgraded and true or false end)
+      if W.on.bstock and not built and not upgrading then
+        local g = {}; for t, a in pairs(invOf(b)) do g[#g + 1] = t .. ":" .. a end
+        table.sort(g); local inventory = table.concat(g, ","); st.C[#st.C + 1] = k .. "=" .. inventory
+        P.detail.C[k] = P.detail.C[k] and "?" or (inventory ~= "" and inventory or "0")
+      end
+    end)
+    if not ok then if st.B then st.B[#st.B + 1] = "ERR" end; st.err = tostring(e) end
+  end
+end
+
+-- one owned region's three parts of the fingerprint (families, numbers, stock), each "<tag>:<body>" or "<tag>:ERR".
+-- Shared by the day sample and the timing proof (Check.proof), so both read a region the same way.
+local function fpRegionWords(S, r, k)
+  local okF, f = pcall(function()
+    return k .. ":" .. #r.workerFamilies .. "/" .. r:getNumHomelessFamilies() .. "/" .. r:getNumTotalPopulation() .. "/L" .. r.settlementLevel
+      .. "/" .. r:getNumFamiliesOfLv(1) .. "," .. r:getNumFamiliesOfLv(2) .. "," .. r:getNumFamiliesOfLv(3) .. "," .. r:getNumFamiliesOfLv(4)
+  end)
+  local okR, x = pcall(function() return string.format("%s:%d/%d/%d", k, r.regionalWealth, r.Approval, r.publicOrder) end)
+  local okS, s = pcall(function()
+    local t = {}
+    for _, g in ipairs(goods(S)) do local v = r:getStockOfGood(g, false, false); if v ~= 0 then t[#t + 1] = g .. "=" .. v end end
+    return k .. ":" .. table.concat(t, ",")
+  end)
+  return okF and f or (k .. ":ERR"), okR and x or (k .. ":ERR"), okS and s or (k .. ":ERR")
+end
+
 local function fpJob(st)
   local S = W.S; local eng = S.eng
   if not st.P then                                   -- step 1: calendar, weather, merchants, lord numbers, home stock
-    local P = {}; st.P = P; st.B = {}; st.C = {}; st.i = 0
+    local P = { at = { rows = {} }, detail = { B = {}, C = {}, O = {} } }; st.P = P; st.B = {}; st.C = {}; st.i = 0
     st.day = eng:getDaysTotal(); P.D = tostring(st.day)
     local T = eng.TemporalComponent
-    sec(P, "W", function() return string.format("%d,%d,%d,%d,%d,%d", T.Season, T.month, T.rainMeter, T.isDrought and 1 or 0, T.isWinter and 1 or 0, T.daysWithoutRainVariation) end)
+    sec(P, "W", function() if not valid(T) then return "ERR" end; return string.format("%d,%d,%d,%d,%d,%d", T.Season, T.month, T.rainMeter, T.isDrought and 1 or 0, T.isWinter and 1 or 0, T.daysWithoutRainVariation) end)
     sec(P, "M", function() return string.format("%d,%d", #eng.freeMerchants, #eng.livestockMerchants) end)
     -- N: the lord's own numbers (treasury, influence, king's favour)
     sec(P, "N", function() return string.format("%d,%d,%d", S.p1.silver, S.p1.influence, S.p1.kingsFavour) end)
@@ -444,25 +534,8 @@ local function fpJob(st)
     -- A squad that is routing is counted on neither copy: on the host it drops out of its lord's list while it
     -- flees, on a friend's copy it stays in the list (the rout is the game's own there, or imitated), so a rout
     -- that lasted over two day checks looked like drift (lane 4: 36 against 45) and cost a resync.
-    sec(P, "Q", function()
-      local sum = {}
-      for _, pw in ipairs(A.pawns()) do
-        if valid(pw) then
-          local code = ownerCode(pw); local arr = pw.commandedSquads
-          for i = 1, #arr do
-            local h = arr[i].Value
-            if h and h ~= 0 and S.sc:IsValidSquad({ Value = h }) then
-              local fleeing = false
-              pcall(function() fleeing = S.sc:GetSquad({ Value = h }).Control == 3 end)          -- 3 = Fleeing
-              if not fleeing and S.role == "friend" and S.mir and S.mir[h] and S.mir[h].routed then fleeing = true end
-              if not fleeing then sum[code] = (sum[code] or 0) + S.sc:GetUnitCount({ Value = h }) end
-            end
-          end
-        end
-      end
-      local t = {}; for code, n in pairs(sum) do if n > 0 then t[#t + 1] = code .. "=" .. n end end
-      table.sort(t); return table.concat(t, ",")
-    end)
+    sec(P, "Q", function() return fpSoldiers(S) end)
+    P.at.world = Check.clock(S)
     st.regs = {}; st.ri = 0; st.F = {}; st.R = {}; st.S = {}
     local arr = eng.regions
     for i = 1, #arr do local r = un(arr[i]); if valid(r) and mine(r.ownerPawn) then st.regs[#st.regs + 1] = r end end
@@ -474,19 +547,8 @@ local function fpJob(st)
     if r then
       if valid(r) then
         local k = W.rkey(r)
-        local okF, f = pcall(function()
-          return k .. ":" .. #r.workerFamilies .. "/" .. r:getNumHomelessFamilies() .. "/" .. r:getNumTotalPopulation() .. "/L" .. r.settlementLevel
-            .. "/" .. r:getNumFamiliesOfLv(1) .. "," .. r:getNumFamiliesOfLv(2) .. "," .. r:getNumFamiliesOfLv(3) .. "," .. r:getNumFamiliesOfLv(4)
-        end)
-        st.F[#st.F + 1] = okF and f or (k .. ":ERR")
-        local okR, x = pcall(function() return string.format("%s:%d/%d/%d", k, r.regionalWealth, r.Approval, r.publicOrder) end)
-        st.R[#st.R + 1] = okR and x or (k .. ":ERR")
-        local okS, s = pcall(function()
-          local t = {}
-          for _, g in ipairs(goods(S)) do local v = r:getStockOfGood(g, false, false); if v ~= 0 then t[#t + 1] = g .. "=" .. v end end
-          return k .. ":" .. table.concat(t, ",")
-        end)
-        st.S[#st.S + 1] = okS and s or (k .. ":ERR")
+        st.P.at[k] = Check.clock(S)
+        st.F[#st.F + 1], st.R[#st.R + 1], st.S[#st.S + 1] = fpRegionWords(S, r, k)
       end
       return false
     end
@@ -496,38 +558,15 @@ local function fpJob(st)
     P.F = (table.concat(st.F, "|"):gsub("%s", "_"))  -- readable on purpose: when it differs the log shows what (session 20)
     P.R = #st.R > 0 and table.concat(st.R, "|") or "-"
     P.S = #st.S > 0 and table.concat(st.S, "|") or "-"
-    sec(P, "O", function()
-      local t, arr = {}, eng.regions
-      for i = 1, #arr do local r = un(arr[i]); if valid(r) then t[#t + 1] = W.rkey(r) .. "=" .. ownerCode(r.ownerPawn) end end
-      table.sort(t); return string.format("%x", H(table.concat(t, ",")))
-    end)
+    sec(P, "O", function() return fpOwners(eng, P) end)
+    P.at.O = Check.clock(S)
     return false
   end
   local arr = eng.buildingArr                         -- then one building per step
   st.i = st.i + 1
   if st.i <= #arr then
     local b = un(arr[st.i])
-    -- The pile a demolished or moved building leaves behind (type 88, "supply_dump") is not compared: each copy's own
-    -- carriers empty it at their own pace, so one copy still has it when the other does not. Seen in session 21: after
-    -- a demolish at speed 4 the pile stayed on one copy for days and forced a resync. Its goods are stock, which the
-    -- stock rules already keep equal.
-    local dump = false; if valid(b) then pcall(function() dump = b:GetType() == 88 end) end
-    if valid(b) and not dump and mine(b.ownerPawn) then
-      local ok, e = pcall(function()
-        local k = W.bkey(b); local built = b:IsConstructed()
-        st.B[#st.B + 1] = k .. (built and "B" or "u") .. b.lv .. "w" .. b:getNumActiveWorkerFamilies() .. "r" .. b:getNumResidingFamilies() .. (b.onFire and "F" or "") .. (b.sleep and "S" or "")
-        -- A building being upgraded (storehouse, granary, house level) keeps working: its inventory is its normal
-        -- stock, which each copy's own carriers move, not construction deliveries. Comparing it forced a resync
-        -- every two days for as long as the upgrade lasted (session 21). Only fresh sites are compared here; the
-        -- end of an upgrade comes from the host through the sites rule.
-        local upgrading = false; pcall(function() upgrading = b.isBeingUpgraded and true or false end)
-        if W.on.bstock and not built and not upgrading then
-          local g = {}; for t, a in pairs(invOf(b)) do g[#g + 1] = t .. ":" .. a end
-          table.sort(g); st.C[#st.C + 1] = k .. "=" .. table.concat(g, ",")
-        end
-      end)
-      if not ok then st.B[#st.B + 1] = "ERR"; st.err = tostring(e) end
-    end
+    fpBuilding(st, b)
     return false
   end
   -- (lane 63, test switch, console on a friend only: Coop.fpSkew = true) a lasting difference that no load can fix:
@@ -539,6 +578,7 @@ local function fpJob(st)
   -- a differing "B" can be read line by line from the two logs
   if rawget(C, "fpLog") then log("FPB day %s %s %s", tostring(st.day), st.P.B, table.concat(st.B, " ")) end
   st.P.C = W.on.bstock and string.format("%x/%d", H(table.concat(st.C, "|")), #st.C) or "-"
+  st.P.at.buildings = Check.clock(S)
   if st.done then st.done(st.day, st.P) end
   return true
 end
@@ -637,6 +677,7 @@ local function tryCompare(S, day)
   W.fp.host[day] = nil; W.fp.mine[day] = nil
   for d in pairs(W.fp.host) do if d < day - 3 then W.fp.host[d] = nil end end
   for d in pairs(W.fp.mine) do if d < day - 3 then W.fp.mine[d] = nil end end
+  if W.on.wide then Check.fingerprint(day, a, b) end
   judgeFp(S, day, a, b, false)
 end
 -- (lane 71) a pair whose families part waits for the host's growth of the day (see below): judged again later
@@ -650,9 +691,16 @@ function W.fpLaterStep(S)
       local b2 = {}; for k, v in pairs(x.b) do b2[k] = v end
       local okF, f = pcall(W.famNow, S, x.a.F); if okF and f and x.a.F then b2.F = f end
       local okR, rr = pcall(W.regNow, S, x.a.R); if okR and rr and x.a.R then b2.R = rr end
-      local before = table.concat(W.compareFp(x.a, x.b), " ")
+      local was = W.compareFp(x.a, x.b)
+      local before = table.concat(was, " ")
       local after = W.compareFp(x.a, b2)
-      if #after == 0 then bump("w_fpTimingOk"); log("fingerprint day %d: %s at the sample, the host's 2 s later (the host's word came after the sample): not a difference", x.day, before) end
+      if #after == 0 then bump("w_fpTimingOk"); log("fingerprint day %d: %s at the sample, the host's 2 s later (the host's word came after the sample): not a difference", x.day, before)
+      else
+        -- (lane 76) a timing part beside another part: say which timing parts were the host's 2 s later
+        local left = {}; for _, y in ipairs(after) do left[y] = true end
+        local t = {}; for _, y in ipairs(was) do if W.onlyTiming({ y }) and not left[y] then t[#t + 1] = y end end
+        if #t > 0 then bump("w_fpTimingOk"); log("fingerprint day %d: %s at the sample, the host's 2 s later (the host's word came after the sample): not a difference; the rest is judged as it was sampled", x.day, table.concat(t, " ")) end
+      end
       judgeFp(S, x.day, x.a, b2, true)
     end
   end
@@ -662,6 +710,13 @@ function W.onlyTiming(bad)
   if #bad == 0 then return false end
   for _, x in ipairs(bad) do if x ~= "F" and not tostring(x):find("^wealth@") then return false end end
   return true
+end
+-- (lane 76) a day with a timing part among its differences (session l76i, days 364 and 395: "W wealth@hof:259/253":
+-- the weather part differed too, so the wealth was not taken again and stood in the log as a difference; the friend
+-- had the host's 259 0.7 s after its sample)
+function W.anyTiming(bad)
+  for _, x in ipairs(bad) do if W.onlyTiming({ x }) then return true end end
+  return false
 end
 -- (lane 71) the region part of the fingerprint as it is now, for the regions the host's part names (same text as the
 -- sample's step 2 builds: wealth / approval / public order)
@@ -691,9 +746,11 @@ judgeFp = function(S, day, a, b, again)
   --             51: "waits like a total", up to a second). So this copy's sample at its own day change holds the
   --             wealth of before the host's day (every lane's checks: wealth@hof 99/93, 428/412, 545/539, 233/227: the
   --             host a day's net income ahead; lane 74: two days in a row, a repair).
-  -- A day whose only differences are such parts is judged once more 2 s later, with those two parts of this copy taken
-  -- again then (W.famNow, W.regNow); every other part keeps its sample.
-  if #bad > 0 and not again and W.onlyTiming(bad) then
+  -- A day that has such a part among its differences is judged once more 2 s later, with those two parts of this copy
+  -- taken again then (W.famNow, W.regNow); every other part keeps its sample. (lane 76: also when another part
+  -- differs beside it; before, only when nothing else differed. The 3 s check of each field, Check.fingerprint, has
+  -- already been started from the samples themselves and is not touched by this.)
+  if #bad > 0 and not again and W.anyTiming(bad) then
     W.fpLater = W.fpLater or {}; W.fpLater[#W.fpLater + 1] = { day = day, a = a, b = b, t = os.clock() + 2.0 }
     bump("w_fpTimingWait"); return
   end
@@ -884,62 +941,87 @@ local function wo(o, n, P)                                                      
   local ok2, k = pcall(W.bkey, x); return ok2 and k or "?"
 end
 
-local function wideWorld(P, S)
+local function wideWorld(P, S, only)
+  if not (valid(S.eng) and valid(S.p1)) then error("world or lord is gone") end
   local eng = S.eng; local T = eng.TemporalComponent
-  local d = "-"; pcall(function() local D = eng.questDirector; if valid(D) then d = wFmt(D.scenario_nextActionDay) end end)
-  P.sc.TIME = wv(T, "daysUntilNextRaid") .. "|" .. wv(T, "daysSinceLastRaid") .. "|" .. wv(T, "lastBanditCampSpawnedDay") .. "|" .. wv(T, "damagingRain") .. "|" .. d
-  local t = {}; for i, f in ipairs(WIDE_BY.wx[2]) do t[i] = wv(T, f) end
-  P.wx.TIME = table.concat(t, "|")
-  t = {}; for i, f in ipairs(WIDE_BY.en[2]) do t[i] = (i <= WIDE_ENLEN) and wl(eng, f) or wv(eng, f) end
-  P.en.ENGINE = table.concat(t, "|")
-  t = {}; for i, f in ipairs(WIDE_BY.lo[2]) do t[i] = (i >= WIDE_LOLEN) and wl(S.p1, f) or wv(S.p1, f) end
-  P.lo.LORD = table.concat(t, "|")
-  -- (lane 71) Resource actors per class, deposits, deer lairs: a difference here is a work area that holds other things
-  pcall(function()
-    local cls = {}
-    for _, r in ipairs(FindAllOf("Resource") or {}) do
-      if valid(r) then
-        local okN, n = pcall(function() return r:GetClass():GetFName():ToString() end)
-        n = (okN and type(n) == "string") and n:gsub("[%s;|]", "_") or "?"
-        cls[n] = (cls[n] or 0) + 1
+  if not valid(T) then error("world clock is gone") end
+  local t
+  if not only or only == "sc" then
+    local d = "-"; pcall(function() local D = eng.questDirector; if valid(D) then d = wFmt(D.scenario_nextActionDay) end end)
+    P.sc.TIME = wv(T, "daysUntilNextRaid") .. "|" .. wv(T, "daysSinceLastRaid") .. "|" .. wv(T, "lastBanditCampSpawnedDay") .. "|" .. wv(T, "damagingRain") .. "|" .. d
+  end
+  if not only or only == "wx" then
+    t = {}; for i, f in ipairs(WIDE_BY.wx[2]) do t[i] = wv(T, f) end
+    P.wx.TIME = table.concat(t, "|")
+  end
+  if not only or only == "en" then
+    t = {}; for i, f in ipairs(WIDE_BY.en[2]) do t[i] = (i <= WIDE_ENLEN) and wl(eng, f) or wv(eng, f) end
+    P.en.ENGINE = table.concat(t, "|")
+  end
+  if not only or only == "lo" then
+    t = {}; for i, f in ipairs(WIDE_BY.lo[2]) do t[i] = (i >= WIDE_LOLEN) and wl(S.p1, f) or wv(S.p1, f) end
+    P.lo.LORD = table.concat(t, "|")
+  end
+  if not only or only == "rr" then
+    -- (lane 71) Resource actors per class, deposits, deer lairs: a difference here is a work area that holds other things
+    pcall(function()
+      local cls = {}
+      for _, r in ipairs(FindAllOf("Resource") or {}) do
+        if valid(r) then
+          local okN, n = pcall(function() local c = r:GetClass(); if valid(c) then return c:GetFName():ToString() end end)
+          n = (okN and type(n) == "string") and n:gsub("[%s;|]", "_") or "?"
+          cls[n] = (cls[n] or 0) + 1
+        end
       end
-    end
-    for n, c in pairs(cls) do P.rr[n] = tostring(c) end
-  end)
-  P.rr.deposits = wl(eng, "deposits")
-  pcall(function() P.rr.lairs = tostring(#eng:getDeerLairLocations()) end)
-  local X = rawget(C, "stats"); if X and X.wideWorld then pcall(X.wideWorld, P, S) end      -- lane 72: sections mk, uv
+      for n, c in pairs(cls) do P.rr[n] = tostring(c) end
+    end)
+    P.rr.deposits = wl(eng, "deposits")
+    pcall(function() P.rr.lairs = tostring(#eng:getDeerLairLocations()) end)
+  end
+  local X = rawget(C, "stats"); if (not only or only == "mk" or only == "uv") and X and X.wideWorld then pcall(X.wideWorld, P, S) end      -- lane 72: sections mk, uv
+  Check.note(P, "world")
 end
 
-local function wideRegion(P, r)
+local function wideRegion(P, r, only)
   local k = W.rkey(r); local own = ownerCode(r.ownerPawn)
-  local name = "?"; pcall(function() name = r.regionName:ToString() end)
-  P.ro[k] = wFmt(name) .. "|" .. own .. "|" .. wv(r, "isSettled") .. "|" .. wv(r, "settlementLevel") .. "|" .. wv(r, "tier")
+  if not only or only == "ro" then
+    local name = "?"; pcall(function() name = r.regionName:ToString() end)
+    P.ro[k] = wFmt(name) .. "|" .. own .. "|" .. wv(r, "isSettled") .. "|" .. wv(r, "settlementLevel") .. "|" .. wv(r, "tier")
+  end
   local town = own ~= "-" and own ~= "X"            -- the region's own counting functions are called for a lord's region only
-  local pop, homeless = "-", "-"
-  if town then pcall(function() pop = wFmt(r:getNumTotalPopulation()); homeless = wFmt(r:getNumHomelessFamilies()) end) end
-  P.rp[k] = wl(r, "workerFamilies") .. "|" .. wl(r, "residents") .. "|" .. pop .. "|" .. homeless .. "|" .. wl(r, "corpses") .. "|" .. wl(r, "squadsPresent")
-  -- approval's inputs as the game sums them: <factor type>[p = past]:<effect>, one per row of summedApprovalFactors
-  local fac = "-"
-  local okF = pcall(function()
-    local arr = r.summedApprovalFactors; local t = {}
-    for i = 1, #arr do local m = arr[i]; t[#t + 1] = string.format("%d%s:%d", m.Type, m.past and "p" or "", math.floor(m.effectByPopulation + 0.5)) end
-    table.sort(t); if #t > 0 then fac = table.concat(t, ",") end
-  end)
-  if not okF then fac = "?" end
-  P.ap[k] = wv(r, "Approval") .. "|" .. wv(r, "publicOrder") .. "|" .. wl(r, "summedApprovalFactors") .. "|" .. fac .. "|" .. wl(r, "summedPublicOrderFactors") .. "|" .. wl(r, "problems")
-  P.rw[k] = wv(r, "regionalWealth") .. "|" .. wv(r, "supplies_food") .. "|" .. wv(r, "supplies_wood") .. "|" .. wv(r, "expenses") .. "|" .. wv(r, "marketAtt") .. "|" .. wv(r, "nextLivestockOrderIn")
-  local land, tithe = "-", "-"
-  if town then pcall(function() land = wFmt(r:getTaxRate(FName("land"))); tithe = wFmt(r:getTaxRate(FName("tithe"))) end) end
-  P.rs[k] = land .. "|" .. tithe .. "|" .. wl(r, "policies") .. "|" .. wl(r, "policiesSigned") .. "|" .. wl(r, "Tech") .. "|" .. wl(r, "tradeRules") .. "|" .. wl(r, "targetInventory")
-    .. "|" .. wl(r, "tradePartnerLimits") .. "|" .. wl(r, "forbidGlobalTradeGoodTypes") .. "|" .. wl(r, "tradeRouteMerchants") .. "|" .. wl(r, "overstockedGoods")
-    .. "|" .. wv(r, "autoBuyCommodities") .. "|" .. wv(r, "claimCost") .. "|" .. wl(r, "tradeRouteLevels")
-  if town then
+  if not only or only == "rp" then
+    local pop, homeless = "-", "-"
+    if town then pcall(function() pop = wFmt(r:getNumTotalPopulation()); homeless = wFmt(r:getNumHomelessFamilies()) end) end
+    P.rp[k] = wl(r, "workerFamilies") .. "|" .. wl(r, "residents") .. "|" .. pop .. "|" .. homeless .. "|" .. wl(r, "corpses") .. "|" .. wl(r, "squadsPresent")
+  end
+  if not only or only == "ap" then
+    -- approval's inputs as the game sums them: <factor type>[p = past]:<effect>, one per row of summedApprovalFactors
+    local fac = "-"
+    local okF = pcall(function()
+      local arr = r.summedApprovalFactors; local t = {}
+      for i = 1, #arr do local m = arr[i]; t[#t + 1] = string.format("%d%s:%d", m.Type, m.past and "p" or "", math.floor(m.effectByPopulation + 0.5)) end
+      table.sort(t); if #t > 0 then fac = table.concat(t, ",") end
+    end)
+    if not okF then fac = "?" end
+    P.ap[k] = wv(r, "Approval") .. "|" .. wv(r, "publicOrder") .. "|" .. wl(r, "summedApprovalFactors") .. "|" .. fac .. "|" .. wl(r, "summedPublicOrderFactors") .. "|" .. wl(r, "problems")
+  end
+  if not only or only == "rw" then
+    P.rw[k] = wv(r, "regionalWealth") .. "|" .. wv(r, "supplies_food") .. "|" .. wv(r, "supplies_wood") .. "|" .. wv(r, "expenses") .. "|" .. wv(r, "marketAtt") .. "|" .. wv(r, "nextLivestockOrderIn")
+  end
+  if not only or only == "rs" then
+    local land, tithe = "-", "-"
+    if town then pcall(function() land = wFmt(r:getTaxRate(FName("land"))); tithe = wFmt(r:getTaxRate(FName("tithe"))) end) end
+    P.rs[k] = land .. "|" .. tithe .. "|" .. wl(r, "policies") .. "|" .. wl(r, "policiesSigned") .. "|" .. wl(r, "Tech") .. "|" .. wl(r, "tradeRules") .. "|" .. wl(r, "targetInventory")
+      .. "|" .. wl(r, "tradePartnerLimits") .. "|" .. wl(r, "forbidGlobalTradeGoodTypes") .. "|" .. wl(r, "tradeRouteMerchants") .. "|" .. wl(r, "overstockedGoods")
+      .. "|" .. wv(r, "autoBuyCommodities") .. "|" .. wv(r, "claimCost") .. "|" .. wl(r, "tradeRouteLevels")
+  end
+  if town and (not only or only == "li") then
     local t = { "?" }; pcall(function() t[1] = wFmt(r:getTotalLivestockCount()) end)
     for i, role in ipairs(WIDE_LIVE) do t[i + 1] = "?"; pcall(function() t[i + 1] = wFmt(r:GetTotalLivestockCountOfType(role)) end) end
     local s = table.concat(t, "|"); if s ~= WIDE_BY.li.zero then P.li[k] = s end
   end
-  local X = rawget(C, "stats"); if X and X.wideRegion then pcall(X.wideRegion, P, r, k) end     -- lane 72: section mk
+  local X = rawget(C, "stats"); if (not only or only == "mk") and X and X.wideRegion then pcall(X.wideRegion, P, r, k) end     -- lane 72: section mk
+  Check.note(P, "region", k)
 end
 
 -- a family is its place in the region's list (the realm module keeps the lists equal); its people are not touched
@@ -950,66 +1032,91 @@ local function wideFamily(P, k, F, i)
   if ok and cs ~= nil then
     P.fc[key] = wv(cs, "hunger") .. "|" .. wv(cs, "cold") .. "|" .. wv(cs, "ale") .. "|" .. wv(cs, "garments") .. "|" .. wv(cs, "footwear") .. "|" .. wv(cs, "sickness") .. "|" .. wv(cs, "injured")
   else P.fc[key] = "?|?|?|?|?|?|?" end
+  Check.note(P, "family", key)
 end
 
-local function wideBuilding(P, b)
+local function wideBuilding(P, b, only)
   local k = W.bkey(b)
   if P.bl[k] then P.dup = P.dup + 1; k = k .. "#" .. P.dup end        -- two buildings of one type on one spot
   local ba = addr(b); if ba then P.keyOf[ba] = k end                  -- for the families' homes and workplaces
   local op = b.ownerPawn; local oa = valid(op) and addr(op) or 0      -- a lord's code is worked out once per sample
   local own = P.own[oa]; if own == nil then own = ownerCode(op); P.own[oa] = own end
-  local okB, built = pcall(gBuilt, b)
-  P.bl[k] = own .. "|" .. ((okB and built) and "1" or "0") .. "|" .. wv(b, "lv") .. "|" .. wv(b, "onFire") .. "|" .. wv(b, "sleep")
-  P.bw[k] = wv(b, "numActiveWorkerFamilies") .. "|" .. wl(b, "assignedFamilyIDs") .. "|" .. wl(b, "occupantFamilyIDs") .. "|" .. wv(b, "buildPriority") .. "|" .. wv(b, "secondaryPriority")
-    .. "|" .. wv(b, "stockFuelFor") .. "|" .. wl(b, "upgradesDone") .. "|" .. wl(b, "Extensions") .. "|" .. wv(b, "artisanJob") .. "|" .. wv(b, "isBeingUpgraded")
-    .. "|" .. wl(b, "constructionGoods")
-  local goodsStr = "-"
-  if own == "P" then                                                   -- what each good is, for the player's buildings
-    local okI, m = pcall(invOf, b)
-    if okI then
-      local g = {}; for t, a in pairs(m) do if a ~= 0 then g[#g + 1] = string.format("%d:%d", t, a) end end
-      table.sort(g); goodsStr = #g > 0 and table.concat(g, ",") or "0"
-    else goodsStr = "?" end
+  local okB, built, s
+  if not only or only == "bl" or only == "cs" then okB, built = pcall(gBuilt, b) end
+  if not only or only == "bl" then
+    P.bl[k] = own .. "|" .. ((okB and built) and "1" or "0") .. "|" .. wv(b, "lv") .. "|" .. wv(b, "onFire") .. "|" .. wv(b, "sleep")
   end
-  P.bs[k] = wv(b, "numStoredGeneric") .. "|" .. wv(b, "numStoredLarge") .. "|" .. wv(b, "numStoredPantry") .. "|" .. wl(b, "Inventory") .. "|" .. goodsStr
-  local s = wv(b, "refuelDay") .. "|" .. wv(b, "refueled") .. "|" .. wv(b, "needsRefueling") .. "|" .. wv(b, "waterSupply") .. "|" .. wv(b, "marketDaysLeft") .. "|" .. wv(b, "mourningPeriod")
-  if s ~= WIDE_BY.hv.zero then P.hv[k] = s end
-  s = wl(b, "animals") .. "|" .. wl(b, "animalsOnPasture") .. "|" .. wl(b, "oxen") .. "|" .. wv(b, "activeOxen") .. "|" .. wl(b, "Carts")
-  if s ~= WIDE_BY.an.zero then P.an[k] = s end
-  P.bd[k] = wl(b, "buildings") .. "|" .. wl(b, "Resources") .. "|" .. wl(b, "distributedGoods") .. "|" .. wl(b, "roadDecals") .. "|" .. wl(b, "additionalWorkPositions") .. "|" .. wp(b, "snappedToRoad")
-    .. "|" .. wl(b, "freeStallTransforms")
-  P.bx[k] = wv(b, "allowMarketStalls") .. "|" .. wv(b, "supplyOverstocking") .. "|" .. wv(b, "workAreaLimited") .. "|" .. wv(b, "workAreaRange") .. "|" .. wv(b, "sellingType")
-    .. "|" .. wv(b, "muleTrain_buyingType") .. "|" .. wv(b, "muleTrain_sellingType") .. "|" .. wv(b, "allowLabourers") .. "|" .. wv(b, "targetSquadSize")
-    .. "|" .. wl(b, "storageFilter") .. "|" .. wl(b, "TargetStock") .. "|" .. wl(b, "customBuildingFlags") .. "|" .. wl(b, "recruits") .. "|" .. wl(b, "blueprints") .. "|" .. wl(b, "walls")
-  s = wv(b, "bRotateCrops") .. "|" .. wv(b, "fieldOperationMode") .. "|" .. wv(b, "forceHarvest") .. "|" .. wv(b, "field_ploughingPerc") .. "|" .. wv(b, "field_sowingPerc")
-    .. "|" .. wv(b, "field_growingPerc") .. "|" .. wv(b, "field_harvestingPerc") .. "|" .. wv(b, "field_numReadyToHarvest") .. "|" .. wv(b, "field_numUnplowed")
-    .. "|" .. wv(b, "field_numSown") .. "|" .. wv(b, "yield") .. "|" .. wv(b, "plannedHarvest_PredictedYield")
-  if s ~= WIDE_FD_BASE then                                            -- (lane 71) planned days, crop of the next years, workers
-    P.fd[k] = s .. "|" .. wv(b, "plannedHarvest_DaysLeft") .. "|" .. wv(b, "cropType2") .. "|" .. wv(b, "cropType3") .. "|" .. wv(b, "fieldWorkersNeeded")
+  if not only or only == "bw" then
+    P.bw[k] = wv(b, "numActiveWorkerFamilies") .. "|" .. wl(b, "assignedFamilyIDs") .. "|" .. wl(b, "occupantFamilyIDs") .. "|" .. wv(b, "buildPriority") .. "|" .. wv(b, "secondaryPriority")
+      .. "|" .. wv(b, "stockFuelFor") .. "|" .. wl(b, "upgradesDone") .. "|" .. wl(b, "Extensions") .. "|" .. wv(b, "artisanJob") .. "|" .. wv(b, "isBeingUpgraded")
+      .. "|" .. wl(b, "constructionGoods")
   end
-  -- (lane 71) a site's bar (the game's own getConstructionProgress, only on a site) and a ruin
-  local okR, raw = pcall(function() return b:GetType() end)
-  local ruin = (okR and raw == 75) and "1" or "0"
-  if (okB and built == false) or ruin == "1" then
-    local pr = "-"
-    if okB and built == false then local okP, v = pcall(function() return b:getConstructionProgress() end); pr = okP and wFmt(v) or "?" end
-    s = pr .. "|" .. ruin
-    if s ~= WIDE_BY.cs.zero then P.cs[k] = s end
+  if not only or only == "bs" then
+    local goodsStr = "-"
+    if own == "P" then                                                   -- what each good is, for the player's buildings
+      local okI, m = pcall(invOf, b)
+      if okI then
+        local g = {}; for t, a in pairs(m) do if a ~= 0 then g[#g + 1] = string.format("%d:%d", t, a) end end
+        table.sort(g); goodsStr = #g > 0 and table.concat(g, ",") or "0"
+      else goodsStr = "?" end
+    end
+    P.bs[k] = wv(b, "numStoredGeneric") .. "|" .. wv(b, "numStoredLarge") .. "|" .. wv(b, "numStoredPantry") .. "|" .. wl(b, "Inventory") .. "|" .. goodsStr
   end
-  local okm, mc = pcall(gField, b, "MaintenanceComponent")
-  if okm and mc and valid(mc) then
-    local st, sl, nd = "?", "?", "?"
-    pcall(function() st = wFmt(mc:GetMaintenanceStatus()) end)
-    pcall(function() sl = wFmt(mc:GetSliderValue()) end)
-    pcall(function() nd = wFmt(mc:DoesBuildingNeedMaintaining()) end)
-    local M = rawget(C, "maint"); local trk = (M and M.trkOf) and M.trkOf(k) or "-"
-    P.mt[k] = st .. "|" .. sl .. "|" .. nd .. "|" .. trk
+  if not only or only == "hv" then
+    s = wv(b, "refuelDay") .. "|" .. wv(b, "refueled") .. "|" .. wv(b, "needsRefueling") .. "|" .. wv(b, "waterSupply") .. "|" .. wv(b, "marketDaysLeft") .. "|" .. wv(b, "mourningPeriod")
+    if s ~= WIDE_BY.hv.zero then P.hv[k] = s end
   end
-  local X = rawget(C, "stats"); if X and X.wideBuilding then pcall(X.wideBuilding, P, b, k) end -- lane 72: sections pt, ex
+  if not only or only == "an" then
+    s = wl(b, "animals") .. "|" .. wl(b, "animalsOnPasture") .. "|" .. wl(b, "oxen") .. "|" .. wv(b, "activeOxen") .. "|" .. wl(b, "Carts")
+    if s ~= WIDE_BY.an.zero then P.an[k] = s end
+  end
+  if not only or only == "bd" then
+    P.bd[k] = wl(b, "buildings") .. "|" .. wl(b, "Resources") .. "|" .. wl(b, "distributedGoods") .. "|" .. wl(b, "roadDecals") .. "|" .. wl(b, "additionalWorkPositions") .. "|" .. wp(b, "snappedToRoad")
+      .. "|" .. wl(b, "freeStallTransforms")
+  end
+  if not only or only == "bx" then
+    P.bx[k] = wv(b, "allowMarketStalls") .. "|" .. wv(b, "supplyOverstocking") .. "|" .. wv(b, "workAreaLimited") .. "|" .. wv(b, "workAreaRange") .. "|" .. wv(b, "sellingType")
+      .. "|" .. wv(b, "muleTrain_buyingType") .. "|" .. wv(b, "muleTrain_sellingType") .. "|" .. wv(b, "allowLabourers") .. "|" .. wv(b, "targetSquadSize")
+      .. "|" .. wl(b, "storageFilter") .. "|" .. wl(b, "TargetStock") .. "|" .. wl(b, "customBuildingFlags") .. "|" .. wl(b, "recruits") .. "|" .. wl(b, "blueprints") .. "|" .. wl(b, "walls")
+  end
+  if not only or only == "fd" then
+    s = wv(b, "bRotateCrops") .. "|" .. wv(b, "fieldOperationMode") .. "|" .. wv(b, "forceHarvest") .. "|" .. wv(b, "field_ploughingPerc") .. "|" .. wv(b, "field_sowingPerc")
+      .. "|" .. wv(b, "field_growingPerc") .. "|" .. wv(b, "field_harvestingPerc") .. "|" .. wv(b, "field_numReadyToHarvest") .. "|" .. wv(b, "field_numUnplowed")
+      .. "|" .. wv(b, "field_numSown") .. "|" .. wv(b, "yield") .. "|" .. wv(b, "plannedHarvest_PredictedYield")
+    if s ~= WIDE_FD_BASE then                                            -- (lane 71) planned days, crop of the next years, workers
+      P.fd[k] = s .. "|" .. wv(b, "plannedHarvest_DaysLeft") .. "|" .. wv(b, "cropType2") .. "|" .. wv(b, "cropType3") .. "|" .. wv(b, "fieldWorkersNeeded")
+    end
+  end
+  if not only or only == "cs" then
+    -- (lane 71) a site's bar (the game's own getConstructionProgress, only on a site) and a ruin
+    local okR, raw = pcall(function() return b:GetType() end)
+    local ruin = (okR and raw == 75) and "1" or "0"
+    if (okB and built == false) or ruin == "1" then
+      local pr = "-"
+      if okB and built == false then local okP, v = pcall(function() return b:getConstructionProgress() end); pr = okP and wFmt(v) or "?" end
+      s = pr .. "|" .. ruin
+      if s ~= WIDE_BY.cs.zero then P.cs[k] = s end
+    end
+  end
+  if not only or only == "mt" then
+    local okm, mc = pcall(gField, b, "MaintenanceComponent")
+    if okm and mc and valid(mc) then
+      local st, sl, nd = "?", "?", "?"
+      pcall(function() st = wFmt(mc:GetMaintenanceStatus()) end)
+      pcall(function() sl = wFmt(mc:GetSliderValue()) end)
+      pcall(function() nd = wFmt(mc:DoesBuildingNeedMaintaining()) end)
+      local M = rawget(C, "maint"); local trk = (M and M.trkOf) and M.trkOf(k) or "-"
+      P.mt[k] = st .. "|" .. sl .. "|" .. nd .. "|" .. trk
+    end
+  end
+  local X = rawget(C, "stats"); if (not only or only == "pt" or only == "ex") and X and X.wideBuilding then pcall(X.wideBuilding, P, b, k) end -- lane 72: sections pt, ex
+  if P.tag then W.wd.objects[k] = b end
+  Check.note(P, "building", k)
 end
 
 local function wideNew(tag, day, done)
-  local P = { dup = 0, unc = {}, keyOf = {}, own = {} }
+  local P = { times = {}, dup = 0, unc = {}, keyOf = {}, own = {} }
+  if tag ~= "bench" then P.tag = tostring(tag) end
   for _, s in ipairs(WIDE) do P[s[1]] = {} end
   return { tag = tag, day = day, done = done, P = P, phase = 1, i = 0, ri = 0, fi = 0, ms = 0, ticks = 0, t0 = os.clock() }
 end
@@ -1037,7 +1144,7 @@ local function wideStep(S, st)
       -- a region's families are read into a list of their own and taken over when the region is done: a family is
       -- its place in the list, so when the list grew or shrank while it was read (over several ticks) the region is
       -- read again, once
-      if st.fi == 0 then st.fcnt = cnt; st.ft = { fa = {}, fc = {}, keyOf = P.keyOf } end
+      if st.fi == 0 then st.fcnt = cnt; st.ft = { fa = {}, fc = {}, keyOf = P.keyOf, tag = P.tag, times = P.times } end
       while st.fi < cnt and n < 4 do st.fi = st.fi + 1; n = n + 1; wideFamily(st.ft, k, fams[st.fi], st.fi) end
       if st.fi >= cnt then
         if cnt ~= st.fcnt and st.fredo ~= st.ri then st.fredo = st.ri; st.fi = 0; bump("w_wideRedo"); return end
@@ -1089,16 +1196,22 @@ local function wideStep(S, st)
     return 1
   end
   for rk, c in pairs(P.unc) do P.un["role" .. rk] = string.format("%d", c) end
+  Check.note(P, "units")
   return nil
 end
 
 local function wideFinish(st)
-  local smp = { tag = st.tag, day = st.day, sec = {}, ms = st.ms, ticks = st.ticks, span = os.clock() - st.t0, n = 0, err = st.P.err }
+  local smp = { tag = st.tag, day = st.day, sec = {}, times = st.P.times, ms = st.ms, ticks = st.ticks, span = os.clock() - st.t0, n = 0, err = st.P.err }
   for _, s in ipairs(WIDE) do local m = st.P[s[1]]; smp.sec[s[1]] = m; for _ in pairs(m) do smp.n = smp.n + #s[2] end end
   if smp.err and W.lastWideErr ~= smp.err then W.lastWideErr = smp.err; log("wide %s: a read failed: %s", tostring(st.tag), smp.err) end
   if st.redo or st.uredo or st.fredo then
     log("wide %s: a list changed while it was read; read again (buildings %d times%s%s)%s", tostring(st.tag), st.redo or 0, st.uredo and ", units" or "",
       st.fredo and ", families" or "", st.P.unstable and ": the building list did not hold still, a building may be named wrongly today" or "")
+  end
+  smp.finish = Check.clock(W.S)
+  if st.P.tag then
+    if W.S.role == "host" then Check.remember(W.wd.samples, tostring(smp.tag), smp)
+    else Check.absent(smp) end
   end
   if st.done then st.done(smp) end
   return smp
@@ -1123,6 +1236,9 @@ end
 -- (session 2 of lane 9: at speed 4 and under 10 frames a second six of 48 days were left out at the fixed pace).
 local function wideStart(S, tag, day, done)
   local D = W.wd
+  local clock = os.clock()
+  if D.lastDayTime then D.daySeconds = clock - D.lastDayTime end
+  D.lastDayTime = clock
   local tpd = D.dayTick and (D.tickN - D.dayTick) or nil; D.dayTick = D.tickN
   -- the shorter of the last two days: ticks go on while the game is paused, so one day can look far longer than it is
   if tpd and D.tpdLast and D.tpdLast < tpd then tpd, D.tpdLast = D.tpdLast, tpd else D.tpdLast = tpd end
@@ -1209,15 +1325,16 @@ end
 -- friend: one section of the host's sample against this copy's, by key.
 -- Returns { n = differences, nP = of them on the player's own, held, max = largest gap, sum = all gaps, onlyH, onlyF,
 --           items = { k, f, h, m, d, mark, o = owner } }.
-local function wideCompareSec(spec, Hs, Ms)
+local function wideCompareSec(spec, Hs, Ms, onlyKey)
   local sec, fields = spec[1], spec[2]
   local a, b = Hs.sec[sec] or {}, Ms.sec[sec] or {}
   local R = { n = 0, nP = 0, held = 0, max = 0, sum = 0, onlyH = 0, onlyF = 0, items = {} }
   local function item(key, field, hv, mv)
     local mark = wideMark(sec, field, hv, mv)
     local x, y = tonumber(hv), tonumber(mv); local d = (x and y) and (y - x) or nil
-    -- weather numbers are compared to one decimal: 0.94 and 0.96 are written 0.9 and 1 and are not a difference
-    if sec == "wx" and d and math.abs(d) < 0.15 then return end
+    -- Preserve the old wide count. The timed check also examines adjacent
+    -- displayed tenths, just as it examines all other marked differences.
+    if sec == "wx" and d and math.abs(d) < 0.15 then mark = "roundStep" end
     local own = wideOwner(sec, key, Hs, Ms)
     R.items[#R.items + 1] = { k = key, f = field, h = hv, m = mv, d = d, mark = mark, o = own }
     if mark then R.held = R.held + 1; return end
@@ -1239,7 +1356,7 @@ local function wideCompareSec(spec, Hs, Ms)
           for g, n in pairs(tp) do if tq[g] ~= n then item(key, "t" .. g, n, tq[g] or "absent") end end
           for g, n in pairs(tq) do if tp[g] == nil then item(key, "t" .. g, "absent", n) end end
           if next(tp) == nil and next(tq) == nil then item(key, f, p, q) end
-        elseif f == "goods" then                           -- per good: g<type> host/here
+        elseif f == "goods" and p ~= "?" and q ~= "?" and p ~= "-" and q ~= "-" then
           local gp, gq = {}, {}
           for g, n in p:gmatch("(%d+):(%-?%d+)") do gp[g] = n end
           for g, n in q:gmatch("(%d+):(%-?%d+)") do gq[g] = n end
@@ -1249,16 +1366,18 @@ local function wideCompareSec(spec, Hs, Ms)
       end
     end
   end
-  for k, hv in pairs(a) do
-    local mv = b[k]
+  local function compareKey(k, hv, mv)
+    if hv == mv then return end
+    if hv == nil then
+      if spec.zero then entry(k, spec.zero, mv) else R.onlyF = R.onlyF + 1; item(k, "*", "absent", mv) end
+      return
+    end
     if mv == nil and spec.zero then mv = spec.zero end
     if mv == nil then R.onlyH = R.onlyH + 1; item(k, "*", hv, "absent") elseif mv ~= hv then entry(k, hv, mv) end
   end
-  for k, mv in pairs(b) do
-    if a[k] == nil then
-      if spec.zero then entry(k, spec.zero, mv) else R.onlyF = R.onlyF + 1; item(k, "*", "absent", mv) end
-    end
-  end
+  if onlyKey then compareKey(onlyKey, a[onlyKey], b[onlyKey]); return R end
+  for k, hv in pairs(a) do compareKey(k, hv, b[k]) end
+  for k, mv in pairs(b) do if a[k] == nil then compareKey(k, nil, mv) end end
   -- The order in the log line, where cfg.wideLogMax cuts: first what stands on one copy only, then the player's own,
   -- then the rest; within each the largest gap first (a difference that is not a number, such as another workplace,
   -- before any number); then by key and field, so that the order is the same every day.
@@ -1275,6 +1394,835 @@ local function wideCompareSec(spec, Hs, Ms)
   return R
 end
 
+-- The daily scans are spread over frames. Keep the time of the actual field read, and
+-- open a short, read-only watch as soon as that row differs. The host samples just the
+-- requested fields. Neither receiving a watch nor receiving its answer can write game state.
+do
+local groups = {
+  building = { "bl", "bw", "bs", "hv", "an", "bd", "bx", "fd", "cs", "mt", "pt", "ex" },
+  region = { "ro", "rp", "ap", "rw", "li", "rs", "mk" }, family = { "fa", "fc" },
+  world = { "sc", "wx", "en", "lo", "rr", "mk", "uv" }, units = { "un" }
+}
+local function groupOf(s, k)
+  if s == "mk" and (k == "FMS" or k == "BASE") then return "world" end
+  local kind = WIDE_KIND[s]
+  return kind == "b" and "building" or kind == "r" and "region" or kind == "f" and "family" or s == "un" and "units" or "world"
+end
+function Check.clock(S)
+  if S.role == "friend" and C.steam and C.steam.on then
+    if not (C.men and C.men.hostClock) then return nil end
+    local t, known = C.men.hostClock()
+    if known then return t end
+    return nil
+  end
+  return A.now()
+end
+function Check.remember(store, tag, sample)
+  store.order = store.order or {}
+  if not store[tag] then store.order[#store.order + 1] = tag end
+  store[tag] = sample
+  if #store.order > 8 then store[table.remove(store.order, 1)] = nil end
+end
+local function part(row, index)
+  local i = 0
+  for v in (row .. "|"):gmatch("([^|]*)|") do i = i + 1; if i == index then return v end end
+end
+local function fieldValue(s, f, row)
+  local spec = WIDE_BY[s]
+  row = row or spec.zero
+  if not row then return "absent" end
+  if f == "*" then return row end
+  local good = s == "bs" and f:match("^g(%d+)$")
+  local tracker = s == "mt" and f:match("^t([%d+]+)$")
+  for i, name in ipairs(spec[2]) do
+    if name == f then return part(row, i) end
+    if (good and name == "goods") or (tracker and name == "trk") then
+      local word = part(row, i)
+      if not word or word == "?" then return "?" end
+      for key, amt in word:gmatch(good and "(%d+):(%-?%d+)" or "([%d+]+)=(%-?%d+)") do
+        if key == (good or tracker) then return amt end
+      end
+      return good and "0" or "absent"
+    end
+  end
+end
+local weather = { "Season", "month", "rainMeter", "isDrought", "isWinter", "daysWithoutRainVariation" }
+local lord = { "silver", "influence", "kingsFavour" }
+local region = { "regionalWealth", "Approval", "publicOrder" }
+local bfields = { "built", "lv", "workers", "residents", "fire", "sleep" }
+local function detailValue(s, row, f)
+  if row == "?" then return "?" end
+  if f == "present" then return row and "1" or "0" end
+  if not row then return "absent" end
+  if s == "O" then return row end
+  if s == "B" then for i, field in ipairs(bfields) do if field == f then return part(row, i) end end end
+  for g, v in row:gmatch("(%d+):(%-?%d+)") do if "g" .. g == f then return v end end
+  return "0"
+end
+local function fingerprintFields(s, word)
+  local rows = {}
+  if s == "Q" then
+    for k, v in word:gmatch("([%w%-]+)=(%d+)") do rows[k] = v end
+  elseif s == "F" or s == "R" or s == "S" then
+    for k, body in word:gmatch("([^|:]+):([^|]*)") do
+      if s == "S" then
+        for g, v in body:gmatch("(%d+)=(%-?%d+)") do rows[k .. ":" .. g] = v end
+      else
+        local n = 0
+        for v in body:gmatch("[^/,]+") do n = n + 1; rows[k .. ":" .. n] = v end
+      end
+    end
+  elseif s == "W" or s == "M" or s == "N" then
+    local n = 0
+    for v in word:gmatch("[^,]+") do n = n + 1; rows[tostring(n)] = v end
+  else rows.value = word end
+  return rows
+end
+local function fpTime(P, s, k)
+  if not P.at then return nil end
+  if s == "B" or s == "C" then return P.at.buildings end
+  if s == "O" then return P.at.O end
+  return P.at[k:match("^([^:]+):") or "world"]
+end
+local findBuilding
+local function fpRead(S, s, k, f, memo)
+  local e, i = S.eng, tonumber(k)
+  if s == "W" then local t = e.TemporalComponent; if valid(t) and weather[i] then return wv(t, weather[i]) end
+  elseif s == "N" then if valid(S.p1) and lord[i] then return wv(S.p1, lord[i]) end
+  elseif s == "M" then if i == 1 or i == 2 then return wl(e, i == 1 and "freeMerchants" or "livestockMerchants") end
+  elseif s == "D" then return e:getDaysTotal()
+  elseif s == "Q" then
+    if not memo.Q then local word = fpSoldiers(S); if word == "ERR" then return "?" end; memo.Q = fingerprintFields(s, word) end
+    return memo.Q[k] or "0"
+  elseif s == "O" then
+    local r = W.regionByKey(k)
+    return detailValue(s, valid(r) and ownerCode(r.ownerPawn) or nil, f)
+  elseif s == "B" or s == "C" then
+    local b = findBuilding(S, k, memo)
+    if not valid(b) or b:GetType() == 88 or not mine(b.ownerPawn) then return detailValue(s, nil, f) end
+    if s == "C" and (b:IsConstructed() or b.isBeingUpgraded or not W.on.bstock) then return detailValue(s, nil, f) end
+    if f == "present" then return "1" end
+    if s == "C" then return invOf(b)[tonumber(f:match("^g(%d+)$"))] or 0 end
+    if f == "built" then return b:IsConstructed() and "1" or "0"
+    elseif f == "lv" then return b.lv elseif f == "workers" then return b:getNumActiveWorkerFamilies()
+    elseif f == "residents" then return b:getNumResidingFamilies()
+    elseif f == "fire" then return b.onFire and "1" or "0" elseif f == "sleep" then return b.sleep and "1" or "0" end
+  else
+    local tag, col = k:match("^([^:]+):(%d+)$")
+    local r = tag and W.regionByKey(tag)
+    if not valid(r) or not mine(r.ownerPawn) then return "absent" end
+    col = tonumber(col)
+    if s == "S" then
+      for _, g in ipairs(goods(S)) do if g == col then return r:getStockOfGood(g, false, false) end end
+      return "?"
+    elseif s == "R" and region[col] then return wv(r, region[col])
+    elseif s == "F" then
+      if col == 1 then return #r.workerFamilies elseif col == 2 then return r:getNumHomelessFamilies()
+      elseif col == 3 then return r:getNumTotalPopulation() elseif col == 4 then return "L" .. r.settlementLevel
+      elseif col and col >= 5 and col <= 8 then return r:getNumFamiliesOfLv(col - 4) end
+    end
+  end
+  return "?"
+end
+findBuilding = function(S, k, memo)
+  local objects = W.wd.objects
+  local b = objects[k]
+  if valid(b) and W.bkey(b) == k then return b end
+  if not memo.buildings then
+    memo.buildings = {}; local arr = S.eng.buildingArr; local duplicates = 0
+    for i = 1, #arr do
+      local x = un(arr[i])
+      if valid(x) then
+        local key = W.bkey(x)
+        if memo.buildings[key] then duplicates = duplicates + 1; key = key .. "#" .. duplicates end
+        memo.buildings[key] = x
+      end
+    end
+    W.wd.objects = memo.buildings
+  end
+  return memo.buildings[k]
+end
+local function read(S, s, k, f, memo)
+  if not (valid(S.eng) and valid(S.p1)) then return "?" end
+  if not WIDE_BY[s] then return fpRead(S, s, k, f, memo) end
+  local group = groupOf(s, k)
+  local obj
+  if group == "building" then obj = findBuilding(S, k, memo)
+  elseif group == "region" then obj = W.regionByKey(k)
+  elseif group == "family" then
+    local tag, n = k:match("^(.-):F(%d+)$"); n = tonumber(n)
+    local r = tag and W.regionByKey(tag)
+    if valid(r) and n and n >= 1 and n <= #r.workerFamilies then obj = r.workerFamilies[n] end
+  end
+  if group == "building" or group == "region" then
+    if not valid(obj) then return fieldValue(s, f, nil) end
+  elseif group == "family" and not obj then return fieldValue(s, f, nil) end
+  -- Only schema fields get here. The common scalar and length reads need no row allocation.
+  if f ~= "*" then
+    if s == "wx" or (s == "sc" and f ~= "scenario_nextActionDay") then
+      local t = S.eng.TemporalComponent; if valid(t) then return wv(t, f) end; return "?"
+    elseif s == "an" then return f == "activeOxen" and wv(obj, f) or wl(obj, f)
+    elseif s == "bd" then return f == "snappedToRoad" and wp(obj, f) or wl(obj, f)
+    elseif s == "bs" then
+      local g = f:match("^g(%d+)$")
+      if g then return invOf(obj)[tonumber(g)] or 0 end
+      if f == "Inventory" then return wl(obj, f) elseif f ~= "goods" then return wv(obj, f) end
+    elseif s == "hv" then return wv(obj, f)
+    elseif s == "rw" then return (f == "expenses" or f == "marketAtt") and wl(obj, f) or wv(obj, f)
+    elseif s == "en" or s == "lo" then
+      local o = s == "en" and S.eng or S.p1
+      for i, name in ipairs(WIDE_BY[s][2]) do
+        if f == name then return ((s == "en" and i <= WIDE_ENLEN) or (s == "lo" and i >= WIDE_LOLEN)) and wl(o, f) or wv(o, f) end
+      end
+    end
+  end
+  -- A compound row or count uses the same reader as the first pass, once per object
+  -- in this tick. A role count must inspect the bounded unit list to count that role.
+  local mk = s .. "/" .. ((group == "world" or group == "units") and "" or k)
+  if not memo[mk] then
+    local P = { dup = 0, keyOf = {}, own = {} }
+    P[s] = {}; P.bl = P.bl or {}
+    if group == "building" then wideBuilding(P, obj, s); if k:find("#", 1, true) then P[s][k] = P[s][W.bkey(obj)] end
+    elseif group == "region" then wideRegion(P, obj, s)
+    elseif group == "family" then local tag, n = k:match("^(.-):F(%d+)$"); P.fa = P.fa or {}; P.fc = P.fc or {}; wideFamily(P, tag, obj, tonumber(n))
+    elseif group == "units" then
+      local arr = S.eng.unitArr
+      for i = 1, #arr do
+        local u = arr[i]; local role = "none"
+        if ptrOk(u) and valid(u) then role = wv(u, "currentUnitRole") end
+        local key = "role" .. role; P.un[key] = (P.un[key] or 0) + 1
+      end
+    elseif valid(S.eng.TemporalComponent) then wideWorld(P, S, s) else return "?" end
+    memo[mk] = P
+  end
+  local row = memo[mk][s][k]; return fieldValue(s, f, row and tostring(row))
+end
+local function descriptor(id)
+  local s, k, f = id:match("^([A-Za-z]+)~([%w@:,%.#_%-]+)~([%w%._+*]+)$")
+  if not s then return end
+  local spec = WIDE_BY[s]
+  if spec then
+    if f == "*" or (s == "bs" and f:match("^g%d+$")) or (s == "mt" and f:match("^t[%d+]+$")) then return s, k, f end
+    for _, name in ipairs(spec[2]) do if name == f then return s, k, f end end
+  elseif s == "B" or s == "C" or s == "O" then
+    if f == "present" or (s == "O" and f == "owner") or (s == "C" and f:match("^g%d+$")) then return s, k, f end
+    if s == "B" then for _, field in ipairs(bfields) do if field == f then return s, k, f end end end
+  elseif f == "value" then
+    for _, section in ipairs(FP_ORDER) do if s == section then return s, k, f end end
+  end
+end
+local function record(w, side, t, v)
+  if not t or v == nil then return end
+  v = tostring(v)
+  local a = w[side]; a[#a + 1] = { t = t, v = v }
+  if side == "host" and v ~= "?" and (not w.seen[v] or t < w.seen[v]) then w.seen[v] = t end
+end
+local weatherCol, fpCol = {}, {}
+for i, field in ipairs(WX) do weatherCol[field[1]] = i end
+for i, name in ipairs(weather) do fpCol[name] = tostring(i) end
+function Check.weatherWord(t, v)
+  local D = W.wd
+  if not t or not W.on.wide then return end
+  D.weatherWords = D.weatherWords or {}
+  local words = D.weatherWords
+  words[#words + 1] = { t = t, v = v }
+  while words[1] and t - words[1].t > 15 do table.remove(words, 1) end
+  for i, raw in ipairs(v) do
+    local field = WX[i]
+    if field then
+      local name = field[1]
+      local a = D.watches["wx~TIME~" .. name]
+      local b = fpCol[name] and D.watches["W~" .. fpCol[name] .. "~value"]
+      if a then record(a, "host", t, wFmt(raw)) end
+      if b then record(b, "host", t, wFmt(raw)) end
+    end
+  end
+end
+local function watch(s, k, f, tag)
+  local D = W.wd; local id = s .. "~" .. k .. "~" .. f; local w = D.watches[id]
+  if not w then
+    w = { s = s, k = k, f = f, host = {}, friend = {}, seen = {} }; D.watches[id] = w
+    local name = (s == "wx" and k == "TIME" and f) or (s == "W" and weather[tonumber(k)])
+    local col = name and weatherCol[name]
+    if col then for _, word in ipairs(D.weatherWords or {}) do
+      if word.v[col] ~= nil then record(w, "host", word.t, wFmt(word.v[col])) end
+    end end
+  end
+  if tag and w.tag ~= tag then
+    w.tag = tag; D.ask = D.ask or {}; D.ask[tag] = D.ask[tag] or {}; D.ask[tag][id] = true
+  end
+  -- A recurring fault needs the host's history from BEFORE the next day's
+  -- sample as well. Let a watch expire when the following day stops naming it.
+  local lease = math.max(4.5, math.min(90, (D.daySeconds or 0) + 4))
+  w.untilT = math.max(w.untilT or 0, os.clock() + lease)
+  return w
+end
+local function earlyPair(tag, s, k, hostRow, hereRow, ht, ft)
+  if hostRow == hereRow then return end
+  local host = { sec = { [s] = { [k] = hostRow } } }
+  local here = { sec = { [s] = { [k] = hereRow } } }
+  for _, x in ipairs(wideCompareSec(WIDE_BY[s], host, here, k).items) do
+    local w = watch(s, k, x.f, tag)
+    record(w, "friend", ft, x.m); record(w, "host", ht, x.h)
+  end
+end
+local function sampleTime(times, s, k)
+  local group = groupOf(s, k)
+  return times[group .. "/" .. ((group == "world" or group == "units") and "" or k)]
+end
+-- Both copies keep their original independent day scan. Preview changed host rows
+-- as each is read, so the slower of the two reads can open the watch that frame.
+-- The ordinary complete, serial-checked sample alone decides which rows count.
+function Check.note(P, group, k)
+  if not P.tag then return end
+  local D, S = W.wd, W.S
+  local t = Check.clock(S); P.times[group .. "/" .. (k or "")] = t
+  for _, s in ipairs(groups[group]) do
+    local map = P[s]
+    local base = (S.role == "host" and D.sent[s]) or (D.base and D.base[s])
+    local early = D.early[P.tag] and D.early[P.tag][s]
+    local paired = D.host[P.tag]
+    local function observe(key)
+      local row = map[key]
+      if S.role == "host" then
+        if t and row ~= (base and base[key]) then
+          D.preview = D.preview or {}; local head = "W PRE " .. P.tag .. string.format(" %.3f ", t)
+          D.preview[head] = D.preview[head] or {}
+          D.preview[head][#D.preview[head] + 1] = s .. "~" .. key .. "=" .. (row or "!")
+        end
+      elseif paired then earlyPair(P.tag, s, key, paired.sec[s][key], row, nil, t)
+      elseif early and early[key] then
+        local x = early[key]; earlyPair(P.tag, s, key, x.row, row, x.t, t)
+      elseif base then earlyPair(P.tag, s, key, base[key], row, nil, t) end
+    end
+    if k then observe(k) else
+      for key in pairs(map) do if groupOf(s, key) == group then observe(key) end end
+      for key in pairs(base or {}) do if groupOf(s, key) == group and not map[key] then observe(key) end end
+      for key in pairs(early or {}) do if groupOf(s, key) == group and not map[key] and not (base and base[key]) then observe(key) end end
+    end
+  end
+end
+function Check.absent(sample)
+  local D, tag = W.wd, tostring(sample.tag); local h = D.host[tag]
+  for _, spec in ipairs(WIDE) do
+    local s = spec[1]
+    local early = D.early[tag] and D.early[tag][s]
+    local base = h and h.sec[s] or (D.base and D.base[s]) or {}
+    local function absent(k)
+      local group = groupOf(s, k)
+      if (group == "building" or group == "region" or group == "family") and not sampleTime(sample.times, s, k) then
+        local x = early and early[k]
+        if h or not x then earlyPair(tag, s, k, base[k], nil, nil, sample.finish)
+        else earlyPair(tag, s, k, x.row, nil, x.t, sample.finish) end
+      end
+    end
+    for k in pairs(base) do absent(k) end
+    for k in pairs(early or {}) do if not base[k] then absent(k) end end
+  end
+end
+local function rowTime(sample, s, k)
+  return sampleTime(sample.times, s, k) or sample.finish
+end
+function Check.section(tag, s, items, sample)
+  if #items == 0 then return end
+  local batch = { tag = tag, s = s, items = {}, due = os.clock() }
+  for _, x in ipairs(items) do
+    local at = x.at or (sample and rowTime(sample, s, x.k))
+    local w = watch(s, x.k, x.f, tostring(tag))
+    record(w, "friend", at, x.m)
+    Check.proofFill(w, at)
+    batch.items[#batch.items + 1] = { w = w, at = at, initial = x.m, hostInitial = x.h }
+    -- Allow final host observations to travel. Classification uses their read stamps.
+    local now = Check.clock(W.S)
+    local remaining = now and at and math.max(0, math.min(3, at + 3 - now)) or 3
+    batch.due = math.max(batch.due, os.clock() + remaining + 1)
+  end
+  W.wd.batches[#W.wd.batches + 1] = batch
+  log("settle %s %s sample=%d", tostring(tag), s, #items)
+end
+function Check.fingerprint(day, a, b)
+  for _, s in ipairs(FP_ORDER) do
+    if (a[s] or ""):find("ERR", 1, true) or (b[s] or ""):find("ERR", 1, true) then
+      log("settle-invalid %s %s unreadable fingerprint", tostring(day), s)
+    elseif a[s] ~= b[s] and (s == "B" or s == "C" or s == "O") then
+      local tag = tostring(day)
+      W.wd.details[tag .. s] = { mine = b, host = {}, count = 0, since = os.clock() }
+      log("settle-detail %s %s requested", tag, s)
+      send("W FPASK " .. tag .. " " .. s)
+    elseif a[s] ~= b[s] then
+      local x, y = fingerprintFields(s, a[s] or "ERR"), fingerprintFields(s, b[s] or "ERR")
+      local keys, items = {}, {}
+      for k in pairs(x) do keys[k] = true end; for k in pairs(y) do keys[k] = true end
+      local missing = (s == "Q" or s == "S") and "0" or "absent"
+      for k in pairs(keys) do
+        if (x[k] or missing) ~= (y[k] or missing) then
+          items[#items + 1] = { k = k, f = "value", h = x[k] or missing, m = y[k] or missing, at = fpTime(b, s, k) }
+        end
+      end
+      Check.section(day, s, items)
+    end
+  end
+end
+-- Positive evidence is a dated host read in the closed interval. For a negative
+-- result require observations across that interval. A gap, an error, or a late
+-- reply cannot establish either equality or a foreign value.
+local function evidence(history, t, v)
+  if v == "?" or v == "ERR" then return "unknown" end
+  local left, prev, gap = t - 3, nil, false
+  for _, h in ipairs(history) do
+    if h.t > t then break end
+    if h.t >= left then
+      if h.v == v then return "match" end
+      if h.v == "?" or h.v == "ERR" or h.t - (prev or left) > 0.6 then gap = true end
+      prev = h.t
+    end
+  end
+  if not prev or gap or t - prev > 0.6 then return "unknown" end
+  return "outside"
+end
+local function classify(x)
+  local w, start = x.w, x.at
+  if not start then return false, false, false, false, true, "no-clock", "-", "-" end
+  local deadline = start + 3
+  local last, firstMatch, foreign, stale, unknown = nil, nil, false, false, false
+  table.sort(w.friend, function(a, b) return a.t < b.t end)
+  for _, f in ipairs(w.friend) do
+    if f.t >= deadline and f.t <= deadline + 0.6 and (not last or f.t < last.t) then last = f end
+  end
+  table.sort(w.host, function(a, b) return a.t < b.t end)
+  local previous = start
+  for _, f in ipairs(w.friend) do
+    if f.t >= start and f.t <= (last and last.t or deadline) then
+      if f.t - previous > 0.6 then unknown = true end
+      previous = f.t
+      local result = evidence(w.host, f.t, f.v)
+      if result == "match" then
+        if f.t <= deadline then firstMatch = math.min(firstMatch or f.t, f.t) end
+      elseif result == "outside" then
+        if w.seen[f.v] and w.seen[f.v] <= f.t then stale = true else foreign = true end
+      else unknown = true end
+    end
+  end
+  local atEnd = last and evidence(w.host, last.t, last.v) or "unknown"
+  unknown = unknown or atEnd == "unknown" or (atEnd == "match" and not firstMatch)
+  local latest
+  if last then for _, h in ipairs(w.host) do if h.t > last.t then break end; latest = h end end
+  if not latest or last.t - latest.t > 0.6 or latest.v == "?" or latest.v == "ERR" then unknown = true end
+  return firstMatch ~= nil and atEnd == "match" and not unknown, atEnd == "outside", foreign, stale, unknown,
+    last and string.format("%s@+%.3f", last.v, last.t - start) or "missing",
+    latest and string.format("%s@%+.3f", latest.v, latest.t - start) or "missing",
+    firstMatch and string.format("%.3f", firstMatch - start) or "-"
+end
+-- Both sides use the host time scale. Keep every distinct read, including
+-- unchanged values, so gaps and the preceding three seconds can be audited.
+local function timeline(history, start, lead)
+  if not start then return "-" end
+  local words, previous = {}, nil
+  for _, r in ipairs(history) do
+    local ms = math.floor((r.t - start) * 1000 + 0.5)
+    if ms >= lead and ms <= 3600 then
+      local word = tostring(ms) .. ":" .. r.v
+      if word ~= previous then words[#words + 1] = word; previous = word end
+    end
+  end
+  return #words > 0 and table.concat(words, ";") or "-"
+end
+local function finish(batch)
+  local delay, past, foreign, stale, unknown = 0, 0, 0, 0, 0
+  for _, x in ipairs(batch.items) do
+    local ok, p, f, old, u, value, hostValue, firstMatch = classify(x)
+    if ok then delay = delay + 1 end; if p then past = past + 1 end
+    if f then foreign = foreign + 1 end; if old then stale = stale + 1 end; if u then unknown = unknown + 1 end
+    log("settle-field %s %s %s %s initial=%s/%s recheck=%s/%s firstMatch=%s past=%d foreign=%d stale=%d unverified=%d at=%.3f hostMs=%s friendMs=%s",
+      tostring(batch.tag), batch.s, x.w.k, x.w.f, tostring(x.hostInitial), x.initial, hostValue, value, firstMatch,
+      p and 1 or 0, f and 1 or 0, old and 1 or 0, u and 1 or 0, x.at or 0,
+      timeline(x.w.host, x.at, -3000), timeline(x.w.friend, x.at, 0))
+  end
+  log("settle %s %s sample=%d settled=%d past3=%d foreign=%d stale=%d unverified=%d",
+    tostring(batch.tag), batch.s, #batch.items, delay, past, foreign, stale, unknown)
+end
+local function prior(tag, s, k, f)
+  local sample = W.wd.samples[tag]
+  if WIDE_BY[s] then
+    if sample then return rowTime(sample, s, k), fieldValue(s, f, sample.sec[s][k]) end
+  else
+    local P = W.wd.fpSamples[tag]
+    if P then
+      if P.detail[s] then
+        local stamp = s == "O" and P.at.O or P.at.rows[k]
+        return stamp, detailValue(s, P.detail[s][k], f)
+      end
+      local missing = (s == "Q" or s == "S") and "0" or "absent"
+      return fpTime(P, s, k), fingerprintFields(s, P[s] or "ERR")[k] or missing
+    end
+  end
+end
+local function compareDetails(tag, s, pending)
+  local P, a = pending.mine, pending.host
+  local b, keys, items = P.detail[s], {}, {}
+  for k in pairs(a) do keys[k] = true end; for k in pairs(b) do keys[k] = true end
+  for k in pairs(keys) do
+    if a[k] ~= b[k] then
+      local fields = {}
+      if not a[k] or not b[k] then fields.present = true
+      elseif s == "O" then fields.owner = true
+      elseif s == "B" then for _, f in ipairs(bfields) do fields[f] = true end
+      else for g in (a[k] .. "," .. b[k]):gmatch("(%d+):") do fields["g" .. g] = true end end
+      for f in pairs(fields) do
+        local h, m = detailValue(s, a[k], f), detailValue(s, b[k], f)
+        if h ~= m then items[#items + 1] = { k = k, f = f, h = h, m = m,
+          at = s == "O" and P.at.O or (P.at.rows[k] or P.at.buildings) } end
+      end
+    end
+  end
+  if #items == 0 then log("settle-detail %s %s unverified", tag, s); return end
+  log("settle-detail %s %s complete", tag, s)
+  Check.section(tag, s, items)
+end
+-- ---- the timing proof (lane 76): the host's own dated history of the rows players see. TEST TOOL, off for players
+-- (cfg.proof; the session check switches it on with Coop.world.cfg.proof = true on both copies). Read only.
+-- Why: a friend's reading can be judged only against host reads of the 3 s BEFORE it. The host began reading a row
+-- 0.2 to 0.5 s after the friend named it, so the friend's first readings had nothing to be judged against (session
+-- l76i: 2,184 readings "unverified"). With the proof on, the host reads every row of the sections below again and
+-- again (one round every cfg.proofEvery s, at most cfg.proofMs ms a tick), keeps cfg.proofKeep s of dated reads and,
+-- when a friend names a field (W WATCH), sends the kept reads of that field as ordinary W OBS lines with their own
+-- read times. Nothing here reaches compareFp, W.miss or the game.
+--   rows: the fingerprint's parts (W M N Q as one word each, F R S per owned region, B C per own building, O per
+--   region) and the wide sections named in cfg.proofSecs.
+--   a row that a finished round did not find is kept as "not there" for that round (false), so "absent" is dated too.
+local proofGroup = {}
+for group, list in pairs(groups) do for _, s in ipairs(list) do if s ~= "mk" then proofGroup[s] = group end end end
+local function proofState()
+  local D = W.wd
+  if not D.proof then
+    D.proof = { hist = {}, ends = {}, cyc = 0, served = {}, stat = { c0 = os.clock(), ms = 0, maxTick = 0, maxGap = 0, gaps = 0, cycles = 0, rows = 0, ids = 0, reads = 0 } }
+  end
+  return D.proof
+end
+local function proofSecs(Pr)
+  local text = tostring(W.cfg.proofSecs or "")
+  if Pr.secText ~= text then
+    Pr.secText = text; Pr.secs = { building = {}, region = {}, family = {} }; Pr.secOn = {}
+    for s in text:gmatch("%l+") do
+      local group = proofGroup[s]
+      if WIDE_BY[s] and Pr.secs[group] then Pr.secs[group][#Pr.secs[group] + 1] = s; Pr.secOn[s] = true end
+    end
+  end
+  return Pr.secs
+end
+local function proofPut(Pr, key, row, t)
+  local h = Pr.hist[key]
+  if not h then
+    h = { t = {}, v = {}, i = 1, n = 0 }; Pr.hist[key] = h
+    for _, e in ipairs(Pr.ends) do h.n = h.n + 1; h.t[h.n] = e; h.v[h.n] = false end      -- not there in the rounds before
+  elseif h.n >= h.i then
+    local gap = t - h.t[h.n]
+    if gap > Pr.stat.maxGap then Pr.stat.maxGap = gap end
+    if gap > 0.55 then Pr.stat.gaps = Pr.stat.gaps + 1 end
+  end
+  h.n = h.n + 1; h.t[h.n] = t; h.v[h.n] = row or false; h.c = Pr.cyc
+  Pr.stat.reads = Pr.stat.reads + 1
+end
+-- a building's key as the day scan names it; nil for an actor the game has cleared (type 0 or place 0,0)
+local function proofKey(b)
+  local ok, k = pcall(W.bkey, b)
+  if not ok or type(k) ~= "string" or k:match("^0@") or k:match("@0,0$") then return nil end
+  return k
+end
+local function proofStep(S, J, Pr, t)
+  local eng = S.eng; local secs = proofSecs(Pr)
+  if J.phase == 1 then                                   -- the world's words and the regions
+    local T = eng.TemporalComponent
+    local P = {}
+    sec(P, "W", function() if not valid(T) then return "ERR" end; return string.format("%d,%d,%d,%d,%d,%d", T.Season, T.month, T.rainMeter, T.isDrought and 1 or 0, T.isWinter and 1 or 0, T.daysWithoutRainVariation) end)
+    sec(P, "M", function() return string.format("%d,%d", #eng.freeMerchants, #eng.livestockMerchants) end)
+    sec(P, "N", function() return string.format("%d,%d,%d", S.p1.silver, S.p1.influence, S.p1.kingsFavour) end)
+    sec(P, "Q", function() return fpSoldiers(S) end)
+    for _, s in ipairs({ "W", "M", "N", "Q" }) do proofPut(Pr, s, P[s] ~= "ERR" and P[s] or "?", t) end
+    J.regs = {}; J.F = {}; J.R = {}; J.S = {}; J.ri = 0
+    local arr = eng.regions
+    for i = 1, #arr do local r = un(arr[i]); if valid(r) then J.regs[#J.regs + 1] = r end end
+    J.phase = 2; return false
+  elseif J.phase == 2 then                               -- one region per step
+    J.ri = J.ri + 1
+    local r = J.regs[J.ri]
+    if r then
+      if valid(r) then
+        local k = W.rkey(r)
+        proofPut(Pr, "O~" .. k, ownerCode(r.ownerPawn), t)
+        if mine(r.ownerPawn) then J.F[#J.F + 1], J.R[#J.R + 1], J.S[#J.S + 1] = fpRegionWords(S, r, k) end
+        for _, s in ipairs(secs.region) do
+          local P = { [s] = {} }
+          if pcall(wideRegion, P, r, s) then proofPut(Pr, s .. "~" .. k, P[s][k], t) else proofPut(Pr, s .. "~" .. k, "?", t) end
+        end
+      end
+      return false
+    end
+    table.sort(J.F); table.sort(J.R); table.sort(J.S)
+    proofPut(Pr, "F", (table.concat(J.F, "|"):gsub("%s", "_")), t)
+    proofPut(Pr, "R", #J.R > 0 and table.concat(J.R, "|") or "-", t)
+    proofPut(Pr, "S", #J.S > 0 and table.concat(J.S, "|") or "-", t)
+    J.phase = 3; J.ri = 1; J.fi = 0; J.keyOf = {}; J.own = {}; J.seen = {}; J.dup = 0; J.i = 0
+    return false
+  elseif J.phase == 4 then                               -- last: eight families per step
+    local r = J.regs[J.ri]
+    if not r then return true end
+    local n = 0
+    if valid(r) then
+      local okK, k = pcall(W.rkey, r); local fams = r.workerFamilies
+      local P = { fa = {}, fc = {}, keyOf = J.keyOf }
+      while okK and J.fi < #fams and n < 8 do
+        J.fi = J.fi + 1; n = n + 1
+        local key = k .. ":F" .. J.fi
+        if pcall(wideFamily, P, k, fams[J.fi], J.fi) then
+          for _, s in ipairs(secs.family) do proofPut(Pr, s .. "~" .. key, P[s][key], t) end
+        end
+      end
+    end
+    if n < 8 then J.ri = J.ri + 1; J.fi = 0 end
+    return false
+  end
+  local arr = eng.buildingArr                            -- phase 3: one building per step
+  J.i = J.i + 1
+  if J.i > #arr then
+    if #secs.family == 0 then return true end
+    J.phase = 4; return false
+  end
+  local b = un(arr[J.i])
+  if not valid(b) then return false end
+  local k = proofKey(b); if not k then return false end
+  local base = k
+  if J.seen[k] then J.dup = J.dup + 1; k = k .. "#" .. J.dup end; J.seen[base] = true
+  local ba = addr(b); if ba then J.keyOf[ba] = k end
+  for _, s in ipairs(secs.building) do
+    local P = { dup = 0, keyOf = J.keyOf, own = J.own, bl = {} }; P[s] = {}
+    if pcall(wideBuilding, P, b, s) then proofPut(Pr, s .. "~" .. k, P[s][base], t) else proofPut(Pr, s .. "~" .. k, "?", t) end
+  end
+  -- the fingerprint's building rows (as fpBuilding makes them): the lord's own buildings, not a pile (type 88)
+  local okD, dump = pcall(function() return b:GetType() == 88 end)
+  if okD and not dump and mine(b.ownerPawn) then
+    local okB, brow, crow = pcall(function()
+      local built = b:IsConstructed()
+      local row = table.concat({ built and 1 or 0, b.lv, b:getNumActiveWorkerFamilies(), b:getNumResidingFamilies(), b.onFire and 1 or 0, b.sleep and 1 or 0 }, "|")
+      local inventory
+      if W.on.bstock and not built and not b.isBeingUpgraded then
+        local g = {}; for g2, a in pairs(invOf(b)) do g[#g + 1] = g2 .. ":" .. a end
+        table.sort(g); inventory = table.concat(g, ","); if inventory == "" then inventory = "0" end
+      end
+      return row, inventory
+    end)
+    proofPut(Pr, "B~" .. k, okB and brow or "?", t)
+    if okB and crow then proofPut(Pr, "C~" .. k, crow, t) elseif not okB then proofPut(Pr, "C~" .. k, "?", t) end
+  end
+  return false
+end
+local function proofEnd(Pr, t)
+  local keep = W.cfg.proofKeep; local rows = 0
+  for key, h in pairs(Pr.hist) do
+    if h.c ~= Pr.cyc then h.n = h.n + 1; h.t[h.n] = t; h.v[h.n] = false end              -- not found in this round
+    while h.i <= h.n and t - h.t[h.i] > keep do h.t[h.i] = nil; h.v[h.i] = nil; h.i = h.i + 1 end
+    if h.i > 64 then                                                                      -- move the kept reads to the front
+      local nt, nv, m = {}, {}, 0
+      for i = h.i, h.n do m = m + 1; nt[m] = h.t[i]; nv[m] = h.v[i] end
+      h.t, h.v, h.i, h.n = nt, nv, 1, m
+    end
+    local live = false
+    for i = h.i, h.n do if h.v[i] then live = true; break end end
+    if live then rows = rows + 1 else Pr.hist[key] = nil end                               -- nothing but "not there": forget it
+  end
+  local e = Pr.ends; e[#e + 1] = t
+  while e[1] and t - e[1] > keep do table.remove(e, 1) end
+  Pr.stat.rows = rows; Pr.stat.cycles = Pr.stat.cycles + 1
+end
+function Check.proofTick(S)
+  local Pr = proofState(); local c0 = os.clock(); local st = Pr.stat
+  if not Pr.job then
+    if c0 - (Pr.startC or -1e9) < W.cfg.proofEvery then return end
+    Pr.cyc = Pr.cyc + 1; Pr.startC = c0; Pr.job = { phase = 1 }
+  end
+  local t = Check.clock(S); if not t then return end
+  local budget = W.cfg.proofMs / 1000; local done = false; local part = Pr.job.phase; local failed = false
+  repeat
+    local ok, r = pcall(proofStep, S, Pr.job, Pr, t)
+    if not ok then st.err = tostring(r); st.errs = (st.errs or 0) + 1; done = true; failed = true else done = r end
+  until done or os.clock() - c0 >= budget
+  if done then
+    local long = os.clock() - Pr.startC
+    if long > (st.maxCycle or 0) then st.maxCycle = long end
+    -- a round that broke off is not a finished round: the rows it did not reach get no "not there" (they keep a
+    -- hole, which the check reads as "cannot be timed")
+    Pr.job = nil; if not failed then proofEnd(Pr, t) end
+  end
+  local ms = (os.clock() - c0) * 1000
+  st.ms = st.ms + ms; if ms > st.maxTick then st.maxTick = ms end
+  st.part = st.part or { 0, 0, 0, 0 }; st.part[part] = st.part[part] + ms      -- by the part the tick began in
+  if c0 - st.c0 >= 60 then
+    log("proof parts (ms a second): world %.1f, regions %.1f, buildings %.1f, families %.1f", st.part[1] / (c0 - st.c0), st.part[2] / (c0 - st.c0), st.part[3] / (c0 - st.c0), st.part[4] / (c0 - st.c0))
+    log("proof: %d rounds in %.0f s, %d rows, %d reads, %.2f ms a second, worst tick %.1f ms, longest round %.3f s, longest gap between two reads of a row %.3f s, gaps over 0.55 s %d, fields served %d%s",
+      st.cycles, c0 - st.c0, st.rows, st.reads, st.ms / (c0 - st.c0), st.maxTick, st.maxCycle or 0, st.maxGap, st.gaps, st.ids, st.err and (", read errors " .. tostring(st.errs) .. " (" .. st.err .. ")") or "")
+    Pr.total = Pr.total or { ms = 0, s = 0, maxTick = 0, maxGap = 0, gaps = 0, cycles = 0, reads = 0, ids = 0, errs = 0 }
+    local T = Pr.total
+    T.ms = T.ms + st.ms; T.s = T.s + (c0 - st.c0); T.cycles = T.cycles + st.cycles; T.reads = T.reads + st.reads; T.gaps = T.gaps + st.gaps; T.ids = T.ids + st.ids
+    T.errs = T.errs + (st.errs or 0)
+    if st.maxTick > T.maxTick then T.maxTick = st.maxTick end; if st.maxGap > T.maxGap then T.maxGap = st.maxGap end
+    Pr.stat = { c0 = c0, ms = 0, maxTick = 0, maxGap = 0, gaps = 0, cycles = 0, rows = st.rows, ids = 0, reads = 0 }
+  end
+end
+-- the kept value of one field at one kept read (row: the row's text, or false = not there)
+local function proofValue(s, k, f, row)
+  if WIDE_BY[s] then return fieldValue(s, f, row or nil) end
+  if s == "B" or s == "C" or s == "O" then return detailValue(s, row or nil, f) end
+  if not row or row == "?" then return "?" end
+  return fingerprintFields(s, row)[k] or ((s == "Q" or s == "S") and "0" or "absent")
+end
+local function proofReads(Pr, s, k, f, add)
+  local row = WIDE_BY[s] or s == "B" or s == "C" or s == "O"
+  local h = Pr.hist[row and (s .. "~" .. k) or s]
+  if h then for i = h.i, h.n do add(h.t[i], proofValue(s, k, f, h.v[i])) end
+  elseif row then for _, e in ipairs(Pr.ends) do add(e, proofValue(s, k, f, false)) end end   -- never there in the kept rounds
+end
+-- friend: this copy's own kept reads of a field since its day sample read it (at). The friend opens its watch of a
+-- field only when the day's comparison is made, up to seconds after the sample read the row; without these its own
+-- series had a hole there and the field stayed "unverified" (session l76j: 0 ms, then 943 ms).
+function Check.proofFill(w, at)
+  if not (W.cfg.proof and at) then return end
+  local Pr = W.wd.proof; if not Pr then return end
+  if WIDE_BY[w.s] and not (Pr.secOn and Pr.secOn[w.s]) then return end
+  if w.f == "*" and not WIDE_BY[w.s] then return end
+  proofReads(Pr, w.s, w.k, w.f, function(t, v) if t > at and v ~= nil then record(w, "friend", t, v) end end)
+end
+-- host: the kept reads of a field a friend has just named go into the reply (history[<read time>] = { "<id>=<value>" })
+function Check.proofServe(id, s, k, f, history)
+  if not W.cfg.proof then return 0 end
+  local Pr = proofState(); local wide = WIDE_BY[s]
+  if wide and not (Pr.secOn and Pr.secOn[s]) then return 0 end
+  if f == "*" and not wide then return 0 end
+  local after = Pr.served[id] or -1; local last = after; local n = 0
+  proofReads(Pr, s, k, f, function(t, v)
+    if t > after and v ~= nil then
+      history[t] = history[t] or {}; history[t][#history[t] + 1] = id .. "=" .. tostring(v); n = n + 1
+      if t > last then last = t end
+    end
+  end)
+  Pr.served[id] = last
+  if n > 0 then Pr.stat.ids = Pr.stat.ids + 1 end
+  return n
+end
+function W.proofStat()
+  local D = W.wd; local Pr = D and D.proof
+  if not Pr then return "proof: off or no round yet" end
+  local st, T = Pr.stat, Pr.total or { ms = 0, s = 0, maxTick = 0, maxGap = 0, gaps = 0, cycles = 0, reads = 0, ids = 0, errs = 0 }
+  local s = T.s + (os.clock() - st.c0)
+  return string.format("proof %s: %d rounds in %.0f s, %d rows, %d reads, %.2f ms a second, worst tick %.1f ms, longest gap %.3f s, gaps over 0.55 s %d, fields served %d, read errors %d",
+    W.cfg.proof and "on" or "off", T.cycles + st.cycles, s, st.rows, T.reads + st.reads, s > 0 and (T.ms + st.ms) / s or 0, math.max(T.maxTick, st.maxTick), math.max(T.maxGap, st.maxGap),
+    T.gaps + st.gaps, T.ids + st.ids, T.errs + (st.errs or 0))
+end
+function Check.receive(S, from, msg)
+  local D = W.wd
+  local tag, section = msg[5], msg[6]
+  if msg[4] ~= "OBS" and (not tag or not tag:match("^n?%d+$")) then return end
+  if S.role == "friend" and from == "host" and msg[4] == "PRE" then
+    local stamp = tonumber(section)
+    if not stamp or (tonumber(tag) and W.day and math.abs(tonumber(tag) - W.day) > 4) then return end
+    local e = D.early[tag] or {}; D.early[tag] = e
+    local mine = D.mine[tag]; local active = D.run and D.run.tag == tag and D.run.P
+    for s, k, v in (msg[7] or ""):gmatch("(%l+)~([^=;]+)=([^;]+)") do
+      if WIDE_BY[s] then
+        local row; if v ~= "!" then row = v end
+        e[s] = e[s] or {}; e[s][k] = { row = row, t = stamp }
+        local times = mine and mine.times or (active and active.times)
+        local ft = times and sampleTime(times, s, k) or (mine and mine.finish)
+        local maps = mine and mine.sec or active
+        if ft and maps then earlyPair(tag, s, k, row, maps[s][k], stamp, ft) end
+      end
+    end
+  elseif S.role == "host" and msg[4] == "FPASK" then
+    local P = D.fpSamples[tag]
+    if P and P.detail[section] then
+      local items = {}
+      for k, row in pairs(P.detail[section]) do items[#items + 1] = k .. "~" .. row end
+      local head = "W FPROWS " .. tag .. " " .. section .. " "
+      sendList(head, items, ";"); send(head .. "END " .. #items)
+    end
+  elseif S.role == "friend" and from == "host" and msg[4] == "FPROWS" then
+    local key = tostring(tag) .. tostring(section); local pending = D.details[key]
+    if not pending then return end
+    if msg[7] == "END" then
+      D.details[key] = nil
+      if pending.count == tonumber(msg[8]) then compareDetails(tag, section, pending)
+      else log("settle-detail %s %s unverified", tag, section) end
+    else
+      for k, row in (msg[7] or ""):gmatch("([^~;]+)~([^;]+)") do
+        if pending.host[k] == nil then pending.count = pending.count + 1 end
+        pending.host[k] = row
+      end
+    end
+  elseif S.role == "host" and msg[4] == "WATCH" and tag and (D.samples[tag] or D.fpSamples[tag] or (D.run and D.run.tag == tag)
+      or (W.day and tonumber(tag) and (tonumber(tag) == W.day or tonumber(tag) == W.day + 1))) then
+    local history = {}
+    for id in (msg[6] or ""):gmatch("[^;]+") do
+      local s, k, f = descriptor(id)
+      if s then
+        watch(s, k, f)
+        Check.proofServe(id, s, k, f, history)
+        for _, tag in ipairs((WIDE_BY[s] and D.samples.order or D.fpSamples.order) or {}) do
+          local t, v = prior(tag, s, k, f)
+          if t and v ~= nil then
+            history[t] = history[t] or {}; history[t][#history[t] + 1] = id .. "=" .. v
+          end
+        end
+      end
+    end
+    for t, items in pairs(history) do sendList(string.format("W OBS %.3f ", t), items, ";") end
+  elseif S.role == "friend" and from == "host" and msg[4] == "OBS" then
+    local t = tonumber(msg[5])
+    for id, v in (msg[6] or ""):gmatch("([^;=]+)=([^;]+)") do
+      local w = D.watches[id]; if w then record(w, "host", t, v) end
+    end
+  end
+end
+function Check.tick(S)
+  local D, now = W.wd, os.clock()
+  if D.preview then
+    for head, items in pairs(D.preview) do sendList(head, items, ";") end
+    D.preview = nil
+  end
+  if D.ask then
+    for tag, ids in pairs(D.ask) do
+      local words = {}; for id in pairs(ids) do words[#words + 1] = id end
+      sendList("W WATCH " .. tag .. " ", words, ";")
+    end
+    D.ask = nil
+  end
+  if W.cfg.proof then Check.proofTick(S) end
+  if now < (D.checkNext or 0) then return end
+  D.checkNext = now + 0.18
+  local memo, frames = {}, {}; local t = Check.clock(S)
+  for id, w in pairs(D.watches) do
+    if now <= w.untilT then
+      local ok, v = pcall(read, S, w.s, w.k, w.f, memo)
+      v = (ok and v ~= nil) and tostring(v) or "?"
+      local stamp = Check.clock(S)
+      if S.role == "host" and stamp then
+        local ms = string.format("%.3f", stamp)
+        frames[ms] = frames[ms] or {}; frames[ms][#frames[ms] + 1] = id .. "=" .. v
+      else record(w, "friend", stamp, v) end
+    elseif now - w.untilT > 45 then D.watches[id] = nil end
+    if #w.host > 350 or #w.friend > 350 then
+      for _, side in ipairs({ "host", "friend" }) do
+        local keep = {}; for _, r in ipairs(w[side]) do if t and t - r.t < 35 then keep[#keep + 1] = r end end
+        w[side] = keep
+      end
+    end
+  end
+  for stamp, items in pairs(frames) do sendList("W OBS " .. stamp .. " ", items, ";") end
+  for i = #D.batches, 1, -1 do if now >= D.batches[i].due then finish(table.remove(D.batches, i)) end end
+  for key, pending in pairs(D.details) do if now - pending.since > 8 then
+    log("settle-detail %s %s unverified", key:sub(1, -2), key:sub(-1)); D.details[key] = nil
+  end end
+end
+end
+
 -- friend: one section per tick is compared, counted and logged; then the day's summary line.
 -- LOG ONLY: nothing here asks for a resync.
 local function wideCmpStep(J)
@@ -1283,6 +2231,7 @@ local function wideCmpStep(J)
   local spec = WIDE[J.i]
   if spec then
     local sec = spec[1]; local R = wideCompareSec(spec, Hs, Ms); J.res[sec] = R
+    Check.section(tag, sec, R.items, Ms)
     local Cn = W.wideCnt[sec]; if not Cn then Cn = { days = 0, bad = 0, items = 0, held = 0, max = 0, badP = 0, itemsP = 0 }; W.wideCnt[sec] = Cn end
     Cn.days = Cn.days + 1; Cn.items = Cn.items + R.n; Cn.held = Cn.held + R.held; Cn.itemsP = Cn.itemsP + R.nP
     if R.n > 0 then Cn.bad = Cn.bad + 1 end
@@ -1324,7 +2273,7 @@ end
 local function wideTry(S, tag)
   local D = W.wd; local Hs, Ms = D.host[tag], D.mine[tag]
   if not (Hs and Ms) then return end
-  D.host[tag] = nil; D.mine[tag] = nil
+  D.host[tag] = nil; D.mine[tag] = nil; D.early[tag] = nil
   local nt = tonumber(tag)
   if nt then
     for t in pairs(D.host) do local x = tonumber(t); if x and x < nt - 3 then D.host[t] = nil end end
@@ -1358,7 +2307,7 @@ end
 -- arrives would too.
 local function widePrune(day)
   local D = W.wd; local now = os.clock()
-  for _, t in ipairs({ D.mine, D.host }) do
+  for _, t in ipairs({ D.mine, D.host, D.early }) do
     for tag in pairs(t) do local x = tonumber(tag); if x and x < day - 3 then t[tag] = nil end end
   end
   for tag, I in pairs(D.inb) do if now - (I.t or now) > 300.0 then D.inb[tag] = nil end end
@@ -1471,13 +2420,19 @@ local function sendTimers(S)
   send(string.format("W T %d %d %d %s %d %d", t.u, t.s, t.c, t.d and string.format("%d", t.d) or "-", t.m, t.day))      -- lane 36: monthsTotal and the day it was read on
 end
 
-local function sendWeather(S)
+local function sendWeather(S, changed)
+  if not valid(S.eng) then return end
   local T = S.eng.TemporalComponent; local v = {}
+  if not valid(T) then return end
+  local exact = C.facts and C.facts.sentX == true
   for i, f in ipairs(WX) do
+    if i > 10 and not exact then break end
     local x = T[f[1]]
-    if f[2] == "b" then v[i] = x and "1" or "0" elseif f[2] == "i" then v[i] = string.format("%d", x) else v[i] = string.format("%.4f", x) end
+    if f[2] == "b" then v[i] = x and "1" or "0" elseif f[2] == "i" then v[i] = string.format("%d", x) else v[i] = string.format("%.9g", x) end
   end
-  send(string.format("W X %d %s", S.eng:getDaysTotal(), table.concat(v, ",")))
+  local line = string.format("W X %d %s", S.eng:getDaysTotal(), table.concat(v, ","))
+  if changed and W.sent.weather == line and os.clock() - (W.t.weatherSent or 0) < 1 then return end
+  W.sent.weather = line; W.t.weatherSent = os.clock(); send(line)
 end
 
 -- ---------------------------------------------------------------- HOLD (lane 31): the region panel's numbers
@@ -1857,7 +2812,7 @@ local function onHostDay(S, day)
   send(string.format("W D %d %s", day, ok and string.format("%.4f", clk) or "-"))
   try("timers", sendTimers, S)
   if W.on.weather then try("weather", sendWeather, S) end
-  if W.on.fp then addJob("fp", fpJob, { done = function(d, P) send("W F " .. d .. " " .. fpEncode(P)) end }) end
+  if W.on.fp then addJob("fp", fpJob, { done = function(d, P) Check.remember(W.wd.fpSamples, tostring(d), P); send("W F " .. d .. " " .. fpEncode(P)) end }) end
   if W.on.wide then                                              -- log only
     wideStart(S, tostring(day), day, function(smp) local D = W.wd; D.posts[#D.posts + 1] = { kind = "send", smp = smp, i = 0, lines = 0, bytes = 0 } end)
   end
@@ -1884,6 +2839,9 @@ local function hostTick(S, clock)
   -- (lane 22, TOTALS), so they are read and sent every cfg.exactStockEvery s instead of every cfg.stockEvery s
   local every = cfg.stockEvery
   local Xf = rawget(C, "facts"); if Xf and Xf.sentX == true and cfg.exactStockEvery then every = math.min(every, cfg.exactStockEvery) end
+  if Xf and Xf.sentX == true and W.on.weather and clock - (W.t.weatherRead or 0) >= 0.2 then
+    W.t.weatherRead = clock; try("weather", sendWeather, S, true)
+  end
   -- exact mode: the months of food and fuel and the regional wealth are pushed at once when they change (looked at 10
   -- times a second): the game writes the months in its day routine, and a friend's day comes a moment after the
   -- host's, so the host's new value must be there before the friend's own one is shown (lane 22)
@@ -2313,14 +3271,16 @@ end
 -- (READ); that a write takes effect is a GUESS. A write that does not stick switches the item off.
 local function weatherApply(S)
   local X = W.fr.wx; if not (X and W.on.weather) then return end
+  if not valid(S.eng) then return end
   local T = S.eng.TemporalComponent; local n = 0
+  if not valid(T) then return end
   for i, f in ipairs(WX) do
     local want = X.v[i]
     if want ~= nil then
       local name, kind = f[1], f[2]
       if kind == "b" then want = want == 1 end
       local cur = T[name]
-      local same; if kind == "f" then same = math.abs(cur - want) < 1e-3 else same = cur == want end
+      local same = cur == want or (kind == "f" and string.format("%.9g", cur) == string.format("%.9g", want))
       if not same then
         if W.dry then W.dryLog[#W.dryLog + 1] = "weather " .. name .. "=" .. tostring(want)
         else
@@ -2497,8 +3457,9 @@ function W.apply(S, w)
       else W.clockMiss = 0 end
     end
   elseif sub == "X" then
-    local X = { day = tonumber(w[5]), v = {} }; local i = 0
+    local X = { day = tonumber(w[5]), received = os.clock(), v = {} }; local i = 0
     for x in (w[6] or ""):gmatch("[^,]+") do i = i + 1; X.v[i] = tonumber(x) end
+    Check.weatherWord(tonumber(w[2]), X.v)
     F.wx = X
     weatherApply(S)
   elseif sub == "F" then
@@ -2605,7 +3566,12 @@ local function friendTick(S, clock)
   local F = W.fr; local cfg = W.cfg
   if rawget(C, "hold") then return end   -- a join or repair is loading a save: the host's values are not arriving
   if clock - W.t.poll >= cfg.pollEvery then W.t.poll = clock; try("dayPoll", friendDayPoll, S) end
-  if clock - W.t.hold >= cfg.holdEvery then W.t.hold = clock; try("holds", holds, S); try("weather", weatherKeep, S); try("firePassive", firePassive, S) end
+  local liveWeather = F.wx and F.wx.v[11] ~= nil and exactStock() and clock - F.wx.received <= 3
+  if liveWeather then try("weather", weatherApply, S) end
+  if clock - W.t.hold >= cfg.holdEvery then
+    W.t.hold = clock; try("holds", holds, S); try("firePassive", firePassive, S)
+    if not liveWeather and not (F.wx and F.wx.v[11]) then try("weather", weatherKeep, S) end
+  end
   -- exact mode with TOTALS (lane 22): the months of food and fuel and the regional wealth are kept at the host's on
   -- every tick: the game writes the months in its own day routine and moves the wealth itself; written back in the
   -- same frame they are not shown
@@ -2655,6 +3621,7 @@ local function tick(S, clock)
   if S.role == "host" then hostTick(S, clock) elseif S.role == "friend" then friendTick(S, clock) end
   if S.role == "friend" and W.fpLater then pcall(W.fpLaterStep, S) end      -- (lane 71)
   runJobs(W.cfg.budgetMs / 1000)
+  if W.on.wide and not rawget(C, "hold") then Check.tick(S) end
   -- the wide sample has its own stepper (not the job queue above: it must never delay a push); not while a save loads
   W.wd.tickN = W.wd.tickN + 1
   if (W.wd.run or W.wd.posts[1]) and not (S.role == "friend" and rawget(C, "hold")) then
@@ -2664,6 +3631,10 @@ end
 
 local function onMessage(S, from, kind, w, line)
   if kind ~= "W" then return false end
+  if w[4] == "PRE" or w[4] == "WATCH" or w[4] == "OBS" or w[4] == "FPASK" or w[4] == "FPROWS" then
+    if W.on.wide and not C.stale(from, w) and not rawget(C, "hold") then fresh(S); Check.receive(S, from, w) end
+    return true
+  end
   if S.role ~= "friend" or from ~= "host" then bump("w_ignored"); return true end   -- W runs host -> friends only
   -- the core's friendInbox does not drop lines from before this copy started (hostInbox does): do it here,
   -- so a late friend does not replay an old raid or fire; the next keyframe brings the current values
@@ -2739,6 +3710,7 @@ end
 function W.fingerprintNow(S)
   W.prepare(S); local P
   addJob("fpNow", fpJob, { done = function(_, p) P = p end }); W.flush()
+  if P then P.at = nil; P.detail = nil end
   return P, P and fpEncode(P)
 end
 function W.holdsNow(S) W.prepare(S); holds(S) end
@@ -2774,6 +3746,16 @@ function W.wide()
     t[#t + 1] = table.concat(row, " ")
   end
   return table.concat(t, "\n")
+end
+
+function W.settlePending()
+  local D = W.wd
+  if not D then return -1 end
+  local n = #D.batches + #D.posts + (D.run and 1 or 0)
+  for _, pending in ipairs({ D.details, D.inb, D.mine, D.host, W.fp.mine, W.fp.host, W.fpLater or {} }) do
+    for _ in pairs(pending) do n = n + 1 end
+  end
+  return n
 end
 function W.wideDetail(tag)
   local L

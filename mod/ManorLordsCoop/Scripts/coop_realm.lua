@@ -504,7 +504,7 @@ local function actorKey(e)
   return (ok and k) or "-"
 end
 local function buildingByKey(S, key)
-  if not key or key == "-" then return nil end
+  if not key or key == "-" or not valid(S.eng) then return nil end
   local hit = R.bCache and R.bCache[key]
   if hit and valid(hit) then return hit end
   R.bCache = R.bCache or {}
@@ -522,7 +522,11 @@ local function addHostLine(S, P, h)
   local actor = buildingByKey(S, h.actor)
   P.markLog(); S.p1:addLog(FName(h.tag), h.text, h.descr, h.opens, h.pos, actor)
   local la = S.p1.log; local n = #la
-  if n > 0 then R.relayed[logKey(la[n])] = true end
+  if n > 0 then
+    local e = la[n]
+    R.relayed[logKey(e)] = true
+    if not e.IsDisplayed then R.pendingLogDraw = true end
+  end
 end
 -- (lane 66, release re-check) the kinds this copy's game adds by itself outside the two notice routines (LOCAL_TAGS):
 -- the host's line is the only one, as for every other notice. This copy's own line of such a kind is taken out at the
@@ -574,18 +578,12 @@ local function drawnLines()
   return t
 end
 R.drawnLines = drawnLines
-local function sameLine(a, b)
-  local ok, r = pcall(function()
-    if a.LogText:ToString() ~= b.LogText:ToString() then return false end
-    return math.abs(a.Location.X - b.Location.X) < 1 and math.abs(a.Location.Y - b.Location.Y) < 1
-  end)
-  return ok and r == true
-end
 -- take the drawn line of entry e off the screen with the widget's own Remove; returns how many
 local function removeDrawn(e)
+  local key = logKey(e)                                  -- Remove may erase e from the lord's array
   local n = 0
   for _, d in ipairs(drawnLines()) do
-    if d.e and sameLine(d.e, e) then
+    if valid(d.w) and d.e and logKey(d.e) == key then
       local ok = pcall(function() d.w:Remove() end)
       if ok then n = n + 1 end
     end
@@ -594,7 +592,20 @@ local function removeDrawn(e)
 end
 local function ownLocalPrune(S, clock)
   local P = rawget(C, "patch")
-  if not (P and P.nlOn == true and R.on.notices) then return end
+  if not (P and P.nlOn == true and R.on.notices and valid(S.p1)) then return end
+  -- A join can deliver the list before the HUD can draw it. The game leaves
+  -- those entries undisplayed until its next refresh, even while paused.
+  if R.pendingLogDraw then
+    R.pendingLogDraw = nil
+    local pending = S.p1.log
+    for i = 1, #pending do
+      if not pending[i].IsDisplayed then
+        R.pendingLogDraw = true
+        S.p1:updateLogUI()
+        break
+      end
+    end
+  end
   local la = S.p1.log; local n = #la
   if not R.pruneBase then                              -- the first look in this world: what the loaded list holds (the
     R.pruneBase = true                                 -- host's save) stays; only what comes after is judged
@@ -625,25 +636,39 @@ local function ownLocalPrune(S, clock)
     end
   end
   if out > 0 then pcall(function() S.p1:updateLogUI() end) end
+  -- A local dismissal or an inline writer of any other kind can change the
+  -- count without going through NOLOG. Ask for the current list once.
+  if R.expectedLogN then
+    local entries = S.p1.log; local count = #entries
+    if count ~= R.expectedLogN or (count == 100 and not R.relayed[logKey(entries[count])]) then
+      R.askWorld = nil; R.expectedLogN = nil
+    end
+  end
 end
-local function logSig(e) return e.Tag:ToString() .. "|" .. e.LogText:ToString() .. "|" .. string.format("%.1f", e.Timestamp) end
+local function logSig(e) return e.Tag:ToString() .. "|" .. logKey(e) end
+local hostLogAll
 local function logPoll(S)
+  if not valid(S.p1) then return end
   local arr = S.p1.log; local n = #arr
   local last = n > 0 and logSig(arr[n]) or ""
   if not R.logN then R.logN = n; R.logLast = last; return end          -- first look in this world: nothing is new
   if n == R.logN and last == R.logLast then return end
-  local from = n + 1
-  if R.logLast == "" then from = 1
-  elseif n > R.logN and n < 100 then
-    -- (lane 66) the list grew and is under the game's cap (100 entries; addLog drops the oldest only at the cap): the
-    -- new entries are the last ones. A second notice equal to the last one (same tag, text and time) was lost by the
-    -- search below; R LOG is now a friend's only source of notices
-    from = R.logN + 1
-  else
-    for i = n, 1, -1 do if logSig(arr[i]) == R.logLast then from = i + 1; break end end
-    if from == n + 1 and last ~= R.logLast and n > R.logN then from = R.logN + 1 end   -- the last seen one was dismissed
+  local from
+  if n >= R.logN then
+    if R.logN == 0 or logSig(arr[R.logN]) == R.logLast then
+      from = R.logN + 1
+    elseif n == 100 then                                -- at the cap the oldest entries fall off
+      for i = n - 1, 1, -1 do
+        if logSig(arr[i]) == R.logLast then from = i + 1; break end
+      end
+    end
   end
-  for i = math.max(from, n - 9), n do
+  if not from then                                       -- a dismissal or replacement needs a full list
+    R.logN = n; R.logLast = last
+    for _, serial in pairs(R.logSubscribers) do hostLogAll(S, serial) end
+    return
+  end
+  for i = from, n do
     local e = arr[i]
     local x, y, z = 0, 0, 0; pcall(function() x, y, z = e.Location.X, e.Location.Y, e.Location.Z end)
     -- (lane 66) the 12th word: the notice's actor, a building by its key ("-": none)
@@ -653,7 +678,7 @@ local function logPoll(S)
   R.logN = n; R.logLast = last
 end
 
--- ---- (lane 66, after 0.2.5) the host's whole notice list, once after each join or reload of a friend
+-- ---- the host's whole notice list after a join, reload or change to existing rows
 -- A load keeps none of the lord's notices (a copy that has just loaded holds only what came after: lane 64 a1, lane 66
 -- run 1), so a friend that joined or reloaded lacked every notice the host had before (lane 64: host 23, friend 19).
 -- The friend asks (R LOGASK) once per world while NOLOG is on; the host first sends what its poll has not sent yet, then
@@ -661,10 +686,11 @@ end
 -- ended by R LOGEND <serial> <n>. The friend applies it all or nothing when every line has come: its own list is
 -- emptied (every entry and its drawn line), then the host's entries are added in order, each through the mod's mark,
 -- with the alert sound held (the lord's DT_Alerts, the table playAlertFromTag reads, is empty for those calls only:
--- with no table the routine plays nothing), its time, day and "displayed" written to the host's (by index, under the
--- list's length), and its drawn line taken off in the same tick, so no old banner shows and no sound plays.
-local function hostLogAll(S, serial)
-  pcall(logPoll, S)                                     -- what the poll has not sent goes first (never twice)
+-- with no table the routine plays nothing). Both HUDs refresh from the active list. Dismissing a row removes its
+-- entry from the lord's log. The restored widgets must be built after the entries have their host times and days.
+hostLogAll = function(S, serial)
+  if not valid(S.p1) then return end
+  S.p1:updateLogUI()                                     -- draw pending entries on the authoritative HUD first
   local arr = S.p1.log; local n = #arr
   for i = 1, n do
     local e = arr[i]
@@ -679,22 +705,23 @@ end
 local function friendLogApply(S, L)
   local P = rawget(C, "patch")
   if not (P and P.nlOn == true) then log("realm: the host's whole notice list came but NOLOG is not on here: not applied"); return end
-  for i = 1, L.n do if not L.items[i] then log("realm: the host's whole notice list came incomplete (%d of %d): not applied", L.got, L.n); return end end
-  local p1 = S.p1
-  -- empty this copy's list: every entry with its drawn line (newest first; the length is read again each time)
-  local guard = 0
-  while #p1.log > 0 and guard < 200 do
-    guard = guard + 1
-    local la = p1.log; local e = la[#la]
-    removeDrawn(e)
-    local before = #la
-    pcall(function() p1:removeLogEntry(e) end)
-    if #p1.log >= before then break end                 -- nothing went (the entry did not match itself): stop, never loop
+  if L.n < 0 or L.n > 200 or L.got ~= L.n then
+    log("realm: the host's whole notice list came incomplete (%d of %d): not applied", L.got, L.n)
+    R.askWorld = nil
+    return
   end
-  local left = #p1.log
+  for i = 1, L.n do if not L.items[i] then R.askWorld = nil; return end end
+  local p1 = S.p1
+  if not valid(p1) or not valid(S.eng) then return end
+  while #p1.log > 0 do
+    local la = p1.log; local n = #la
+    p1:removeLogEntry(la[n])
+    if #p1.log >= n then error("could not clear the local notice list") end
+  end
+  R.relayed = {}
   -- the host's entries in order, with the alert table held empty for these calls only
   local alerts = p1.DT_Alerts
-  local added, timed = 0, 0
+  local added = 0
   local okAll, eAll = pcall(function()
     p1.DT_Alerts = nil
     for i = 1, L.n do
@@ -702,20 +729,27 @@ local function friendLogApply(S, L)
       local actor = buildingByKey(S, h.actor)
       P.markLog(); p1:addLog(FName(h.tag), h.text, h.descr, h.opens, h.pos, actor)
       local la = p1.log; local n = #la
-      if n > 0 then
-        local e = la[n]
-        removeDrawn(e)                                    -- the line the game just drew for it: off, same tick
-        local okT = pcall(function() e.Timestamp = h.time; if h.day >= 0 then e.DayOfTheYear = h.day end; e.IsDisplayed = true end)
-        if okT then timed = timed + 1 end
-        R.relayed[logKey(e)] = true
-        added = added + 1
-      end
+      if n ~= i then error("could not append notice " .. i) end
+      local e = la[i]
+      e.Timestamp = h.time
+      if h.day >= 0 then e.DayOfTheYear = h.day end
+      e.IsDisplayed = true
+      R.relayed[logKey(e)] = true
+      added = i
     end
+    -- addLog may have drawn rows with the local clock. RemoveFromParent only detaches their widgets.
+    -- LogEntry_C:Remove also erases the lord's matching record, invalidating a reference into the array.
+    for _, d in ipairs(drawnLines()) do if valid(d.w) then d.w:RemoveFromParent() end end
+    local la = p1.log
+    for i = 1, #la do la[i].IsDisplayed = false end
+    p1:updateLogUI()
   end)
   p1.DT_Alerts = alerts                                  -- the alert table back, whatever happened above
-  pcall(function() p1:updateLogUI() end)
-  log("realm: the host's whole notice list applied: %d of %d added (%d with the host's time and day), %d of this copy's own left before (%s)",
-    added, L.n, timed, left, okAll and "ok" or ("FAILED " .. tostring(eAll)))
+  log("realm: the host's whole notice list applied: %d of %d added with the host's time and day (%s)",
+    added, L.n, okAll and "ok" or ("FAILED " .. tostring(eAll)))
+  if not okAll then R.askWorld = nil; return end
+  R.expectedLogN = L.n
+  R.pendingLogDraw = L.n > 0
   R.stats.logAll = (R.stats.logAll or 0) + 1
 end
 
@@ -727,8 +761,9 @@ townReplayed = function(r)
 end
 
 local function fresh(S)
-  if R.S == S and R.world == S.worlds then return end
+  if R.S == S and R.world == S.worlds and R.logSubscribers then return end
   R.S = S; R.world = S.worlds; R.logN = nil; R.logLast = nil; R.relayed = {}; R.pruneBase = nil; R.bCache = {}; R.logAll = nil
+  R.logSubscribers = {}; R.askWorld = nil; R.logSerial = nil; R.expectedLogN = nil; R.pendingLogDraw = nil
   R.known = {}; R.want = {}; R.famHost = {}; R.gHost = {}; R.claimSent = {}; R.regions = nil; R.tPoll = 0; R.tKey = -1e9
 end
 
@@ -787,7 +822,7 @@ function M.tick(S, clock)
     if P and P.nlOn == true then
       R.askWorld = S.worlds
       local serial = tostring(S.name) .. "." .. tostring(S.worlds) .. "." .. tostring(math.floor(os.clock() * 1000))
-      R.logAll = { serial = serial, items = {}, n = -1, got = 0 }
+      R.logSerial = serial; R.logAll = nil
       A.send("R LOGASK " .. serial)
       log("realm: the host's whole notice list asked for (%s)", serial)
     end
@@ -799,11 +834,16 @@ function M.onMessage(S, from, kind, w, line)
   fresh(S)
   local verb, rk, item, value = w[4], w[5], w[6], w[7]
   if verb == "LOGASK" then                                  -- (lane 66) a friend's join or reload: the whole list once
-    if S.role == "host" and R.on.notices and w[5] then local ok, e = pcall(hostLogAll, S, w[5]); if not ok then log("realm: whole notice list not sent: %s", tostring(e)) end end
+    if S.role == "host" and R.on.notices and w[5] then
+      logPoll(S)
+      R.logSubscribers[from] = w[5]
+      local ok, e = pcall(hostLogAll, S, w[5]); if not ok then log("realm: whole notice list not sent: %s", tostring(e)) end
+    end
     return true
   elseif verb == "LOGALL" or verb == "LOGEND" then
-    local L = R.logAll
-    if S.role ~= "friend" or not L or w[5] ~= L.serial then return true end   -- another friend's list
+    if S.role ~= "friend" or not R.logSerial or w[5] ~= R.logSerial then return true end
+    local L = R.logAll or { items = {}, n = -1, got = 0 }
+    R.logAll = L
     if verb == "LOGALL" then
       local i, n = tonumber(w[6]), tonumber(w[7])
       if i and n and i >= 1 and i <= n and n <= 200 and not L.items[i] then
@@ -816,12 +856,12 @@ function M.onMessage(S, from, kind, w, line)
       L.n = tonumber(w[6]) or L.n
       R.logAll = nil
       local ok, e = pcall(friendLogApply, S, L)
-      if not ok then log("realm: the host's whole notice list not applied: %s", tostring(e)) end
+      if not ok then R.askWorld = nil; log("realm: the host's whole notice list not applied: %s", tostring(e)) end
     end
     return true
   end
   if verb == "LOG" then
-    if S.role == "friend" and R.on.notices and w[5] and w[6] and w[7] then
+    if S.role == "friend" and R.on.notices and valid(S.p1) and w[5] and w[6] and w[7] then
       local tag, text, descr = dec(w[5]), dec(w[6]), dec((w[7]:gsub("%-$", "")))
       local pos = { X = (tonumber(w[9]) or 0) + 0.0, Y = (tonumber(w[10]) or 0) + 0.0, Z = (tonumber(w[11]) or 0) + 0.0 }
       local P = rawget(C, "patch")
@@ -834,6 +874,7 @@ function M.onMessage(S, from, kind, w, line)
           -- host in the same moment are two here too; the mark lets exactly this call into the game's routine; the
           -- actor (the name in brackets, the click target) by its key
           addHostLine(S, P, { tag = tag, text = text, descr = descr, opens = opens, pos = pos, actor = akey })
+          if R.expectedLogN then R.expectedLogN = math.min(100, R.expectedLogN + 1) end
         else
           S.p1:addLogIfNew(FName(tag), text, descr, opens, pos, buildingByKey(S, akey))
         end

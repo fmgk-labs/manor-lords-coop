@@ -377,8 +377,9 @@ local function famPushTick(S)
               local ids = {}; local a = b.assignedFamilyIDs
               for j = 1, #a do ids[#ids + 1] = math.tointeger(tonumber(un(a[j]))) or 0 end
               table.sort(ids)
-              if #ids > 0 or (tonumber(b.numActiveWorkerFamilies) or 0) == 0 then
-                A.send(string.format("L FAMS %s %s %d", X.bkeyOf(X.bident(b)), #ids > 0 and table.concat(ids, ",") or "-", tonumber(b.numActiveWorkerFamilies) or 0)); n = n + 1
+              local bk = X.bkeyOf(X.bident(b))                    -- (lane 76) "-" = a cleared actor: no line
+              if bk ~= "-" and (#ids > 0 or (tonumber(b.numActiveWorkerFamilies) or 0) == 0) then
+                A.send(string.format("L FAMS %s %s %d", bk, #ids > 0 and table.concat(ids, ",") or "-", tonumber(b.numActiveWorkerFamilies) or 0)); n = n + 1
               end
             end
           end)

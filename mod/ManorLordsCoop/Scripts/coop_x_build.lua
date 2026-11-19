@@ -145,7 +145,7 @@ X.def { name = "PLAN", status = "console2", ref = "lane 2 runs s3b, s4, s5", hel
     end
     local l, r = a:K2_GetActorLocation(), a:K2_GetActorRotation()
     e.x, e.y, e.z, e.yaw = l.X, l.Y, l.Z, r.Yaw
-    return X.bkeyOf(X.bident(m)) .. " " .. Pl.bkeyYaw(e)
+    return X.bkeyOf(rec.snap) .. " " .. Pl.bkeyYaw(e)
   end,
   apply = function(S, job)
     local m = X.findBkey(job.f[1]); if not m then return "retry:planner building not found" end
@@ -220,7 +220,7 @@ X.def { name = "PLANWALL", status = "native2", ref = "lane 28 report (two copies
     B.wallKnown[addrOf(w)] = line
     -- (lane 32) the gates' places as this copy worked them out: the replaying copy takes their heights (see apply)
     local gt = {}; for i, q in ipairs(g.gates or {}) do gt[i] = string.format("%.2f,%.2f,%.4f", q.X, q.Y, q.Z) end
-    return X.bkeyOf(X.bident(m)) .. " " .. g.kind[3] .. "," .. g.kind[4] .. " " .. line .. " " .. (#gt > 0 and table.concat(gt, "|") or "-")
+    return X.bkeyOf(rec.snap) .. " " .. g.kind[3] .. "," .. g.kind[4] .. " " .. line .. " " .. (#gt > 0 and table.concat(gt, "|") or "-")
   end,
   apply = function(S, job)
     if not drawOk() then return "the native piece (coop_patch DRAW) is not available on this copy: the wall cannot be drawn here" end
@@ -327,7 +327,7 @@ X.def { name = "PLANSEL", status = "static", ref = "lane 2 report (not run)", he
   ready = function(S, rec)
     local m = rec.obj; if not valid(m) then return nil, "planner building gone" end
     if not X.owned(m) then return nil, "not the lord's" end
-    return X.bkeyOf(X.bident(m)) .. " " .. rec.ref .. " " .. rec.op .. (SEL[rec.op].arg and ("," .. rec.v) or "")
+    return X.bkeyOf(rec.snap) .. " " .. rec.ref .. " " .. rec.op .. (SEL[rec.op].arg and ("," .. rec.v) or "")
   end,
   apply = function(S, job)
     local m = X.findBkey(job.f[1]); if not m then return "retry:planner building not found" end

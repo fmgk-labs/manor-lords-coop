@@ -65,7 +65,7 @@ X.def { name = "TRAINREG", status = "console2", ref = "lane_s21_1", argt = "i",
     local key = r and T.rkey(r) or ("#" .. id)
     local ek = "TRAINREG@" .. tostring(rec.addr) .. ":" .. key
     if T.expect[ek] and T.expect[ek] > os.clock() then T.expect[ek] = nil; return nil, "echo" end
-    return X.bkeyOf(X.bident(b)) .. " " .. key
+    return X.bkeyOf(rec.snap) .. " " .. key
   end,
   apply = function(S, job)
     local b = X.findBkey(job.f[1]); if not b then return "retry:building not found" end
@@ -258,83 +258,7 @@ X.hook(X.WI .. "W_Inventory_FieldWidget.W_Inventory_FieldWidget_C:BndEvt__Invent
     return { k = "PRIO", obj = b, addr = addrOf(b), late = "buildPriority" }
   end)
 
--- ================================================================ a setter the game repeats every frame is sent once
--- FAULT found by pressing (session 21, lane 1): while a field's panel is open and the town may not fertilize, the
--- panel calls SetAllowFertilization(false) on every frame. Each call was sent: 297 FERTILIZE lines in 20 s from the
--- host, 89 from a friend. An absolute setter called again with the same arguments on the same target changes nothing,
--- so the repeat is dropped inside the hook (no line, no log entry) unless something else happened to that target in
--- between: another value, or a replay from another copy (T.touched). A repeat is only recognised for 5 s after the
--- last one, so a stale entry can never hide a later real change. What is left: one line when the panel opens and one
--- more whenever the repeat pauses for 5 s (measured: 2 lines while a panel was open for 12 s, instead of 297).
--- Not covered: a value changed by another module inside Coop.town.quiet does not reset the memory (5 s at most).
-T.xlast = T.xlast or {}; T.xdropped = T.xdropped or 0
-local function onceOnly(h, name)
-  local see0 = h.see
-  h.see = function(self, a1, a2, a3, a4)
-    local rec = see0(self, a1, a2, a3, a4)
-    if not rec or rec.k ~= name or not rec.addr or not rec.args then return rec end
-    local now = os.clock()
-    local tt = T.touched[rec.addr]
-    -- the town module drops these as echoes itself; (lane 69) not for FERTILIZE, whose replay updates the memory below:
-    -- a repeat at 0.75 to 0.8 s after another copy's change on that field slipped through and was sent (game run, 3 of 3)
-    if tt and now - tt < 0.8 and name ~= "FERTILIZE" then return rec end
-    local t = {}; for i, v in ipairs(rec.args) do t[i] = tostring(v) end
-    local key = name .. ":" .. table.concat(t, ",")
-    local L = T.xlast[rec.addr]
-    -- (lane 69, game run 2026-11-18) for FERTILIZE a replay updates this memory itself (below), so the value seen last
-    -- is known after another copy's change too: a repeat of it is never the player, however long the pause between
-    -- repeats (measured with nobody acting: a field panel left open sent FERTILIZE twice in 90 s after pauses of more
-    -- than 5 s, and after a field priority replay on that field two more; each made the other copies redraw)
-    local long = (name == "FERTILIZE")
-    if L and L.key == key and (long and now - L.t < 600.0 or (now - L.t < 5.0 and not (tt and tt > L.t))) then
-      L.t = now; T.xdropped = T.xdropped + 1
-      return nil
-    end
-    T.xlast[rec.addr] = { key = key, t = now }
-    T.xn = (T.xn or 0) + 1
-    if T.xn % 400 == 0 then for a, e in pairs(T.xlast) do if now - e.t > 600 then T.xlast[a] = nil end end end
-    return rec
-  end
-end
--- a new world (load, join, resync) has new objects at the old addresses: forget everything remembered by address
-C.register("x_town", { onWorld = function(S) T.vnames = {}; T.vtyped = {}; T.xlast = {} end })
-
--- Only for the setter that was measured to repeat. (A first version wrapped every absolute setter; it ran clean for
--- CROPYEAR, CROPSPRING, RECIPE_ON / OFF, SLEEP, BFLAG, MULE_*, but whether every other setter's arguments are
--- absolute values was not checked one by one, so the others are left exactly as the town module made them.)
-local ONCE = { FERTILIZE = true }
-for _, h in pairs(T.hooks) do
-  if #h.defs == 1 and not h.x1once then
-    local d = T.defs[h.defs[1]]
-    if d and ONCE[d.name] and d.argt and d.argt ~= "" and not d.rel then h.x1once = true; onceOnly(h, d.name) end
-  end
-end
--- (lane 69, game run 2026-11-18) FAULT: with the field's panel open on the host AND on a friend, FERTILIZE went back
--- and forth for as long as both stayed open (a line from each copy every 1.8 s, measured with and without the panel
--- redraws: 6 and 6 in 10 s, 5 and 6). Each copy's panel repeats SetAllowFertilization(false) every frame; the repeat
--- after a replay was let through once the replay's echo window (0.75 s) had passed, as "something else happened to
--- that target", so every replay made the next send. Worse, the host's own field priority click on that field was then
--- dropped as an echo of the last FERTILIZE replay (host 4, friend 3). A replay now counts as the last value seen on
--- that target: a repeat of the value just replayed is the panel repeating, not the player.
-for _, name in pairs({ "FERTILIZE" }) do
-  local d = T.defs[name]
-  if d and d.apply and not d.x69once then
-    d.x69once = true
-    local apply0 = d.apply
-    d.apply = function(S, job)
-      local r, f, e = apply0(S, job)
-      if r == "ok" then
-        local b = X.findBkey(job.f[1]); local a = b and addrOf(b)
-        if a then
-          local vals = X.decArgs(d.argt, job.f[2]); local t = {}
-          for i, v in ipairs(vals) do t[i] = tostring(v) end
-          T.xlast[a] = { key = name .. ":" .. table.concat(t, ","), t = os.clock() + 0.01 }   -- after the replay's touch
-        end
-      end
-      return r, f, e
-    end
-  end
-end
+C.register("x_town", { onWorld = function() T.vnames = {}; T.vtyped = {} end })
 
 -- ================================================================ a combo box the PANEL fills is not the player choosing
 -- FAULT found by lane 16 (2026-11-12, host and friend, nothing pressed): when the trade tab of a trading post or a
@@ -455,7 +379,9 @@ local function trainClearSee(self)
 end
 X.hook(PTC .. "Button_121_K2Node_ComponentBoundEvent_2_OnButtonReleasedEvent__DelegateSignature", { "TRAINCON" }, trainClearSee)
 X.hook(PTC .. "Button_K2Node_ComponentBoundEvent_3_OnButtonReleasedEvent__DelegateSignature", { "TRAINCON" }, trainClearSee)
-local function bk(b) if not valid(b) then return "-" end; return X.bkeyOf(X.bident(b)) end
+-- "-" = no station (not connected); "?" = a station that has no usable name right now (a cleared actor): that line is
+-- not sent (lane 76), it must not read as "not connected"
+local function bk(b) if not valid(b) then return "-" end; local k = X.bkeyOf(X.bident(b)); return k == "-" and "?" or k end
 local function trainPair(b) local s, t; pcall(function() s = b.trainConnectionSource; t = b.trainConnectionTarget end); return bk(s) .. "|" .. bk(t) end
 local function trainPoll(S)
   -- the stations are looked up in the building list every 10 s only: the full walk every 0.5 s cost about 9 ms per

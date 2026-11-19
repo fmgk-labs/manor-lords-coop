@@ -282,21 +282,21 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 - **Fixed with it:** with a field's panel open on two copies, the field's fertilization setting went back and forth between them and could swallow the host's own field priority click.
 - **Workaround (0.2.2 and 0.2.3):** close the panel and open it again.
 
-### G12. Some host notices missing on a friend (0.2.4 and 0.2.5)
+### G12. Some host notices missing on a friend (0.2.4 and 0.2.5; fixed in 0.2.6)
 
 - **You see:** the host's notice list shows "Storage is full (Storehouse)" or "No storage space left for production (Sawpit)"; a friend's list shows fewer lines, or "No recent events.".
 - **Numbers:** on two test saves the friend lacked 1 and 3 of the host's notices.
 - **Basis:** the release panel check on 0.2.4 and 0.2.5 (two copies, one PC). Cause found: a friend's own list clean-up removed the notices copied from the host. Fix being built for 0.2.6.
 - **Workaround:** read the host's list.
 
-### G13. Another lord's army count late on a friend
+### G13. Another lord's army count late on a friend (fixed in 0.2.6)
 
 - **You see:** another lord's army can show more soldiers on a friend than on the host for up to about 4.5 seconds, for example 36 against 0 after a fight.
 - **Numbers:** 27 of 43,335 readings in one test session were outside 3 seconds.
 - **Basis:** helper's runs on test copies. Fix being built for 0.2.6.
 - **Workaround:** none needed; it settles by itself.
 
-### G14. An animal that starves
+### G14. An animal that starves (fixed in 0.2.6, except oxen: G20)
 
 - **You see:** when a sheep or cow starves, the notice reaches a friend, but the animal stays alive there about 30 seconds longer and its body is not shown.
 - **Basis:** helper's runs on test copies. Fix being built for 0.2.6.
@@ -311,7 +311,7 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 - **You see:** after a reload a friend can show more free merchants than the host. They are not removed, to keep the merchants the host also has safe.
 - **Basis:** helper's runs: with removal on, a friend could delete a merchant the host still had; 0.2.5 keeps them all (3 of 3 reloads equal at 21 merchants). A safe removal is planned for 0.2.6.
 
-### G17. A rare resync after a demolition (0.2.4 and 0.2.5)
+### G17. A rare resync after a demolition (0.2.4 and 0.2.5; fixed in 0.2.6)
 
 - **You see:** once in a test session, a demolition made a friend resync (a short reload).
 - **Basis:** helper's run on test copies: the building's name was lost before the line was sent. The same code is in 0.2.4. Fix being built for 0.2.6.
@@ -322,12 +322,30 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 - **You see:** on a friend, a gatherer may carry by hand where the host's uses a hand cart; the carts drawn are the host's.
 - **Basis:** helper's runs: task given 15 of 15, the cart back at the host's stand 12 of 13. Being built for 0.2.6.
 
-### G19. A trade limit changed by another player, with the Trade tab open (0.2.5)
+### G19. A trade limit changed by another player, with the Trade tab open (0.2.5; fixed in 0.2.6)
 
 - **You see:** another player changes a trade limit while you have the same building's Trade tab open. The value is right in the game, but your open panel keeps showing the old number.
 - **Numbers:** 1 of 1 try with real clicks on the 0.2.5 zip (10 to 11; the open panel still showed 10 minutes later). Worker counts in an open panel did redraw (2 of 2).
 - **Basis:** the real-click check on test copies. Fix being built for 0.2.6.
 - **Workaround:** close the panel and open it again.
+
+### G20. An ox that dies on the host
+
+- **You see:** if an ox dies on the host, a friend may keep its ox for about 25 seconds, and its body is not shown there.
+- **Basis:** helper's runs on test copies. A test command that kills an ox crashed the game copy; whether the plain game does the same is being checked. Other farm animals are carried within about a second.
+- **Workaround:** none needed; the count settles by itself.
+
+### G21. A claim while enemies are in the region
+
+- **You see:** the map does not let you claim a region while enemy units are in it. If an enemy squad is still on the host but already gone on a friend's copy (or the other way round), the friend's claim button can differ from the host's for a few seconds.
+- **Basis:** a reading of the game's code and runs on test copies; a claim the rule forbids was not seen to happen. A check on the host before it carries out a friend's claim is being built for 0.2.7.
+- **Workaround:** none needed.
+
+### G22. Two players change the same region's setting in the same second (0.2.5 and 0.2.6)
+
+- **You see:** you change a trade limit, a trade rule or a production limit less than a second after another player's change to the same region reached you. Your change stays on your copy but is not sent, so the two copies show different numbers (seen: 34 against 33) until the next change of that value. Also: if you hold + down while another player changes the same limit, your value on release wins.
+- **Basis:** the real-click check of 0.2.6 on test copies; the same rule is in 0.2.5. Fix planned for 0.2.7.
+- **Workaround:** change the value once more.
 
 ---
 

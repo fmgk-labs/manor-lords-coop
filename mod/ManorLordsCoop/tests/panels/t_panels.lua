@@ -171,6 +171,9 @@ check(lord.shouldUpdateArmyUI == true and lord.shouldUpdateArmyListUI == nil, "a
 reset(); at(3020.0)
 P.touched("O:SPEED", nil); tick()
 check(lord.shouldUpdateArmyUI == nil and lord.shouldUpdateStatUI == nil and count("field") == 0, "a speed order redraws nothing")
+reset(); at(3025.0)
+P.touched("O:PING", nil); tick()
+check(lord.shouldUpdateArmyUI == nil and lord.shouldUpdateArmyListUI == nil and count("field") == 0, "a friend's once-a-minute link check (O PING) redraws nothing")
 reset(); at(3030.0)
 P.touched("WAR", nil); tick(); lord.shouldUpdateStatUI = nil
 at(3030.1); P.touched("WAR", nil); tick()
@@ -218,6 +221,85 @@ reset(); at(4060.0)
 P.touched("A:BEHAV", nil); tick()
 check(lord.shouldUpdateArmyUI == true and count("tree") == 0, "a player's behaviour stance taken from the host raises the army flag")
 DEVOPEN = {}
+
+-- ---------------------------------------------------------------- lane 78: rows the panel's own redraw leaves alone
+-- A trading post's trade rows, storage filter goods and limit entries are not redrawn by the panel's redraw; each gets
+-- its own call, in shown and hidden tabs, inside the quiet wrapper, under the same "player is using it" rules.
+local ROWCALLS, QUIETDEPTH, INQUIET = {}, 0, {}
+C.town.quiet = function(fn, ...) QUIETDEPTH = QUIETDEPTH + 1; local ok, e = pcall(fn, ...); QUIETDEPTH = QUIETDEPTH - 1; if not ok then error(e, 0) end end
+local function row(name, cls, fn)
+  local w = widget(name, cls)
+  w[fn] = function(self) ROWCALLS[name] = (ROWCALLS[name] or 0) + 1; INQUIET[name] = QUIETDEPTH > 0 end
+  return w
+end
+local tradeRow = row("trade.row1", "targetStockWidget_tradeTarget_C", "updateContents")
+local tradeRow2 = row("trade.row2", "targetStockWidget_tradeTarget_C", "updateContents")
+local filterRow = row("filter.good", "storageFilterGood_C", "updateStorageFilterCheckmark")
+local rowTyping = false
+local rowText = widget("trade.row1.text", "EditableTextBox", { HasKeyboardFocus = function() return false end, HasFocusedDescendants = function() return rowTyping end })
+tradeRow.GetChildrenCount = function() return 1 end
+tradeRow.GetChildAt = function(_, i) return rowText end
+local limitRow = widget("limit.entry", "WorkplaceLimitEntry_C")
+limitRow.currentlyProducedGoodType = 17
+limitRow.updateEntry = function(self, b, g) ROWCALLS["limit.entry"] = (ROWCALLS["limit.entry"] or 0) + 1; INQUIET["limit.entry"] = QUIETDEPTH > 0; self.args = { b, g } end
+local hiddenTab = widget("tab.hidden", "W_InventoryTab_StorageFilters_C", { vis = 1 })     -- collapsed
+hiddenTab.WidgetTree = { RootWidget = filterRow }
+local list = widget("trade.list", "VerticalBox")
+local listKids = { tradeRow, tradeRow2, limitRow }
+list.GetChildrenCount = function() return #listKids end
+list.GetChildAt = function(_, i) return listKids[i + 1] end
+local post = obj({ Region = regionA, key = "6,700,700,0" }); byKey[post.key] = post
+limitRow.building = post
+local pPost = panel("post", post)
+local postRoot = pPost.WidgetTree.RootWidget
+local postKids = { list, hiddenTab, widget("post.combo", "ComboBoxString", { IsOpen = function() return comboOpen end }) }
+postRoot.GetChildrenCount = function() return #postKids end
+postRoot.GetChildAt = function(_, i) return postKids[i + 1] end
+OPEN = { pPost, pFarm }
+local function rc(name) return ROWCALLS[name] or 0 end
+local function rowsReset() ROWCALLS, INQUIET = {}, {}; rowTyping = false end
+
+reset(); rowsReset(); at(5000.0)
+P.touched("TTARGET", "hofA"); tick()
+check(count("post") == 1 and rc("trade.row1") == 1 and rc("trade.row2") == 1, "a remote trade limit: the trading post's panel and each of its trade rows are redrawn")
+check(rc("filter.good") == 1, "a row in a hidden tab is redrawn too (the tab is not redrawn when shown again)")
+check(rc("limit.entry") == 1 and limitRow.args[1] == post and limitRow.args[2] == 17 and INQUIET["limit.entry"] == true, "a limit entry is filled again with its own building and produced good, inside the quiet wrapper")
+check(INQUIET["trade.row1"] == true and INQUIET["filter.good"] == true, "each row is redrawn inside the town module's quiet wrapper (its own handlers send nothing)")
+reset(); rowsReset(); at(5010.0)
+P.touched("FILTER", post.key); tick()
+check(rc("filter.good") == 1 and rc("trade.row1") == 1, "a remote storage filter: the rows of that building's panel are redrawn")
+reset(); rowsReset(); at(5020.0)
+rowTyping = true; P.touched("TTARGET", "hofA"); tick(); at(5021.0); tick()
+check(count("post") == 0 and rc("trade.row1") == 0 and rc("filter.good") == 0, "no redraw and no row call while this player types in a row's box (focus inside the box)")
+rowTyping = false; at(5021.2); tick()
+check(count("post") == 1 and rc("trade.row1") == 1, "redrawn when the typing ends")
+reset(); rowsReset(); at(5030.0)
+P.localInput(); at(5030.1); P.touched("TTARGET", "hofA"); tick()
+check(rc("trade.row1") == 0, "no row call within 0.5 s of this player's press")
+at(5030.6); tick(); check(rc("trade.row1") == 1, "row redrawn right after")
+reset(); rowsReset(); at(5040.0)
+comboOpen = true; P.touched("TRULE", "hofA"); tick(); at(5041.0); tick()
+check(rc("trade.row1") == 0, "no row call while a drop-down of the panel is open")
+comboOpen = false; at(5041.2); tick(); check(rc("trade.row1") == 1, "row redrawn when it closes")
+reset(); rowsReset(); at(5050.0)
+P.touched("PRIO", farm.key); tick()
+check(rc("trade.row1") == 0 and count("farm") == 1, "a change to another region's building leaves the trading post's rows alone")
+reset(); rowsReset(); at(5060.0)
+for i = 1, 7200 do at(5060.0 + i * 0.016); tick() end
+check(rc("trade.row1") + rc("trade.row2") + rc("filter.good") + rc("limit.entry") == 0 and count("post") == 0, "nobody acting: no row call at all")
+reset(); rowsReset(); at(5070.0)
+tradeRow2.alive = false; P.touched("TTARGET", "hofA"); tick(); tradeRow2.alive = true
+check(rc("trade.row1") == 1 and rc("trade.row2") == 0, "a row gone (list made again) gets no call")
+reset(); rowsReset(); at(5080.0)
+tradeRow.updateContents = function() error("boom") end
+local e0 = P.n.errors; P.touched("TTARGET", "hofA"); tick()
+check(P.n.errors == e0 + 1 and rc("trade.row2") == 1, "a row whose call fails is counted as an error; the other rows are still redrawn")
+reset(); rowsReset(); at(5090.0)
+tradeRow.updateContents = function(self) ROWCALLS["trade.row1"] = (ROWCALLS["trade.row1"] or 0) + 1 end
+local c0, m0 = P.n.capped or 0, P.cfg.maxNodes; P.cfg.maxNodes = 4
+P.touched("TTARGET", "hofA"); tick(); P.cfg.maxNodes = m0
+check((P.n.capped or 0) == c0 + 1 and LOG[#LOG]:find("stopped at 4 widgets", 1, true) ~= nil, "a walk stopped by the node cap is counted and logged (rows past it would be missed)")
+OPEN = { pField, pMill, pFarm }
 
 print(P.status())
 print(string.format("%d passed, %d failed", pass, fail))

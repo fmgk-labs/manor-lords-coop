@@ -30,7 +30,7 @@ local A = C.api
 local un, valid = A.un, A.valid
 local E = C.events or {}
 C.events = E
-E.version = "0.14"
+E.version = "0.22"
 E.on = E.on or {}
 local DEFAULT_ON = {
   quests = true,       -- the host's quest lists are pushed and compared
@@ -136,6 +136,7 @@ local function fresh(S)
   E.vill = nil; E.tVill = 0; E.pdQ = {}; E.pdMiss = {}; E.keptSaid = {}
   E.vSeen = {}; E.sentC = {}; E.tKeyC = -1e9; E.tCorpse = 0; E.tCorpseF = 0; E.hostC = {}; E.cState = {}; E.askedCorpses = false; E.tCensus = os.clock(); E.censusSig = nil; E.censusOdd = nil   -- lane 64: corpses, census
   E.vill = nil; E.tVill = 0; E.pdQ = {}
+  E.animalBodies = {}; E.lastAnimalDeath = 0
   E.campMap = nil; E.loot = {}; E.tTheft = 0; E.theftN = 0; E.theftSeen = {}; E.theftWant = {}; E.theftDay = nil; E.ownGrow = {}
   log("reset for world %d", S.worlds)
 end
@@ -673,8 +674,9 @@ local function campGone(S, clock, k, c, st)
     elseif age < GONE_LOOK then st.why = "seen missing only once so far"   -- nobody holds on to it: the second look removes it
     elseif T.pend or #(T.aq or {}) > 0 then st.why = "the helper lord was busy"
     else
-      local l = c.b:K2_GetActorLocation()
-      local ok, id = pcall(T.inject, "DEMOLISH", string.format("%d,%.0f,%.0f,%.0f", CAMP_TYPE, l.X, l.Y, l.Z), "events")
+      -- (lane 76) the camp's place from the town module's safe name (a cleared actor reads 0,0,0)
+      local l = T.api.bident(c.b) or { x = 0, y = 0, z = 0 }
+      local ok, id = pcall(T.inject, "DEMOLISH", string.format("%d,%.0f,%.0f,%.0f", CAMP_TYPE, l.x, l.y, l.z), "events")
       if not ok then campResync(S, k, st, "the town module could not take the removal (" .. tostring(id) .. ")"); return end
       st.id = id; st.why = "the town module's DEMOLISH did not take it away"; bump("k_demolish")
       log("bandit camp %s is gone on the host: removal handed to the town module (%s, %.1f s after it was seen missing)", k, tostring(id), age)
@@ -1424,7 +1426,7 @@ local function corpsesOf(reg)
         local d = u.MLCoopCorpseDays
         if type(d) == "number" and d >= 0 and d <= 30 then e.days = d end
       end
-      e.x, e.y = placeOf(u)
+      e.x, e.y, e.z = placeOf(u)
       t[#t + 1] = e
     end
   end
@@ -1435,12 +1437,110 @@ local function allRegions(S)
   for i = 1, #arr do local r = un(arr[i]); if valid(r) then local k = rkey(r); if k then t[#t + 1] = { k = k, r = r } end end end
   return t
 end
+-- EUnitRole includes a bandit and None between the mule and the pig.
+local function animalRole(role)
+  return role and ((role >= 8 and role <= 16) or (role >= 19 and role <= 22))
+end
+-- An OX (12) is never killed or made dead from here. Measured on lane 2 (2026-11-18): SMUnit:just_die on one ox just
+-- made, and nothing else, ended the host's copy and the friend's within 3 s (sitting an4: access violation reading
+-- 0xD88). Two earlier sittings ended the same way after an ox died among other kinds (an3: chicken, sheep, lamb, ox,
+-- cow, calf, of which all but the ox were killed alone later without harm; an2: all kinds). The other farm kinds
+-- were killed the same way without harm. An ox the host no longer has is taken out by the facts module's count (no
+-- body here). DEER (8) and HARE (20) are wild and no town
+-- animals (Region.residents has none). The one run that carried a death of each (an2) ended in the ox crash, so they
+-- are left alone too until someone tests them alone.
+local function animalKillable(role) return animalRole(role) and role ~= 12 and role ~= 8 and role ~= 20 end
+-- The town's own list (Region.residents) is what the game counts its livestock by (measured: equal to
+-- GetTotalLivestockCountOfType for six kinds on both copies). SMUnit.currentRegion is where the animal stands: an
+-- animal the facts module made beside a building of another region was "elsewhere", stayed alive and kept its count.
+local function livingAnimals(S, reg, role)
+  local list, units = {}, reg.residents
+  for i = 1, #units do
+    local raw = units[i]
+    local u = ptrOk(raw) and un(raw) or nil
+    if u and valid(u) and not u.dead and u.currentUnitRole == role then list[#list + 1] = u end
+  end
+  return list
+end
+-- Announce an actual addition to a complete corpse list. An animal sold or run away leaves no body.
+local function hostAnimalDeaths(S, R, list)
+  local old, now, counts = E.animalBodies[R.k], {}, {}
+  for _, e in ipairs(list) do
+    if animalRole(e.role) and valid(e.u) then
+      now[addr(e.u)] = true
+      counts[e.role] = (counts[e.role] or 0) + 1
+    end
+  end
+  if old then
+    for _, e in ipairs(list) do
+      if animalRole(e.role) and valid(e.u) and not old[addr(e.u)] and e.x then
+        local entry = C.jobs and C.jobs.byAddr and C.jobs.byAddr[addr(e.u)]
+        E.animalSerial = (E.animalSerial or 0) + 1
+        A.send(string.format("E AD %d %s %d '%s %d %d %d,%d,%d %s", E.animalSerial, R.k, e.role,
+            enc(e.n), #livingAnimals(S, R.r, e.role), counts[e.role], math.floor(e.x + 0.5),
+            math.floor(e.y + 0.5), math.floor(e.z + 0.5), entry and entry.key or "-"))
+        bump("animalSent")
+      end
+    end
+  end
+  E.animalBodies[R.k] = now
+end
+local function friendAnimalDeath(S, w)
+  local serial, role, name = tonumber(w[5]), tonumber(w[7]), (w[8] or ""):match("^'(.*)$")
+  local living, bodies = tonumber(w[9]), tonumber(w[10])
+  local x, y, z = (w[11] or ""):match("^(%-?%d+),(%-?%d+),(%-?%d+)$")
+  if not serial or serial <= E.lastAnimalDeath or not animalKillable(role) or role ~= math.floor(role) or not name
+      or not living or living < 0 or not bodies or bodies < 1 or not x or not valid(S.eng) then return end
+  E.lastAnimalDeath = serial
+  local reg = regionByKey(S, w[6])
+  if not valid(reg) then return end
+  local seen, complete = corpsesOf(reg)
+  if not complete then return end
+  local count = 0
+  for _, e in ipairs(seen) do if e.role == role then count = count + 1 end end
+  if count >= bodies then return end  -- a replay overlapping the save, or a death already carried in combat
+  name, x, y, z = dec(name), tonumber(x), tonumber(y), tonumber(z)
+  local live = livingAnimals(S, reg, role)
+  local victim, spawned
+  if #live > living then
+    local best, distance, tied = -1, math.huge, false
+    for _, u in ipairs(live) do
+      if valid(u) then
+        local key = C.jobs and C.jobs.byAddr and C.jobs.byAddr[addr(u)]
+        local ux, uy = placeOf(u)
+        local d = ux and (ux - x)^2 + (uy - y)^2 or math.huge
+        local rank = (name ~= "" and u.DisplayName:ToString() == name) and 2 or 0
+        if (key and key.key or "-") == (w[12] or "-") then rank = rank + 1 end   -- the same place on the job board, or none on both
+        if rank > best or (rank == best and d < distance) then
+          victim, best, distance, tied = u, rank, d, false
+        elseif rank == best and d == distance then tied = true end
+      end
+    end
+    -- Animals of one kind look alike and are not paired between the copies. When neither a name nor the job board
+    -- singles out the host's animal, the nearest of its kind dies here: the count and the body follow the host
+    -- within 3 s. Leaving it alive kept the herd one too many for 25 s and never gave the body.
+    if valid(victim) and (tied or (best <= 1 and distance > 100^2)) then bump("animalNearest") end
+  else
+    -- No spare living animal here. Preserve the host's survivors and create only the missing body.
+    victim = S.eng:SpawnLivestock(role, {X=x, Y=y, Z=z}, reg)
+    spawned = true
+  end
+  if not valid(victim) or victim.dead then bump("animalUnmatched"); log("animal death: %s role %d had no identified animal here", w[6], role); return end
+  local ok = pcall(function() victim:just_die() end)
+  if not ok or not valid(victim) or not victim.dead then
+    if spawned and valid(victim) and not victim.dead then S.eng:destroyUnit(victim) end
+    bump("animalFailed"); return
+  end
+  if victim.DisplayName:ToString() ~= name then victim.DisplayName = name end
+  bump("animalDied"); log("animal death: %s role %d died here on the host's word", w[6], role)
+end
 local function hostCorpses(S, clock)
   local key = clock - (E.tKeyC or -1e9) >= KEY; if key then E.tKeyC = clock end
   local none = {}
   for _, R in ipairs(allRegions(S)) do
     local ok, list, complete = pcall(corpsesOf, R.r)
     if ok then
+      if complete and E.on.vdeaths then hostAnimalDeaths(S, R, list) end
       local parts, ages, hasAge, len, whole = {}, {}, false, 0, complete and 1 or 0
       for _, e in ipairs(list) do
         local p = string.format("%s~%d~%d~%d", enc(e.n), e.role, math.floor((e.x or 0) + 0.5), math.floor((e.y or 0) + 0.5))
@@ -1469,6 +1569,36 @@ local function hostCorpses(S, clock)
       A.send("E PZ " .. table.concat(part, ","))
     until i > #none
   end
+end
+-- (lane 64, for 0.2.6) An animal's body the host has and this copy lacks. Measured: a friend's reload brings no
+-- animal body back (the host had 2, the reloaded friend 0), and a death line can find no animal to kill. The body is
+-- made the way the death line makes it: the engine's own SpawnLivestock at the host's place, then the game's own
+-- just_die. The host's list has no height: the nearest unit's height stands in for the ground.
+local function makeAnimalBody(S, reg, role, h)
+  local z, best = nil, math.huge
+  local units = S.eng.unitArr
+  for i = 1, #units do
+    local u = un(units[i])
+    if valid(u) then
+      local ux, uy, uz = placeOf(u)
+      if ux then local d = (ux - h.x)^2 + (uy - h.y)^2; if d < best then best, z = d, uz end end
+    end
+  end
+  if not z then return false end
+  local u
+  local ok = pcall(function()
+    u = S.eng:SpawnLivestock(role, { X = h.x + 0.0, Y = h.y + 0.0, Z = z + 0.0 }, reg)
+    if valid(u) then u:just_die() end
+  end)
+  if not ok or not valid(u) or not u.dead then
+    if valid(u) and not u.dead then pcall(function() S.eng:destroyUnit(u) end) end
+    bump("animalBodyFailed"); return false
+  end
+  pcall(function() if h.n ~= "" and u.DisplayName:ToString() ~= h.n then u.DisplayName = h.n end end)
+  -- the host's age of the body, so that the game's own age rule takes it away on the host's day (as for people)
+  if h.days and corpseDaysAvailable() then pcall(function() u.MLCoopCorpseDays = h.days end) end
+  bump("animalBodyMade"); log("corpses: the host has the body of an animal (role %d) at %d,%d that this copy lacks: made here", role, math.floor(h.x / 100), math.floor(h.y / 100))
+  return true
 end
 local function friendCorpses(S, clock)
   if S.replay then return end
@@ -1530,6 +1660,11 @@ local function friendCorpses(S, clock)
         end
       end
       for role, n in pairs(hostN) do local have = mine[role] and #mine[role] or 0; if n > have then missing = missing + (n - have) end end
+      -- (an6) a body this copy's own game has just taken away (its age, at this copy's day turn) is not made again: the
+      -- host's list still had it for 0.7 s, the body was made anew and stood here 3.5 s longer than on the host
+      st.have = st.have or {}; st.lost = st.lost or {}
+      for role, n in pairs(st.have) do if (mine[role] and #mine[role] or 0) < n then st.lost[role] = clock end end
+      st.have = {}; for role, L in pairs(mine) do st.have[role] = #L end
       -- a body the host has and this copy lacks: counted and logged once per standing difference, after 15 s
       if missing > 0 and not waiting then
         st.missT = st.missT or clock
@@ -1538,6 +1673,30 @@ local function friendCorpses(S, clock)
           log("corpses: %s has %d body(ies) on the host that this copy lacks: not made here (the person lives here or was never here; see the report of lane 64)", R.k, missing)
         end
       else st.missT = nil; if missing == 0 then st.missSaid = nil end end
+      if missing > 0 and st.missT and clock - st.missT < 0.4 then E.tCorpseF = clock - CORPSE_EVERY + 0.45 end   -- look again as soon as the wait is over
+      if missing > 0 and not waiting and complete and H.whole and E.on.vdeaths and not C.hold and st.missT
+          and clock - st.missT >= 0.4 and clock - (S.worldT or 0) >= 1.0 and clock - (st.bodyTry or -1e9) >= 5.0 then   -- (an5: with 1.0 and 3.0 the bodies were back 3.3 s after a reload)
+        local tried = 0
+        for role, n in pairs(hostN) do
+          local have = mine[role] and #mine[role] or 0
+          if animalKillable(role) and n > have and clock - (st.lost[role] or -1e9) >= 2.5 then
+            local names, lack = {}, {}
+            for _, e in ipairs(mine[role] or {}) do names[e.n] = (names[e.n] or 0) + 1 end
+            for _, h in ipairs(H.list) do
+              if h.role == role then
+                if (names[h.n] or 0) > 0 then names[h.n] = names[h.n] - 1 else lack[#lack + 1] = h end
+              end
+            end
+            for i = 1, math.min(#lack, n - have) do
+              if tried < CORPSE_MAX and lack[i].x and lack[i].y then
+                tried = tried + 1
+                if makeAnimalBody(S, R.r, role, lack[i]) then taken = taken + 1 end
+              end
+            end
+          end
+        end
+        if tried > 0 then st.bodyTry = clock; st.missT = nil end
+      end
       -- bodies here that the host has not
       if #surplus > 0 and complete and H.whole and not waiting and E.on.corpseRemove then
         local sig = #surplus .. "/" .. #list .. "/" .. #H.list
@@ -1938,6 +2097,8 @@ function M.onMessage(S, from, kind, w, line)
       E.hostO = H
     elseif sub == "T" then
       if E.on.thefts then local ok, e = pcall(friendTheft, S, w); if not ok then log("thefts: the host's line failed here: %s", tostring(e)) end end
+    elseif sub == "AD" then
+      if E.on.vdeaths and not C.hold and not (C.stale and C.stale("host", w)) then guarded("animal death", friendAnimalDeath, S, w) end
     elseif sub == "PD" then
       if w[5] and E.on.vdeaths then
         -- (lane 64) the region, the notice (tag and text key: plain words only, or none) and the host's place

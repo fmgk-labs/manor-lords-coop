@@ -451,6 +451,7 @@ local function scanRetinue(S, clock)
   if not (X and X.bkeyOf) then return end
   for _, m in ipairs(rmanors(S)) do
     local mk = X.bkeyOf(X.bident(m))
+    if mk == "-" then return end                        -- (lane 76) a manor without a usable name (a cleared actor): nothing read, nothing sent
     local arr = retinue(m)
     local n0 = RT[mk]                                   -- the list's length when last read
     if n0 ~= #arr then
@@ -1352,6 +1353,7 @@ local function onOrderEvent(S, line, clock)
   end
   if #taken == 0 then return end
   local key = X.bkeyOf(X.bident(b))
+  if key == "-" then log("ARMY order against a building without a usable name (a cleared actor): not sent"); return end   -- (lane 76)
   local hs = {}
   for i, h in ipairs(taken) do hs[i] = tostring(S.role == "host" and h or A.toHost(h)); if S.role ~= "host" then S.localOrderT[h] = clock end end
   send(string.format("%s BLD %s %s %.1f %.1f %.1f%s", S.role == "host" and "A" or "O", table.concat(hs, ","), key, cx, cy, cz, tail))

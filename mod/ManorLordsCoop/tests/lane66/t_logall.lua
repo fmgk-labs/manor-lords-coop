@@ -12,18 +12,20 @@ local function check(c, what) if c then pass = pass + 1; print("  PASS  " .. wha
 
 local function str(s) return { ToString = function() return s end } end
 _G.FName = function(s) return str(s) end
-_G.FindAllOf = function() return {} end
+local activeLord
+_G.FindAllOf = function(cls) return cls == "LogEntry_C" and activeLord.widgets or {} end
 _G.RegisterHook = function() end
 
 -- a lord with a list; addLog appends (time and day as "now"), removeLogEntry removes every equal entry (text, place)
 local function makeLord(now, today)
-  local L = { log = {}, DT_Alerts = { alerts = true }, alertsPlayed = 0 }
+  local L = { log = {}, widgets = {}, DT_Alerts = { alerts = true }, alertsPlayed = 0 }
   function L:GetAddress() return 1 end
   function L:IsValid() return true end
   function L:addLog(tag, text, descr, opens, pos, actor)
     if self.DT_Alerts ~= nil then self.alertsPlayed = self.alertsPlayed + 1 end
     self.log[#self.log + 1] = { Tag = str(tag:ToString()), LogText = str(text), fullDescr = str(descr), opensMenu = opens,
       Location = { X = pos.X, Y = pos.Y, Z = pos.Z }, Timestamp = now(), DayOfTheYear = today, Actor = actor, IsDisplayed = false }
+    self:updateLogUI()
   end
   function L:removeLogEntry(e)
     local t = {}
@@ -32,7 +34,27 @@ local function makeLord(now, today)
     end
     self.log = t
   end
-  function L:updateLogUI() end
+  function L:updateLogUI()
+    if not self.hudReady then return end
+    for _, e in ipairs(self.log) do
+      if not e.IsDisplayed then
+        local w = { LogEntry = {}, attached = true }
+        for k, v in pairs(e) do w.LogEntry[k] = v end
+        function w:IsValid() return true end
+        function w:GetParent() return self.attached and L or nil end
+        function w:GetClass()
+          return { IsValid = function() return true end, ForEachProperty = function(_, visit)
+            visit({ GetStruct = function() return { GetFName = function() return str("LogEntry") end } end,
+                    GetFName = function() return str("LogEntry") end })
+          end }
+        end
+        function w:RemoveFromParent() self.attached = false end
+        function w:Remove() self:RemoveFromParent(); L:removeLogEntry(self.LogEntry) end
+        self.widgets[#self.widgets + 1] = w
+        e.IsDisplayed = true
+      end
+    end
+  end
   return L
 end
 
@@ -54,6 +76,7 @@ local function load(C)
 end
 -- carry every line one copy sent to the other (the core's words: <seq> <wallclock> <kind> ...)
 local function deliver(toS, toM, fromRole)
+  activeLord = toS.p1
   local q = sent; sent = {}
   for _, s in ipairs(q) do
     if s.from == fromRole then
@@ -70,6 +93,7 @@ local host = makeLord(function() hostT = hostT + 1.5; return hostT end, 120)
 for i = 1, 23 do host:addLog(FName(i % 5 == 0 and "death" or "storage"), "notice_" .. i, "descr_" .. i, 0, { X = i * 100.0, Y = -i * 10.0, Z = 3.0 }, nil); host.log[i].DayOfTheYear = 100 + math.floor(i / 12) end
 local CH = makeCoop("host", "host", host, false)
 local MH = load(CH)
+host.hudReady = true
 
 print("[A] a friend that reloaded: its own list holds 3 entries (two from the re-read lines, one its game made)")
 local friendT = 5.0
@@ -79,6 +103,9 @@ friend:addLog(FName("storage"), "notice_23", "descr_23", 0, { X = 2300.0, Y = -2
 friend:addLog(FName("enemy"), "enemy_squad_spotted", "x", 0, { X = 1.0, Y = 1.0, Z = 1.0 }, nil)
 local CF = makeCoop("friend", "friend1", friend, true)
 local MF = load(CF)
+friend.hudReady = true
+friend:updateLogUI()
+activeLord = friend
 friend.alertsPlayed = 0
 MF.tick(CF.s, 10.0)                                  -- asks once
 local asks = 0; for _, s in ipairs(sent) do if s.line:find("^R LOGASK ") then asks = asks + 1 end end
@@ -103,6 +130,14 @@ check(friend.DT_Alerts ~= nil, "the alert table is back afterwards")
 check(CF.patch.marks == 23, "one mark per added entry (" .. CF.patch.marks .. ")")
 local disp = true; for _, e in ipairs(friend.log) do if not e.IsDisplayed then disp = false end end
 check(disp, "every restored entry marked as displayed")
+local function visible(lord)
+  local rows = {}
+  for _, w in ipairs(lord.widgets) do
+    if w.attached then rows[#rows + 1] = w.LogEntry.LogText:ToString() end
+  end
+  return table.concat(rows, "|")
+end
+check(visible(friend) == visible(host), "the HUD draws the host's notices in order after rejoining")
 
 print("[B] a list that came incomplete is not applied")
 local friend2 = makeLord(function() return 1.0 end, 130)
@@ -142,5 +177,52 @@ local q = sent
 sent = q; deliver(CF4.s, MF4, "host")
 check(#friend4.log == 0, "friend4 did not take friend1's list (" .. #friend4.log .. ")")
 
+print("[E] host dismissals, foreign entries and a burst of new notices")
+CF.s.worlds = 3
+activeLord = friend
+MF.tick(CF.s, 30)
+deliver(CH.s, MH, "friend")
+deliver(CF.s, MF, "host")
+activeLord = host
+host.widgets[1]:Remove()
+MH.tick(CH.s, 31)
+deliver(CF.s, MF, "host")
+check(#friend.log == #host.log and visible(friend) == visible(host), "dismissing a host row removes it on the friend")
+friend:addLog(FName("local_kind"), "only_this_copy", "", 0, { X = 0, Y = 0, Z = 0 }, nil)
+MF.tick(CF.s, 32)
+MF.tick(CF.s, 32.2)
+deliver(CH.s, MH, "friend")
+deliver(CF.s, MF, "host")
+check(visible(friend) == visible(host), "an unlisted local notice is removed")
+activeLord = host
+for i = 1, 14 do
+  host:addLog(FName("new_kind"), "new_" .. i, "", 0, { X = i, Y = 0, Z = 0 }, nil)
+end
+MH.tick(CH.s, 33)
+deliver(CF.s, MF, "host")
+check(#friend.log == #host.log and visible(friend) == visible(host), "all 14 new notices arrive in order in one poll")
+
+print("[F] the host's list arrives before the friend's HUD is ready")
+local joining = makeLord(function() return 3 end, 130)
+local CJ = makeCoop("friend", "joining", joining, true)
+local MJ = load(CJ)
+activeLord = joining
+MJ.tick(CJ.s, 40)
+deliver(CH.s, MH, "friend")
+deliver(CJ.s, MJ, "host")
+check(#joining.log == #host.log and visible(joining) == "", "the complete history arrived during the load")
+joining.hudReady = true
+MJ.tick(CJ.s, 40.2)
+check(visible(joining) == visible(host) and joining.alertsPlayed == 0, "the ready HUD draws every row without another notice or alert")
+MJ.tick(CJ.s, 40.4)
+joining.hudReady = false
+activeLord = host
+host:addLog(FName("live_kind"), "live_notice", "", 0, { X = 0, Y = 0, Z = 0 }, nil)
+MH.tick(CH.s, 41)
+deliver(CJ.s, MJ, "host")
+joining.hudReady = true
+MJ.tick(CJ.s, 41.2)
+check(visible(joining) == visible(host), "a live arrival during HUD setup also draws without a second notice")
+
 print(string.format("\nRESULT: %d passed, %d failed", pass, fail))
-return fail == 0
+assert(fail == 0, "notice relay checks failed")

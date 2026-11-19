@@ -137,17 +137,25 @@ local function matsOf(c)
   return table.concat(t, ",")
 end
 
+-- XY is the common origin in the building key, also used for a missing stall.
+-- Z is the centimetre sent with the building. Quantize the world coordinate
+-- once; rounding an offset from a fractional origin moved drawn pieces by 1 cm.
+local function pieceOrigin(B)
+  return rnd(B.X / 10) * 10, rnd(B.Y / 10) * 10, rnd(B.Z)
+end
 -- a piece read in full: its record (text, hash, mesh path) or false (not to be counted: a ground-texture piece)
 local function readRec(x, c, B)
+  if not (valid(x) and valid(c)) then return nil end
   local nv = 0; pcall(function() nv = #c.RuntimeVirtualTextures end)
   if nv > 0 then return false end
-  local mo = c.StaticMesh; if not mo:IsValid() then return nil end
+  local mo = c.StaticMesh; if not valid(mo) then return nil end
   local m = meshPath(mo); if not m then return nil end
   if Q.matsOf[m] == nil then Q.matsOf[m] = matsOf(c) end
   local L = x:K2_GetActorLocation(); local R = x:K2_GetActorRotation(); local Sc = x:GetActorScale3D()
   local p, r = rnd(R.Pitch), rnd(R.Roll)
   local sx, sy, sz = rnd(Sc.X * 100), rnd(Sc.Y * 100), rnd(Sc.Z * 100)
-  local tail = string.format("%d:%d:%d:%d", rnd(L.X - B.X), rnd(L.Y - B.Y), rnd(L.Z - B.Z), rnd(R.Yaw) % 360)
+  local bx, by, bz = pieceOrigin(B)
+  local tail = string.format("%d:%d:%d:%d", rnd(L.X) - bx, rnd(L.Y) - by, rnd(L.Z) - bz, rnd(R.Yaw) % 360)
   if p ~= 0 or r ~= 0 or sx ~= 100 or sy ~= 100 or sz ~= 100 then tail = tail .. string.format(":%d:%d:%d:%d:%d", p, r, sx, sy, sz) end
   local s = m .. ":" .. tail
   return { m = m, t = tail, s = s, h = strHash(s) }
@@ -317,7 +325,8 @@ local function spawnPiece(S, B, m, tail)
   if not mats then bump("noMat"); if not Q.saidMat[m] then Q.saidMat[m] = true; log("no materials for %s here: such a piece is not drawn", m) end; return nil end
   local x, y, z, yaw, p, r, sx, sy, sz = tail:match("^(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+):?(%-?%d*):?(%-?%d*):?(%-?%d*):?(%-?%d*):?(%-?%d*)$")
   if not x then return nil end
-  local a = newActor(S, mesh, { X = B.X + tonumber(x), Y = B.Y + tonumber(y), Z = B.Z + tonumber(z) },
+  local bx, by, bz = pieceOrigin(B)
+  local a = newActor(S, mesh, { X = bx + tonumber(x), Y = by + tonumber(y), Z = bz + tonumber(z) },
     { Pitch = tonumber(p) or 0, Yaw = tonumber(yaw), Roll = tonumber(r) or 0 },
     (tonumber(sx) or 100) / 100, (tonumber(sy) or 100) / 100, (tonumber(sz) or 100) / 100)
   if a then

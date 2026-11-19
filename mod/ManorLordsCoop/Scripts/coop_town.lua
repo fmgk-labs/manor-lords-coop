@@ -158,15 +158,64 @@ local function bident(b)
   local l = b:K2_GetActorLocation(); local r = b:K2_GetActorRotation()
   return { t = A.btype(b), x = l.X, y = l.Y, z = l.Z, yaw = r.Yaw }
 end
-local function bkeyOf(e) return string.format("%d,%.0f,%.0f,%.0f", e.t, e.x, e.y, e.z) end
-local function bkeyYaw(e) return string.format("%d,%.2f,%.2f,%.2f,%.1f", e.t, e.x, e.y, e.z, e.yaw or 0) end      -- a new building: exact place (see encV)
+-- (lane 76) The game clears a demolished building's actor before IsValid turns false: its type reads 0 and its place
+-- 0,0,0 for a moment (l76d: a friend's demolish went out as "DEMOLISH 0,0,0,0", the host refused it, the friend
+-- resynced). An identity is usable only with a type above 0 and a place that is not exactly the origin.
+local function usableB(id)
+  return type(id) == "table" and type(id.t) == "number" and id.t > 0 and type(id.x) == "number" and type(id.y) == "number" and type(id.z) == "number"
+    and id.x == id.x and id.y == id.y and id.z == id.z and not (id.x == 0 and id.y == 0 and id.z == 0)
+end
+local function indexedB(b)
+  local a = addrOf(b); local e = a and T.bidx[a]
+  if usableB(e) and e.name ~= "?" and e.name == nameOf(b) then return e end
+end
+-- The safe name of a building in the tick (every module's X.bident): the live read when it is usable, else what the
+-- index kept of this same object while it was whole, else nil (the line is then not sent, see sendTown).
+local function identB(b)
+  if not valid(b) then return nil end
+  local ok, id = pcall(bident, b)
+  if ok and usableB(id) then return id end
+  return indexedB(b)
+end
+-- The name of a building inside a hook callback, taken while the actor is alive. A hook may only read properties.
+-- The type is read live (a building's type changes in place: an upgrade, type 75 while it changes); the place comes
+-- from the index (world transforms, also of attached buildings). A newly placed building that is not indexed yet
+-- and has no parent: its root's relative transform is its world transform. A cleared actor (type 0): what the index
+-- kept. nil = no usable name here; the tick then tries identB before the line is given up.
+local function captureB(b)
+  if not valid(b) then return nil end
+  local e = indexedB(b)
+  local t = 0
+  pcall(function()
+    t = b.Data.bType
+    if t == 75 then local o = b.typeBeforeChange; if type(o) == "number" and o > 0 and o ~= 75 then t = o end end
+  end)
+  if type(t) ~= "number" or t <= 0 then return e end
+  if e then
+    if e.t == t then return e end
+    return { t = t, x = e.x, y = e.y, z = e.z, yaw = e.yaw }
+  end
+  local id
+  pcall(function()
+    local root = b.RootComponent
+    if not valid(root) or valid(root.AttachParent) then return end
+    local pos, rot = root.RelativeLocation, root.RelativeRotation
+    id = { t = t, x = pos.X, y = pos.Y, z = pos.Z, yaw = rot.Yaw }
+  end)
+  if usableB(id) then return id end
+end
+-- "-" for a building without a usable name: such a line is never sent (sendTown; the modules' own lines check it)
+local function bkeyOf(e) if not usableB(e) then return "-" end; return string.format("%d,%.0f,%.0f,%.0f", e.t, e.x, e.y, e.z) end
+local function bkeyYaw(e) if not usableB(e) then return "-" end; return string.format("%d,%.2f,%.2f,%.2f,%.1f", e.t, e.x, e.y, e.z, e.yaw or 0) end      -- a new building: exact place (see encV)
 local function decB(s) local n = nums(s); if not (n[1] and n[2] and n[3]) then return nil end; return { t = int(n[1]), x = n[2], y = n[3], z = n[4] or 0, yaw = n[5] or 0 } end
 
 -- address -> identity of every building, refreshed a slice per tick; written also whenever a building is seen or made here.
 -- Only used to NAME an object that may be gone by the next tick; every use of a stored object is checked with IsValid first.
 function T.addB(b, id)
+  if not valid(b) then return nil end
   local a = addrOf(b); if not a then return nil end
   id = id or bident(b)
+  if not usableB(id) then return nil end
   T.bidx[a] = { name = nameOf(b), t = id.t, x = id.x, y = id.y, z = id.z, yaw = id.yaw, obj = b, gen = T.bgen }
   return T.bidx[a]
 end
@@ -363,7 +412,41 @@ function T.out(line)
   A.send(line)
 end
 
+-- Most building actions use their first field. MOVE, PLAN, REASSIGN and train routes
+-- name buildings in other positions too. A disconnected train endpoint is explicitly "-".
+local firstBuilding = { BUILD=true, MOVE=true, DEMOLISH=true, EXTEND=true, UPGRADE=true, EXT=true, ARTISAN=true,
+  ADDW=true, REMW=true, FAMS=true, MAINT=true, WAREA=true, TRAINREG=true, TRAINCON=true, ANAME=true,
+  GATE=true, PLAN=true, PLANWALL=true, PLANSEL=true, PLANMOVE=true, PLANWPTS=true }
+local function wireBuilding(key)
+  if not key then return false end
+  local fields = split(key, ",")
+  if (#fields ~= 4 and #fields ~= 5) or table.concat(fields, ",") ~= key then return false end
+  for _, field in ipairs(fields) do
+    local n = tonumber(field)
+    if not n or n ~= n or math.abs(n) == math.huge then return false end
+  end
+  local t = tonumber(fields[1])
+  if not (t > 0 and t == math.floor(t)) then return false end
+  return not (tonumber(fields[2]) == 0 and tonumber(fields[3]) == 0 and tonumber(fields[4]) == 0)   -- a cleared actor's place
+end
+T.wireBuilding = wireBuilding
+local function sendTown(origin, seq, act, fields)
+  local d = T.defs[act]
+  if firstBuilding[act] or (d and d.target == "building") or act == "REASSIGN" then
+    local f = split(fields or "", " ")
+    local ok = wireBuilding(f[act == "REASSIGN" and 3 or 1])
+    if act == "MOVE" or act == "PLAN" then ok = ok and wireBuilding(f[2]) end
+    if act == "TRAINCON" then ok = ok and (f[2] == "-" or wireBuilding(f[2])) and (f[3] == "-" or wireBuilding(f[3])) end
+    if not ok then
+      if C.s and C.s.stats then stat(C.s, "t_emptyKey") end
+      A.log("TOWN %s not sent: empty or unreadable building key (%s)", act, tostring(fields):sub(1, 80)); return false
+    end
+  end
+  T.out(string.format("T %s %s %s %s", origin, tostring(math.tointeger(tonumber(seq)) or seq), act, fields))
+  return true
+end
 function T.emitAction(S, act, fields)
+  if not sendTown(S.name, T.seq + 1, act, fields) then return end
   T.seq = T.seq + 1
   -- remember our own recent actions by tag, so a refusal from the host can be undone by name (see the NAK branch)
   T.own = T.own or {}; T.ownList = T.ownList or {}
@@ -371,7 +454,6 @@ function T.emitAction(S, act, fields)
   T.own[tag] = { act = act, f1 = tostring(fields):match("^(%S+)"), t = os.clock() }
   T.ownList[#T.ownList + 1] = tag
   if #T.ownList > 200 then T.own[table.remove(T.ownList, 1)] = nil end
-  T.out(string.format("T %s %d %s %s", S.name, T.seq, act, fields))
   stat(S, "t_sent")
   A.log("TOWN sent %s %d %s %s", S.name, T.seq, act, fields:sub(1, 160))
   return T.seq
@@ -390,7 +472,7 @@ function T.finish(S, job, status, fwd, extra)
   if ok and C.panels and C.panels.touched and not (C.modules and C.modules[job.origin]) then pcall(C.panels.touched, job.act, job.f and job.f[1]) end   -- (lane 69) another player's action (not a module's own line, e.g. "people"): open panels redraw (coop_x_panels.lua)
   if S.role == "host" and job.origin ~= S.name then
     if ok then
-      T.out(string.format("T %s %s %s %s", job.origin, job.n, job.act, fwd or job.fields))
+      sendTown(job.origin, job.n, job.act, fwd or job.fields)
       for _, e in ipairs(extra or {}) do T.emitAction(S, e[1], e[2]) end
     else
       T.emitAction(S, "NAK", tag .. " " .. enc(status))
@@ -472,6 +554,14 @@ local function makeCallback(path)
 end
 
 local function push(rec)
+  local d = T.defs[rec.k]
+  if rec.k == "REASSIGN" or rec.k == "EXTEND" or (rec.obj and (firstBuilding[rec.k] or (d and d.target == "building")) and rec.k ~= "MAINT" and rec.k ~= "ANAME") then
+    local b = rec.b or rec.ext or rec.obj
+    local okC, snap = pcall(captureB, b)
+    rec.snap = okC and snap or nil
+    rec.owned = valid(b) and owned(b)
+    rec.nameB = b                 -- no usable name in the hook: the tick tries once more (handleSeen)
+  end
   local q = T.q
   if #q >= T.cfg.maxQueue then table.remove(q, 1); T.dropped = (T.dropped or 0) + 1 end
   q[#q + 1] = rec
@@ -531,8 +621,7 @@ hook(BP_PAWN .. "playBuildEffects", { "BUILD", "MOVE", "PLAN" }, function(self, 
   local rec = { k = "BUILD", obj = hb }
   local mb = p.movedBuilding
   if valid(mb) then
-    local e = T.bidx[addrOf(mb)]       -- the old building is demolished inside this same build() call: name it now
-    rec.k = "MOVE"; rec.old = e and { t = e.t, x = e.x, y = e.y, z = e.z } or nil
+    rec.k = "MOVE"; rec.old = captureB(mb)
   end
   return rec
 end)
@@ -640,9 +729,8 @@ end
 -- (lane 2, session 2: "helper paid 50, lord charged 50" on the host, "lord charged 0" on the friend, both treasuries equal)
 def { name = "BUILD", status = "live", ref = "README s7b, s8, s14", helper = true, wait = 1,
   ready = function(S, rec)
-    local b = rec.obj; if not valid(b) then return nil, "new building gone" end
-    local id = bident(b); T.addB(b, id)
-    return bkeyYaw(id)
+    if valid(rec.obj) then T.addB(rec.obj) end
+    return bkeyYaw(rec.snap)
   end,
   apply = function(S, job)
     local e = decB(job.f[1]); if not e then return "bad fields" end
@@ -659,10 +747,9 @@ def { name = "BUILD", status = "live", ref = "README s7b, s8, s14", helper = tru
 -- both directions from the lord's own scripted request, also after a resync (lane 2, runs s3, s4 and s8); a real click not yet
 def { name = "MOVE", status = "console2", ref = "lane_t1 T8d; lane 2 runs s3, s4, s8", helper = true, wait = 1,
   ready = function(S, rec)
-    local b = rec.obj; if not valid(b) then return nil, "new building gone" end
-    if not rec.old then return nil, "the moved building was not in the index yet: not sent" end
-    local id = bident(b); T.addB(b, id)
-    return bkeyOf(rec.old) .. " " .. bkeyYaw(id)
+    if not rec.old then return nil, "old building identity unavailable at capture" end
+    if valid(rec.obj) then T.addB(rec.obj) end
+    return bkeyOf(rec.old) .. " " .. bkeyYaw(rec.snap)
   end,
   apply = function(S, job)
     local o, e = decB(job.f[1]), decB(job.f[2]); if not (o and e) then return "bad fields" end
@@ -949,7 +1036,7 @@ def { name = "EXTEND", status = "console2", ref = "lane_s21_29", helper = true, 
     if not valid(rec.ext) then return nil, "the house the draft extends is gone" end
     local r, why = readyHouse(S, rec)
     if r == nil or r == "wait" then return r, why end
-    return bkeyOf(bident(rec.ext)) .. " " .. r
+    return bkeyOf(rec.snap) .. " " .. r
   end,
   apply = function(S, job)
     local ext = findBkey(job.f[1])
@@ -967,8 +1054,7 @@ T.place = { clearMoved = clearMoved, findNew = findNew, encV = encV, decV = decV
 -- during a real confirm (session 7c), still finds b in the list. Inventory_C:confirmDemolish is a second signal (GUESS that
 -- it is the final step). Both are de-duplicated by address. The building is named from the index: it is gone by the tick.
 local function demRec(b)
-  local a = addrOf(b); local e = a and T.bidx[a]
-  return { k = "DEMOLISH", obj = b, addr = a, snap = e and { t = e.t, x = e.x, y = e.y, z = e.z } or nil }
+  return { k = "DEMOLISH", obj = b, addr = addrOf(b) }
 end
 hook(P .. "PawnCPP:deselectBuilding", { "DEMOLISH" }, function(self, bp)
   local p = self:get(); if not isLocal(p) then return nil end
@@ -979,7 +1065,8 @@ hook(P .. "PawnCPP:deselectBuilding", { "DEMOLISH" }, function(self, bp)
   return demRec(b)
 end)
 hook(INV .. "confirmDemolish", { "DEMOLISH" }, function(self)
-  local w = self:get(); local b = w.Building
+  local w = self:get(); if not valid(w) then return nil end
+  local b = w.Building
   if not valid(b) then return nil end
   return demRec(b)
 end)
@@ -993,10 +1080,7 @@ def { name = "DEMOLISH", status = "static", ref = "lane_t1 T5", helper = true,
     if valid(rec.obj) and C.jobs and C.jobs.gone then pcall(C.jobs.gone, { rec.obj }, "demolish_own") end   -- (lane 35) this player's own demolish
     if rec.addr and T.recentDem[rec.addr] and now - T.recentDem[rec.addr] < 5 then return nil, "duplicate" end
     if rec.addr then T.recentDem[rec.addr] = now end
-    local id = rec.snap
-    if valid(rec.obj) then local ok, live = pcall(bident, rec.obj); if ok then id = live end end
-    if not id then return nil, "demolished building was not in the index: not sent" end
-    return bkeyOf(id)
+    return bkeyOf(rec.snap)
   end,
   apply = function(S, job)
     local e = decB(job.f[1]); if not e then return "bad fields" end
@@ -1056,8 +1140,7 @@ hook(P .. "PawnCPP:addExtensionChangeRequest", { "EXT" }, seeRequest("EXT"))
 hook(P .. "PawnCPP:addArtisanChangeRequest", { "ARTISAN" }, seeRequest("ARTISAN"))
 
 local function readyRequest(S, rec)
-  local b = rec.obj; if not valid(b) then return nil, "building gone" end
-  local key = bkeyOf(bident(b))
+  local key = bkeyOf(rec.snap)
   if rec.k == "EXT" then return key .. " " .. rec.slot .. " " .. rec.id end
   return key .. " " .. rec.id
 end
@@ -1157,7 +1240,7 @@ end
 local function readyFam(S, rec)
   local b = rec.obj; if not valid(b) then return nil, "building gone" end
   if not owned(b) then return nil, "not the lord's building" end
-  return bkeyOf(bident(b)) .. " " .. encIds(famIds(b)) .. " " .. int(b.numActiveWorkerFamilies)
+  return bkeyOf(rec.snap) .. " " .. encIds(famIds(b)) .. " " .. int(b.numActiveWorkerFamilies)
 end
 -- status: the plus/minus call proven live on one copy (README session 14); host forward + FAMS correction not yet run on two copies
 local function applyFam(fn)
@@ -1194,14 +1277,17 @@ def { name = "FAMS", status = "live1", ref = "README s14; lane_t2 T6", follows =
 -- argt letters: i = int / enum / byte, b = bool, n = FName. rel = the call is relative (repeats must not be dropped as echoes).
 local function readySetter(S, rec)
   local d = T.defs[rec.k]; local o = rec.obj
-  if not valid(o) then return nil, "target gone" end
-  if not owned(o) then return nil, "not the lord's" end
+  if d.target == "region" or rec.late then
+    if not valid(o) then return nil, "target gone" end
+    if not owned(o) then return nil, "not the lord's" end
+  elseif not rec.owned then return nil, "not the lord's" end
   -- "late" records come from a panel's own click handler: the value is read now, a tick after the handler ran
   if rec.late then local okL, v = pcall(function() return int(o[rec.late]) end); if not okL then return nil, "value unreadable" end; rec.args = { v } end
   local argstr = encArgs(d.argt, rec.args)
   local ek = rec.k .. "@" .. tostring(rec.addr) .. ":" .. argstr
   if not d.rel and T.expect[ek] and T.expect[ek] > os.clock() then T.expect[ek] = nil; return nil, "echo" end
-  local key = (d.target == "region") and T.rkey(o) or bkeyOf(bident(o))
+  local key = d.target == "building" and bkeyOf(rec.snap) or T.rkey(o)
+  if not key then return nil, "region without a name" end
   return key .. " " .. argstr
 end
 -- status: per action, see its setter(...) line ("live1" = README session 14, "static" = the lane recipe id given there)
@@ -1261,7 +1347,6 @@ setter("RECIPE_OFF", "SMBuildingMaster", "DisableRecipe", "i", "static", "lane_t
 setter("CROP", "SMBuildingMaster", "setCropType", "i", "static", "lane_t2 T7h")
 setter("CROPYEAR", "SMBuildingMaster", "setCropTypeForYear", "ii", "static", "lane_t2 T7h")
 setter("CROPSPRING", "SMBuildingMaster", "SetSpringCropOverride", "ib", "static", "lane_t2 T7h")
-setter("FERTILIZE", "SMBuildingMaster", "SetAllowFertilization", "b", "static", "lane_t2 T7h")
 setter("TSTOCK", "SMBuildingMaster", "SetTargetStock", "ii", "static", "lane_t2 T7g")
 setter("TSTOCK_ON", "SMBuildingMaster", "EnableTargetStock", "i", "static", "lane_t2 T7g")
 setter("TSTOCK_OFF", "SMBuildingMaster", "DisableTargetStock", "i", "static", "lane_t2 T7g")
@@ -1297,7 +1382,7 @@ def { name = "MAINT", status = "live1", ref = "README s14; lane_t2 T7j", argt = 
     end
     if not b then return nil, "building of this maintenance component not found in the index" end
     if not owned(b) then return nil, "not the lord's" end
-    return bkeyOf(bident(b)) .. " " .. argstr
+    return bkeyOf(identB(b)) .. " " .. argstr
   end,
   apply = function(S, job)
     local b = findBkey(job.f[1]); if not b then return "retry:building not found" end
@@ -1327,6 +1412,24 @@ local function seeWidget(kind)
     return { k = kind, obj = b, addr = addrOf(b) }
   end
 end
+-- FERTILIZE (lane 75). The field panel calls the setter in two ways: its checkbox (the player), and its own
+-- UpdateFertilization, which repeats the value the field already has while the panel is alive (measured: 9 calls in
+-- 1 s with the value unchanged, also after the panel was closed) and turns the setting off itself when no year of the
+-- field is fallow any more. The hook runs before the game's routine, so the field still holds its old value there
+-- (measured: "false > true" on a press, "false > false" on the repeats). Only a call that changes the value is sent:
+-- the press, and the panel's own turn-off (a copy without that panel open would keep the old value for good: measured
+-- with a checkbox-only hook, host false and friend true, no line). No address: a replay runs inside T.quiet and leaves
+-- the value equal, so there is no echo to wait out, and a press right after a replay is the player's.
+hook(P .. "SMBuildingMaster:SetAllowFertilization", { "FERTILIZE" }, function(self, a1)
+  local b = self:get(); if not valid(b) then return nil end
+  local want = a1:get() == true
+  local okC, cur = pcall(function() return b:GetAllowFertilization() == true end)
+  if not okC or cur == want then return nil end
+  return { k = "FERTILIZE", obj = b, args = { want } }
+end)
+def { name = "FERTILIZE", status = "live", ref = "lane_s21_29 A031; lane_s21_75",
+      fn = "SetAllowFertilization", argt = "b", target = "building", ready = readySetter, apply = applySetter }
+
 local function filterOf(b)
   local t = {}; local a = b.storageFilter
   for i = 1, #a do t[#t + 1] = int(un(a[i])) end
@@ -1335,7 +1438,7 @@ local function filterOf(b)
 end
 T.fieldSent = T.fieldSent or {}
 local function fieldAction(name, read, write)
-  return def { name = name, status = "press2", ref = "README s21 (panel press)",
+  return def { name = name, target = "building", status = "press2", ref = "README s21 (panel press)",
     ready = function(S, rec)
       local b = rec.obj; if not valid(b) then return nil, "building gone" end
       if not owned(b) then return nil, "not the lord's" end
@@ -1346,7 +1449,7 @@ local function fieldAction(name, read, write)
       local sk = name .. "@" .. tostring(rec.addr)
       if T.fieldSent[sk] and T.fieldSent[sk].v == v and os.clock() - T.fieldSent[sk].t < 1.0 then return nil, "same value just sent" end
       T.fieldSent[sk] = { v = v, t = os.clock() }
-      return bkeyOf(bident(b)) .. " " .. v
+      return bkeyOf(rec.snap) .. " " .. v
     end,
     apply = function(S, job)
       local b = findBkey(job.f[1]); if not b then return "retry:building not found" end
@@ -1427,7 +1530,7 @@ def { name = "WAREA", status = "console2", ref = "README s21",
   ready = function(S, rec)
     local b = rec.obj; if not valid(b) then return nil, "building gone" end
     if not owned(b) then return nil, "not the lord's" end
-    return bkeyOf(bident(b)) .. " " .. string.format("%.0f,%.0f,%.0f,%.0f", rec.x, rec.y, rec.z, rec.r)
+    return bkeyOf(rec.snap) .. " " .. string.format("%.0f,%.0f,%.0f,%.0f", rec.x, rec.y, rec.z, rec.r)
   end,
   apply = function(S, job)
     local b = findBkey(job.f[1]); if not b then return "retry:building not found" end
@@ -1469,7 +1572,7 @@ def { name = "REASSIGN", status = "console2", ref = "README s21", rel = true,
     local r = rec.obj; if not valid(r) or not valid(rec.b) then return nil, "region or workplace gone" end
     if not owned(rec.b) then return nil, "not the lord's" end
     local rk = T.rkey(r); if not rk then return nil, "region without a name" end
-    return rk .. " " .. rec.fam .. " " .. bkeyOf(bident(rec.b))
+    return rk .. " " .. rec.fam .. " " .. bkeyOf(rec.snap)
   end,
   apply = function(S, job)
     local r = T.findR(job.f[1]); if not r then return "retry:region not found" end
@@ -1490,7 +1593,7 @@ def { name = "REASSIGN", status = "console2", ref = "README s21", rel = true,
 -- Argument letters of a setter: i int / enum / byte, b bool, n FName, s string. A setter on "Region" targets the region.
 T.api = { def = def, hook = hook, setter = setter, fieldAction = fieldAction, seeWidget = seeWidget, seeObj = seeObj,
           readySetter = readySetter, applySetter = applySetter, encArgs = encArgs, decArgs = decArgs,
-          bident = bident, bkeyOf = bkeyOf, findBkey = findBkey, owned = owned, isLocal = isLocal, touch = touch,
+          bident = identB, bkeyOf = bkeyOf, findBkey = findBkey, owned = owned, isLocal = isLocal, touch = touch,
           int = int, enc = enc, dec = dec, split = split, addrOf = addrOf, valid = valid, un = un, P = P, WI = WI }
 
 -- ================================================================ tick: seen records -> lines
@@ -1499,6 +1602,12 @@ local function handleSeen(S, rec)
   local d = T.defs[rec.k]; if not (d and d.ready) then return "done" end
   if rec.addr and T.touched[rec.addr] and os.clock() - T.touched[rec.addr] < 0.75 then
     stat(S, "t_echo"); A.log("TOWN dropped %s on a just-replayed target (echo)", rec.k); return "done"
+  end
+  if rec.nameB and not rec.snap then
+    rec.snap = identB(rec.nameB)
+    if not rec.snap then
+      stat(S, "t_noName"); A.log("TOWN %s not sent: the building had no usable name in the hook or in the tick", rec.k); return "done"
+    end
   end
   local ok, res, why = pcall(d.ready, S, rec)
   if not ok then stat(S, "t_seeErr"); A.log("TOWN %s capture error: %s", rec.k, tostring(res)); return "done" end

@@ -53,5 +53,22 @@ hof.regionalWealth = 80
 W.fpLater = { { day = 8, a = a, b = { R = "hof:80/60/70", F = a.F, B = "x", O = "o", W = "ERR" }, t = T } }
 T = T + 0.1; W.fpLaterStep(W.S)
 check(W.miss == 1, "2 s later still 99/80: counted as a difference (1 in a row)")
+print("[lane 76: a timing part beside another part (l76i day 364: W wealth@hof:259/253)]")
+check(W.anyTiming({ "W", "wealth@hof:259/253" }) and W.anyTiming({ "F" }) and not W.anyTiming({ "W", "B" }) and not W.anyTiming({}), "a day with a timing part among others is taken again; one without is not")
+W.on.weather = true; W.miss = 0; logs = {}
+local a3 = { R = "hof:259/60/70", F = a.F, B = "x", O = "o", W = "1,3,5,0,0,0" }
+local b3 = { R = "hof:253/60/70", F = a.F, B = "x", O = "o", W = "1,3,9,0,0,0" }
+check(table.concat(W.compareFp(a3, b3), " ") == "W wealth@hof:259/253", "the compare finds W and the wealth")
+hof.regionalWealth = 259
+W.fpLater = { { day = 364, a = a3, b = b3, t = T } }
+T = T + 0.1; W.fpLaterStep(W.S)
+local told, line = false, nil
+for _, l in ipairs(logs) do if l:find("day 364: wealth@hof:259/253 at the sample, the host's 2 s later", 1, true) then told = true end; if l:find("fingerprint day 364 differs", 1, true) then line = l end end
+check(told and line and line:find("differs: W (1 in a row)", 1, true) and not line:find("wealth", 1, true) and W.miss == 1, "2 s later the wealth is the host's: only W stays a difference and is counted (" .. tostring(line) .. ")")
+hof.regionalWealth = 240; W.miss = 0; logs = {}
+W.fpLater = { { day = 365, a = a3, b = b3, t = T } }
+T = T + 0.1; W.fpLaterStep(W.S)
+line = nil; for _, l in ipairs(logs) do if l:find("fingerprint day 365 differs", 1, true) then line = l end end
+check(line and line:find("W wealth@hof:259/240", 1, true), "a wealth that is still not the host's stays in the line (" .. tostring(line) .. ")")
 print(string.format("\nRESULT: %d passed, %d failed", pass, fail))
 if fail > 0 then error("desk test failed") end

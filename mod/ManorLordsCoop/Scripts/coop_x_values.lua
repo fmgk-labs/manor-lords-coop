@@ -39,7 +39,7 @@
 --   HW X <collapse 1|0> <sitehp 1|0> <mroll 1|0>   the host's native piece can (sent every cfg.announceEvery s)
 --   HW J <bkey>                           (3.) a worker of that building was injured on the host (a work accident)
 --   HW C <bkey>                           the host's building collapsed
---   HW CF <bkey> <1|0>                    its ruin is finished on the host (3 s later): a friend finishes its own (FINISH)
+--   HW CF <bkey> 1                        the host observed finished rubble: a friend finishes the same ruin (FINISH)
 --   HW P <bkey>=<fraction|->;...          the host's sites' work fractions
 local C = rawget(_G, "Coop")
 if type(C) ~= "table" or type(C.register) ~= "function" or type(C.api) ~= "table" then return "coop_x_values: load coop.lua first" end
@@ -50,9 +50,10 @@ C.values = V
 V.version = "0.1"
 V.cfg = V.cfg or {}
 for k, v in pairs({ announceEvery = 5.0, stale = 30.0, lookEvery = 2.0, readEvery = 0.25, pollEvery = 0.5, fullEvery = 10.0,
-                    applyEvery = 0.5, replayWait = 15.0, logEvery = 60.0, ruinAfter = 3.0 }) do if V.cfg[k] == nil then V.cfg[k] = v end end
+                    applyEvery = 0.5, replayWait = 15.0, logEvery = 60.0 }) do if V.cfg[k] == nil then V.cfg[k] = v end end
 V.stats = V.stats or {}
 V.t = V.t or {}
+V.cf, V.finishRuins = {}, {}
 local function log(fmt, ...) A.log("values: " .. fmt, ...) end
 local function bump(k, n) V.stats[k] = (V.stats[k] or 0) + (n or 1) end
 local function patch() local p = rawget(C, "patch"); if p and p.fn then return p end end
@@ -149,7 +150,7 @@ local function hostTick(S, clock)
         ok, k = pcall(function() local l = b:K2_GetActorLocation(); return string.format("%d@%d,%d", ty, math.floor(l.X / 10 + 0.5), math.floor(l.Y / 10 + 0.5)) end)
       elseif b then ok, k = pcall(bkey, b) end
       if ok and k then send("HW C " .. k); bump("collapsesSent"); log("%s collapsed on the host: sent", k)
-        V.cf = V.cf or {}; V.cf[#V.cf + 1] = { k = k, b = b, a = a, t = clock + V.cfg.ruinAfter }   -- (run a1) its ruin's state, a moment later
+        V.cf[#V.cf + 1] = { k = k, b = b, a = a, t = clock }
       else bump("collapseUnnamed"); log("a collapse of the host's building %s that is no longer in the list: not sent", tostring(h)) end
     end
   end
@@ -172,10 +173,9 @@ local function hostTick(S, clock)
   if V.cf and #V.cf > 0 then
     local keep = {}
     for _, c in ipairs(V.cf) do
-      if clock < c.t then keep[#keep + 1] = c
-      else
-        local okB, built = pcall(function() return valid(c.b) and addr(c.b) == c.a and c.b.Data.constructed end)
-        if okB and built ~= nil then send(string.format("HW CF %s %d", c.k, built and 1 or 0)); bump("ruinSent") end
+      if valid(c.b) and addr(c.b) == c.a then
+        if c.b:GetType() == 75 and c.b.Data.constructed then send("HW CF " .. c.k .. " 1"); bump("ruinSent")
+        elseif clock - c.t < V.cfg.replayWait then keep[#keep + 1] = c end
       end
     end
     V.cf = keep
@@ -289,6 +289,20 @@ local function friendTick(S, clock)
     for _, c in ipairs(V.q) do if clock - c.t < V.cfg.replayWait then keep[#keep + 1] = c else bump("collapseLost"); log("%s collapsed on the host; COLLAPSE is not on here: left (a resync puts it right)", c.k) end end
     V.q = keep
   end
+  -- The finish can arrive in the same batch as the collapse, before the local
+  -- game has converted the mine to rubble. Keep it until that conversion lands.
+  for k, at in pairs(V.finishRuins) do
+    local b = byKey(k)
+    if valid(b) and b:GetType() == 75 then
+      if b.Data.constructed then V.finishRuins[k] = nil; bump("ruinSame")
+      elseif p.finish then
+        local ok, why = p.finish(b)
+        if ok then V.finishRuins[k] = nil; bump("ruinFinished"); log("%s: the host's ruin is finished: finished here", k)
+        elseif clock - at >= V.cfg.replayWait then log("%s: could not finish the host's ruin (%s)", k, tostring(why)) end
+      end
+    end
+    if clock - at >= V.cfg.replayWait then V.finishRuins[k] = nil end
+  end
   -- the host's sites' work
   if V.hostSh and V.want and clock - (V.t.apply or -99) >= V.cfg.applyEvery and usable("SITEHP") then
     V.t.apply = clock
@@ -323,6 +337,7 @@ end
 
 local function onWorld(S)
   V.w, V.wa, V.frac, V.sentF, V.q, V.want, V.held, V.heldF = {}, {}, {}, {}, {}, {}, {}, {}
+  V.cf, V.finishRuins = {}, {}
   local p = patch()
   if p then pcall(function() p.send("SITEHP FORGET"); p.tick() end) end
 end
@@ -349,14 +364,8 @@ local function onMessage(S, from, kind, w, line)
       if ok then bump("injuryNotices") else bump("injuryErr"); V.lastErr = tostring(e) end
     else bump("injuryNotMine") end
   elseif what == "C" and w[5] then V.q = V.q or {}; V.q[#V.q + 1] = { k = w[5], t = os.clock() }; bump("collapsesIn")
-  elseif what == "CF" and w[5] and w[6] == "1" and not busy() then   -- (run a1) the host's ruin is finished: this copy's too
-    local b = byKey(w[5])
-    local okS, raw, built = pcall(function() return b:GetType(), b.Data.constructed end)
-    local P = patch()
-    if b and okS and raw == 75 and built == false and P and P.finish then
-      local ok, why = P.finish(b)
-      bump(ok and "ruinFinished" or "ruinNotFinished"); log("%s: the host's ruin is finished: %s here", w[5], ok and "finished" or ("not finished (" .. tostring(why) .. ")"))
-    else bump("ruinSame") end
+  elseif what == "CF" and w[5] and w[6] == "1" and not busy() then
+    V.finishRuins[w[5]] = os.clock()
   elseif what == "P" and w[5] then
     V.want = V.want or {}
     for k, v in w[5]:gmatch("([^;=]+)=([^;]+)") do

@@ -62,14 +62,15 @@
 -- before each use; game calls are wrapped in pcall; nothing runs while the core holds for a join or repair (C.hold), a
 -- join is busy, or the host's lines are being read again (S.replay); a new world clears everything.
 --
--- CONSOLE: Coop.panels.status()   Coop.panels.cfg.inv = "event"   Coop.panels.cfg.on = false   Coop.panels.n (counters)
+-- CONSOLE: Coop.panels.status()   Coop.panels.cfg.inv = "event"   Coop.panels.cfg.on = false   Coop.panels.cfg.rows = false
+--          Coop.panels.n (counters)
 
 local C = rawget(_G, "Coop")
 if not (C and C.register and C.api) then return "coop_x_panels: load coop.lua first" end
 local A = C.api
 C.panels = C.panels or {}
 local P = C.panels
-P.version = "1"
+P.version = "2"
 P.cfg = P.cfg or {}
 local DEFAULT = {
   on = true,
@@ -78,7 +79,8 @@ local DEFAULT = {
   afterClick = 0.5,      -- no redraw this long after the local player's mouse press in a panel
   recheck = 0.1,         -- while a redraw waits, the open panels are looked at again this often (FindAllOf is not free)
   keepScroll = true,     -- put every scroll box of a redrawn panel back where it was
-  maxNodes = 1500,       -- widgets looked at per panel for a held control, an open drop-down or a scroll box
+  rows = true,           -- also redraw the rows the panel's own redraw leaves alone (lane 78; see ROWS)
+  maxNodes = 4000,       -- widgets looked at per panel (hidden tabs too, lane 78): held control, drop-down, scroll box, rows
   log = true,
 }
 for k, v in pairs(DEFAULT) do if P.cfg[k] == nil then P.cfg[k] = v end end
@@ -111,6 +113,9 @@ local KINDS = {
   ["R:claim"] = { inv = false, flags = { "claim", "stat" } },
   -- army orders and the host's word on squads
   ["O:SPEED"] = { inv = false },
+  -- (lane 78) a friend's link check, once a minute (coop_x_army.lua, lane 70): no player acted, nothing to redraw
+  -- (seen in lane 78's idle count: the army flag raised on the host every 60 s with nobody acting)
+  ["O:PING"] = { inv = false },
   ["O:RAISE"] = { inv = false, flags = { "army", "armylist" } }, ["O:HIRE"] = { inv = false, flags = { "army", "armylist" } },
   ["O:REMOVE"] = { inv = false, flags = { "army", "armylist" } }, ["O:HOME"] = { inv = false, flags = { "army", "armylist" } },
   ["O:RALLY"] = { inv = false, flags = { "army", "armylist" } },
@@ -230,46 +235,88 @@ local function openPanels()
   return out
 end
 
--- one pass over a panel's widgets: is a control in use, and where are its scroll boxes
-local function look(root)
-  local res = { busy = nil, scroll = {} }
+-- ROWS THE PANEL'S OWN REDRAW LEAVES ALONE (lane 78). The game's redraw (UpdateInventory -> each shown tab's Update ->
+-- the tab's BP_Update) does not reach every value. Read in the blueprints (lane_s21_78/report.txt, evidence):
+--   * Trade tab (W_InventoryTab_Trade_C): BP_Update -> UpdateTradeWidget redraws the goods rows only when the tab holds
+--     the livestock trader's widget; a trading post's goods list (generalMarketTradeWidget_C) is filled once, when the
+--     tab is first shown, and then only by a row's own click. Each row (targetStockWidget_tradeTarget_C) keeps the
+--     limit it showed in a number of its own, and its + / - buttons add to THAT number: a stale row also sends a
+--     wrong value when pressed. Its own updateContents reads the region again: limit, trade rule, global trade, trade
+--     route section, stock, price (the path the panel takes when it fills the row).
+--   * Storage filters tab: no BP_Update at all; each good's tick mark (storageFilterGood_C) is drawn by its own
+--     updateStorageFilterCheckmark, called by the game only after a click on it or on its category.
+--   * Limits tab (W_InventoryTab_WorkplaceLimits_C): BP_Update makes the entries again only when the SET of goods
+--     changes; the numbers and switches of an entry (WorkplaceLimitEntry_C: production limit, consumption limit,
+--     target stock) are drawn by its updateEntry(building, good), called only when it is made or clicked.
+--   * Pack station planner tab: no BP_Update; its goods and region boxes are filled by Init on opening.
+-- Each such row of a redrawn panel, in shown AND hidden tabs (a hidden tab is not redrawn when the player shows it
+-- again), gets that call, inside the town module's quiet wrapper, right after the panel's redraw. The same rules as
+-- the redraw: not while this player holds a control, has a drop-down open or types in that panel.
+-- class -> function(row): one refresh call; a class is matched by its exact name
+local ROWS = {
+  targetStockWidget_tradeTarget_C = function(w) w:updateContents() end,
+  storageFilterGood_C = function(w) w:updateStorageFilterCheckmark() end,
+  -- the entry's own fill (as respawnAllLimitEntries / CreateConsumptionWidget call it): its building and the produced
+  -- good it already holds; it reads the region's limit (or the building's target stock) and sets box, switch, colour
+  WorkplaceLimitEntry_C = function(w)
+    local b = w.building
+    if valid(b) then w:updateEntry(b, w.currentlyProducedGoodType) end
+  end,
+  -- Init: its region box (populatePotentialRegionPartners), both goods boxes set to the building's selling and buying
+  -- types (SetSelectedOption: the handlers act only for a mouse choice, type 2, and the region box not for type 3)
+  packTrainPlanner_InterRegion_C = function(w) w:Init() end,
+}
+P.ROWS = ROWS
+
+-- one pass over a panel's widgets: is a control in use, where are its scroll boxes, which rows need their own redraw
+-- hidden: also walk hidden subtrees for rows (building panels only; the development tree keeps lane 69's walk)
+local function look(root, hidden)
+  local res = { busy = nil, scroll = {}, rows = {} }
   local n, maxn = 0, P.cfg.maxNodes
-  local function go(w, d)
-    if n >= maxn or d > 40 or res.busy then return end
+  local function go(w, d, vis)
+    if d > 40 or res.busy then return end
+    if n >= maxn then res.capped = true; return end
     if not valid(w) then return end
     n = n + 1
-    if not shown(w) then return end
+    vis = vis and shown(w)                               -- a hidden subtree: no control in use there, rows still taken
+    if not vis and not hidden then return end
     local okN, cname = pcall(function() return w:GetClass():GetFName():ToString() end)
     cname = okN and cname or ""
-    local okM, cap = pcall(function() return w:HasMouseCapture() end)
-    if okM and cap then res.busy = "held " .. cname; return end
-    if cname:find("ComboBox", 1, true) then
-      local okC, open = pcall(function() return w:IsOpen() end)
-      if okC and open then res.busy = "open " .. cname; return end
-    elseif cname:find("EditableText", 1, true) then
-      local okK, kf = pcall(function() return w:HasKeyboardFocus() end)
-      if okK and kf then res.busy = "typing " .. cname; return end
-    elseif cname:find("ScrollBox", 1, true) then
-      local okS, off = pcall(function() return w:GetScrollOffset() end)
-      if okS and type(off) == "number" then res.scroll[#res.scroll + 1] = { w = w, off = off } end
+    if ROWS[cname] then res.rows[#res.rows + 1] = { w = w, c = cname } end
+    if vis then
+      local okM, cap = pcall(function() return w:HasMouseCapture() end)
+      if okM and cap then res.busy = "held " .. cname; return end
+      if cname:find("ComboBox", 1, true) then
+        local okC, open = pcall(function() return w:IsOpen() end)
+        if okC and open then res.busy = "open " .. cname; return end
+      elseif cname:find("EditableText", 1, true) then
+        -- the box itself, or the text widget inside it, may hold the keyboard
+        local okK, kf = pcall(function() return w:HasKeyboardFocus() end)
+        if okK and kf then res.busy = "typing " .. cname; return end
+        local okD, fd = pcall(function() return w:HasFocusedDescendants() end)
+        if okD and fd then res.busy = "typing " .. cname; return end
+      elseif cname:find("ScrollBox", 1, true) then
+        local okS, off = pcall(function() return w:GetScrollOffset() end)
+        if okS and type(off) == "number" then res.scroll[#res.scroll + 1] = { w = w, off = off } end
+      end
     end
     local okK, cnt = pcall(function() return w:GetChildrenCount() end)
     if okK and type(cnt) == "number" then
       for i = 0, cnt - 1 do                              -- GetChildAt(0 .. count-1): never past the end
         local okA, c = pcall(function() return w:GetChildAt(i) end)
-        if okA and c then go(c, d + 1) end
+        if okA and c then go(c, d + 1, vis) end
       end
       return
     end
     local okC, c = pcall(function() return w:GetContent() end)
-    if okC and c and valid(c) then go(c, d + 1); return end
+    if okC and c and valid(c) then go(c, d + 1, vis); return end
     -- (lane 69, game run 2026-11-18) only a blueprint widget ("..._C", not the game's MD_ wrappers) has a widget tree:
     -- asking a plain Image for one ended the game (EXCEPTION_ACCESS_VIOLATION reading 0xffffffffffffffff, two copies)
     if cname:sub(-2) ~= "_C" or cname:sub(1, 3) == "MD_" then return end
     local okT, r = pcall(function() return w.WidgetTree.RootWidget end)
-    if okT and r and valid(r) then go(r, d + 1) end
+    if okT and r and valid(r) then go(r, d + 1, vis) end
   end
-  go(root, 0)
+  go(root, 0, true)
   res.nodes = n
   return res
 end
@@ -280,18 +327,34 @@ local function quiet(fn)
   return pcall(fn)
 end
 
-local function redrawPanel(S, p, scroll)
+-- the rows of one panel that its own redraw leaves alone (see ROWS); returns how many were redrawn
+local function redrawRows(rows)
+  local n = 0
+  for _, r in ipairs(rows or {}) do
+    local f = ROWS[r.c]
+    if f and valid(r.w) then
+      local ok, e = quiet(function() f(r.w) end)
+      if ok then n = n + 1 else P.n.errors = P.n.errors + 1; P.lastErr = "row " .. r.c .. ": " .. tostring(e) end
+    end
+  end
+  P.n.rows = (P.n.rows or 0) + n
+  return n
+end
+P.redrawRows = redrawRows
+
+local function redrawPanel(S, p, lk)
   local m = P.cfg.inv
   local ok, e = quiet(function()
     if m == "event" then p.w:UpdateInventory(0) else p.w:OnUpdateRequested() end
   end)
-  if P.cfg.keepScroll and scroll then
-    for _, s in ipairs(scroll) do
+  local nr = (ok and P.cfg.rows) and redrawRows(lk.rows) or 0
+  if P.cfg.keepScroll and lk.scroll then
+    for _, s in ipairs(lk.scroll) do
       if valid(s.w) then pcall(function() s.w:SetScrollOffset(s.off) end) end
     end
   end
   if not ok then P.n.errors = P.n.errors + 1; A.log("PANELS redraw of a building panel failed: %s", tostring(e)) end
-  return ok
+  return ok, nr
 end
 
 local function wait(why)
@@ -336,13 +399,15 @@ local function tickInv(S, now)
     local p = open[a]
     if not p then P.want[a] = nil                       -- closed meanwhile: it fills itself when it opens again
     else
-      local lk = look(p.w)
+      local lk = look(p.w, true)
       local d = P.decide(now, P.last[a], P.clickT, lk.busy ~= nil)
       if d == "go" then
         P.want[a] = nil; P.last[a] = now
-        if redrawPanel(S, p, lk.scroll) then
+        local okR, nr = redrawPanel(S, p, lk)
+        if okR then
           P.n.inv = P.n.inv + 1
-          if P.cfg.log then A.log("PANELS building panel redrawn (another player's change, %.0f ms after it, %d widgets looked at)", (now - t0) * 1000, lk.nodes or 0) end
+          if P.cfg.log then A.log("PANELS building panel redrawn (another player's change, %.0f ms after it, %d widgets looked at, %d rows redrawn)", (now - t0) * 1000, lk.nodes or 0, nr or 0) end
+          if lk.capped then P.n.capped = (P.n.capped or 0) + 1; A.log("PANELS the walk of a building panel stopped at %d widgets (cfg.maxNodes): rows past it were not redrawn", lk.nodes or 0) end
         end
       else
         wait(d)
@@ -449,9 +514,9 @@ function P.status()
   local f = {}; for k, v in pairs(P.n.flags) do f[#f + 1] = k .. " " .. v end
   local w = {}; for k, v in pairs(P.n.waits) do w[#w + 1] = k .. " " .. v end
   local nw = 0; for _ in pairs(P.want) do nw = nw + 1 end
-  return string.format("panels %s (%s, building panels: %s) | touched %d, building panel redraws %d (every panel %d), development tree %d, flags: %s | waits: %s | waiting %d | dropped while holding %d | errors %d %s",
-    P.version, P.cfg.on and "on" or "off", tostring(P.cfg.inv), P.n.touched, P.n.inv, P.n.invAll, P.n.dev or 0, table.concat(f, ", "),
-    table.concat(w, ", "), nw, P.n.dropped, P.n.errors, P.lastErr or "")
+  return string.format("panels %s (%s, building panels: %s) | touched %d, building panel redraws %d (every panel %d, rows %d), development tree %d, flags: %s | waits: %s | waiting %d | dropped while holding %d | walks capped %d | errors %d %s",
+    P.version, P.cfg.on and "on" or "off", tostring(P.cfg.inv), P.n.touched, P.n.inv, P.n.invAll, P.n.rows or 0, P.n.dev or 0, table.concat(f, ", "),
+    table.concat(w, ", "), nw, P.n.dropped, P.n.capped or 0, P.n.errors, P.lastErr or "")
 end
 
 return "coop_x_panels " .. P.version .. " loaded"

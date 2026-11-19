@@ -139,7 +139,17 @@ local DEFAULT_CFG = {
   exactValuesEvery = 1.0, -- host: the rule values of houses and of rival buildings are read this often; a friend writes them
                           --   at once (no margin, no settle time)
   exactFamEvery = 1.0,    -- host: family marks read this often (rival towns too); a friend writes them on the first look
-  rivalLiveSettle = 2.0,  -- friend: a rival town's livestock (its AI orders on the host only) is made equal after this long
+  rivalLiveSettle = 0.5,  -- friend: a rival town's livestock (its AI orders on the host only) is made equal after this long
+  -- (lane 76) session l76i: a rival town's new animal stood on a friend 4.8 s and more after the host had it (four
+  -- times in 18 minutes: "livestock zwei kind 12: 3 here, 4 on the host"). The host read the counts every 5 s, the
+  -- friend looked every 5 s and waited 2 s more. In exact mode both now look every exactLiveEvery s (one call a
+  -- region; the 13 calls per kind only when a total changed), a rival town waits 0.5 s (one more look) and every
+  -- missing animal of a kind is made in that look (at most 4), not one a look.
+  exactLiveEvery = 0.5,
+  -- ... an animal the host has NOT (one too many here) keeps a long wait: an animal's death comes on the host's own
+  -- word (the events module), and this rule must not take one away ahead of it. Before lane 76 it was the 2 s wait
+  -- on looks 5 s apart, so 5 s and more; that is kept.
+  rivalLoseSettle = 5.0,
   rivalWorkWait = 0.5,    -- friend: a rival building's workers that differ this long get the host's list
 }
 F.on = F.on or {}
@@ -375,6 +385,7 @@ local function fresh(S)
   F.hostW = {}; F.wSince = {}                             -- friend: the host's workers of rival buildings (lane 39)
   F.hostD = {}; F.dDirty = {}; F.dGen = nil               -- friend: the host's market goods of houses (lane 42)
   F.host = { b = {}, a = {}, m = {} }; F.dirty = {}       -- friend: the host's values; stale after a load, dropped
+  F.catchMourning = {}; F.rejoining = nil; F.gap0 = S and S.clockGap   -- (the clock gap of before this load: not a measure of this world)
   F.holds = {}; F.holdR = {}; F.heldSaid = {}; F.last = {}; F.made = {}; F.liveSince = {}; F.famSince = {}; F.famDay = {}; F.refused = {}
   F.liveTot = {}; F.liveFull = {}; F.passNo = 0
   F.t = { pass = 0, apply = 0, quick = 0, index = -1e9, live = 0, fam = 0, log = os.clock(), miss = 0, prune = 0 }
@@ -538,7 +549,10 @@ local function hostOne(st, e)
       if R.on ~= false and (not R.rival or e.rival) and (R.rival or e.res) and (e.live or R.rival or (e.upg and not R.rival)) then
         local x = b[R.p]
         if R.k == "b" then x = x and 1 or 0 end
-        if type(x) == "number" and (full or L.v[R.c] ~= x) then items[#items + 1] = R.c .. "=" .. num(x); L.v[R.c] = x end
+        if type(x) == "number" and (full or L.v[R.c] ~= x) then
+          items[#items + 1] = R.c .. "=" .. num(x); L.v[R.c] = x
+          if R.c == "mp" and exact then items[#items + 1] = "md=" .. F.S.eng:getDaysTotal() end
+        end
       end
     end
   end
@@ -723,7 +737,7 @@ local function hostTick(S, clock)
   if (F.on.stock or F.on.values) and F.idx and clock - F.t.pass >= cfg.passEvery then
     if addJob("hostPass", hostPassJob, {}) then F.t.pass = clock end
   end
-  if F.on.livestock and clock - F.t.live >= cfg.liveEvery then F.t.live = clock; timed("hostLive", hostLive, S, clock) end
+  if F.on.livestock and clock - F.t.live >= (hostExact() and cfg.exactLiveEvery or cfg.liveEvery) then F.t.live = clock; timed("hostLive", hostLive, S, clock) end
   if F.on.families and clock - F.t.fam >= (hostExact() and cfg.exactFamEvery or cfg.famEvery) then   -- lane 42: 1 s in exact mode
     local key = clock - (F.t.famKey or -1e9) >= cfg.keyEvery
     if addJob("hostFam", hostFamJob, { key = key }) then F.t.fam = clock; if key then F.t.famKey = clock end end
@@ -1125,8 +1139,13 @@ local function liveOne(S, r, k, role, have, n, clock)
     local pos
     if list[1] then local p = list[1].realPos; pos = { X = p.X + 150.0, Y = p.Y + 0.0, Z = p.Z + 0.0 }
     else
-      local X = F.idx; local e = X and X.list[1]
-      if e and valid(e.b) then local l = e.b:K2_GetActorLocation(); pos = { X = l.X + 300.0, Y = l.Y + 0.0, Z = l.Z + 0.0 } end
+      -- (lane 64) in the town itself: the first building of the index can stand in another region, and an animal made
+      -- there left its body in that region's list when the host's animal died (measured: gone from there 3 s later)
+      pcall(function() local c = r:getSettledRegionCenter(); if c.X == c.X and c.Y == c.Y and (c.X ~= 0 or c.Y ~= 0) then pos = { X = c.X + 150.0, Y = c.Y + 0.0, Z = c.Z + 0.0 } end end)
+      if not pos then
+        local X = F.idx; local e = X and X.list[1]
+        if e and valid(e.b) then local l = e.b:K2_GetActorLocation(); pos = { X = l.X + 300.0, Y = l.Y + 0.0, Z = l.Z + 0.0 } end
+      end
     end
     if not pos then return end
     local ok, u = pcall(function() return S.eng:SpawnLivestock(role, pos, r) end)
@@ -1138,8 +1157,8 @@ local function liveOne(S, r, k, role, have, n, clock)
     local victim
     for i = #F.made, 1, -1 do
       local m = F.made[i]
-      if not valid(m.u) then table.remove(F.made, i)
-      elseif not victim and m.role == role and m.k == k then victim = m.u; table.remove(F.made, i) end
+      if not valid(m.u) or m.u.dead then table.remove(F.made, i)
+      elseif not victim and m.role == role and m.k == k and m.u.currentUnitRole == role then victim = m.u; table.remove(F.made, i) end   -- (not by currentRegion: that is where it stands, and one made beside another region's building never matched)
     end
     if not victim then
       for i = #list, 1, -1 do
@@ -1175,9 +1194,12 @@ local function liveApply(S, clock)
           if n == have[role] then F.liveSince[id] = nil
           else
             F.liveSince[id] = F.liveSince[id] or clock
-            if clock - F.liveSince[id] >= ((R.rival and F.exact) and F.cfg.rivalLiveSettle or F.cfg.liveSettle) then   -- lane 42: a rival town 2 s
+            -- lane 42: a rival town waits less (lane 76: 0.5 s for an animal to make, 5 s for one to take away)
+            if clock - F.liveSince[id] >= ((R.rival and F.exact) and (n > have[role] and F.cfg.rivalLiveSettle or F.cfg.rivalLoseSettle) or F.cfg.liveSettle) then
               F.liveSince[id] = clock
-              liveOne(S, R.r, R.k, role, have[role], n, clock)
+              -- (lane 76) a rival town in exact mode: every animal the host has more, in this look (at most 4)
+              local times = (R.rival and F.exact and n > have[role]) and math.min(n - have[role], 4) or 1
+              for j = 1, times do liveOne(S, R.r, R.k, role, have[role] + j - 1, n, clock) end
             end
           end
         end
@@ -1281,15 +1303,36 @@ local function friendDist()
   end
 end
 
+-- A single load restores the save's morning while the host keeps playing. Use
+-- the mourning value read on the host's stated day, including across the local
+-- day step that will otherwise subtract the same day twice.
+local function restoreMourning(k, day)
+  local m = F.catchMourning[k]
+  if day > m.day then F.catchMourning[k] = nil; return end
+  if m.applied == day then return end
+  local e = byKey(k)
+  if not e and not F.idx and C.town and C.town.findB then
+    local t, x, y = parseKey(k)
+    local b = C.town.findB(t, x * 10, y * 10, 10)
+    if valid(b) then e = {b = b, k = k} end
+  end
+  if e and same(e) and (liveNow(e) or upgNow(e)) then
+    if e.b.mourningPeriod ~= m.value then e.b.mourningPeriod = m.value; bump("mourningRestored") end
+    m.applied = day
+    if m.value == 0 or (day == m.day and not F.rejoining) then F.catchMourning[k] = nil end
+  end
+end
+
 -- ---------------------------------------------------------------- friend: store the host's lines
 local function onLine(S, w)
   local sub = w[4]; local clock = os.clock()
+  if S.replay then F.rejoining = true end
   if sub == "B" then
     for ent in (w[5] or ""):gmatch("[^;]+") do
       local k, rest = ent:match("^(%d+@%-?%d+,%-?%d+)(.*)$")
       if k then
         if rest == "-" then
-          F.host.b[k] = nil; F.dirty[k] = nil
+          F.host.b[k] = nil; F.dirty[k] = nil; F.catchMourning[k] = nil
           if k:sub(1, 3) == "88@" then F.pileGone[k] = clock end      -- the host's pile is gone (exact mode: pilesStep)
         else
           local full = rest:sub(1, 1) == "!"; local body = rest:match("|(.*)$") or ""
@@ -1297,13 +1340,21 @@ local function onLine(S, w)
           if not H or H.storage then H = { g = {}, v = {}, since = {}, sinceV = {}, new = {}, quiet = 0, phase = math.random(0, 3) }; F.host.b[k] = H end
           if full then H.g = {}; H.full = true end
           H.t = clock; H.fresh = true; F.dirty[k] = true
+          local mourning, day
           for code, val in body:gmatch("(%w+)=(%-?[%d%.]+)") do
             local g = tonumber(code); local v = tonumber(val)
             if v then
               v = math.tointeger(v) or v
-              if g then H.g[g] = v; H.new[g] = true else H.v[code] = v; H.new[code] = true end
+              if g then H.g[g] = v; H.new[g] = true
+              elseif code == "md" then day = v
+              else H.v[code] = v; H.new[code] = true; if code == "mp" then mourning = v end end
               bump("items")
             end
+          end
+          if mourning and day and F.on.values and RULE.mp.on ~= false and (F.rejoining or F.catchMourning[k])
+              and not C.hold and valid(S.eng) then
+            F.catchMourning[k] = { value = mourning, day = day }
+            restoreMourning(k, S.eng:getDaysTotal())
           end
           -- lane 41 (scene module): this stock is written here soon; the friend's own shown goods follow it
           if body ~= "" then local Qs = rawget(C, "scene"); if Qs and Qs.stockSeen then pcall(Qs.stockSeen, k) end end
@@ -1376,6 +1427,13 @@ local function friendTick(S, clock)
     setHostExact(nil)
   end
   local ex = exactSwitch(clock)
+  -- (rl3: the gap still held the value of before the load, so the catch-up was taken to be over at the first tick and
+  --  the next day's mourning waited out the 3 s day rule: 2.986 s behind the host. Only a gap measured in this world counts.)
+  if F.rejoining and not S.replay and S.clockGap and S.clockGap ~= F.gap0 and math.abs(S.clockGap) <= 0.02 then F.rejoining = nil end
+  if next(F.catchMourning) and valid(S.eng) then
+    local day = S.eng:getDaysTotal()
+    for k in pairs(F.catchMourning) do restoreMourning(k, day) end
+  end
   if ex and F.idx and clock - (F.t.idxN or 0) >= cfg.exactIndexAge then        -- a new building: seen within a second
     F.t.idxN = clock
     local okN, n = pcall(function() return #S.eng.buildingArr end)
@@ -1399,7 +1457,7 @@ local function friendTick(S, clock)
       if addJob("friendPass", friendPassJob, { quick = true }) then F.t.quick = clock end
     end
   end
-  if F.on.livestock and next(F.host.a) ~= nil and clock - F.t.live >= cfg.liveEvery then F.t.live = clock; timed("friendLive", liveApply, S, clock) end
+  if F.on.livestock and next(F.host.a) ~= nil and clock - F.t.live >= (F.exact == true and cfg.exactLiveEvery or cfg.liveEvery) then F.t.live = clock; timed("friendLive", liveApply, S, clock) end
   if F.on.levels and F.idx and F.hostL and next(F.hostL) ~= nil and clock - (F.t.lv or -1e9) >= 1.0 then F.t.lv = clock; timed("friendLevels", friendLevels, clock) end
   if ex and F.on.dist and F.idx and F.hostD and next(F.hostD) ~= nil and clock - (F.t.dist or -1e9) >= 0.25 then F.t.dist = clock; timed("friendDist", friendDist) end   -- lane 42
   if ex and F.on.rivalWorkers and F.idx and F.hostW and next(F.hostW) ~= nil and clock - (F.t.wk or -1e9) >= 0.5 then F.t.wk = clock; timed("friendWorkers", friendWorkers, clock) end
