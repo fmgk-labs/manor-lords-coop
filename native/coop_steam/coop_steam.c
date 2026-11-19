@@ -26,10 +26,12 @@
 #include <ctype.h>
 #include "coop_steam_api.h"
 
-#define COOP_STEAM_VERSION "0.4"     /* 0.2 (lane 33): coat pictures travel with the save; link files turn over
+#define COOP_STEAM_VERSION "0.5"     /* 0.2 (lane 33): coat pictures travel with the save; link files turn over
                                       * 0.3 (lane 62): a host that lost its own lobby says so and the next INVITE opens a
                                       *                new one; no persona names in the log
-                                      * 0.4 (lane 62, part two): a short drop does not end the session (GRACE_MS) */
+                                      * 0.4 (lane 62, part two): a short drop does not end the session (GRACE_MS)
+                                      * 0.5 (lane 65): no file opened per tick (kept handles, attribute looks); a status
+                                      *                that differs only in pings written at most every 5 s */
 #define PROTO_VERSION      1
 #define MAX_LINE           65536u          /* longest mod line (bytes, without newline) */
 #define PING_EVERY_MS      2000
@@ -98,6 +100,16 @@
 #else
 #define CS_STATIC static
 #endif
+
+/* (lane 65) FILE OPENS. Live, 2026-11-17: on a friend's PC whose real-time scan checks every file opened after a write,
+ * each open of a link file cost milliseconds, and this DLL opened several a frame (the command file, the friend's own
+ * file, the mirror file at every write, the log at every line). Now a handle is kept while a file is in use and let go
+ * when it has been quiet for HANDLE_IDLE_MS (or on a turnover, a restart, a failure); a file not held is first looked
+ * at by its attributes (no open), and opened only when its size changed. The mock test counts every open
+ * (test/coop_steam_test.c, "file opens"). */
+#define HANDLE_IDLE_MS     1000
+#define STATUS_PING_MS     5000       /* a status that differs only in pings is written at most this often */
+static void close_h(HANDLE *h) { if (*h && *h != INVALID_HANDLE_VALUE) CloseHandle(*h); *h = NULL; }
 
 /* layout checks for the structs we read or pass by size */
 typedef char sa_msg_data[offsetof(SteamNetworkingMessage_t, m_pData) == 0 ? 1 : -1];
@@ -263,7 +275,8 @@ typedef struct Peer {
 
 /* A link file is a chain of files (lane 33): host.txt, host.2.txt, host.3.txt, ... (README "Link file turnover").
  * follow = 1: a "~NEXT <k>" line moves the tail to file k. */
-typedef struct Tail { wchar_t leaf[32]; wchar_t base[16]; int seg, follow; uint64_t off; Buf part; int skip, oversize, active; } Tail;
+typedef struct Tail { wchar_t leaf[32]; wchar_t base[16]; int seg, follow; uint64_t off; Buf part; int skip, oversize, active;
+                      HANDLE h; uint64_t growAt; } Tail;   /* (lane 65) h: the kept read handle of leaf, or NULL */
 #define MIRROR_CUTS 16
 #define LINK_KEEP          2          /* files kept before the current one (the mod's coop.lua keeps the same number) */
 #ifndef LINK_KEEP_MS
@@ -277,6 +290,7 @@ typedef struct Mirror {
     size_t cutAt[MIRROR_CUTS]; int cutTo[MIRROR_CUTS]; int ncut;   /* pend up to cutAt goes to the current file, then file cutTo */
     int stale[8], nstale;                                     /* files of an earlier chain still to delete (were in use) */
     int dropped;                                              /* lines were dropped (logged at the next flush) */
+    HANDLE h; uint64_t usedAt;                                /* (lane 65) the kept write handle of leaf, or NULL */
 } Mirror;
 
 typedef struct FifoE {
@@ -347,7 +361,10 @@ typedef struct Coop {
     int nclose;
     Buf status, lastStatus, scratch, msgBuf;
     uint64_t statusAt;
+    int shapeOnly;
+    Buf shape, lastShape;        /* (lane 65) the status without its pings: a change of pings alone waits STATUS_PING_MS */
     uint64_t logBytes;
+    HANDLE logH; uint64_t logAt; /* (lane 65) the kept log handle, let go when quiet */
     int logChecked;
     uint32_t badSender;
     int quitting, saveOffNoted;
@@ -533,8 +550,14 @@ static void log_raw(Coop *c, const char *text)
 {
     wchar_t p[MAX_PATH];
     if (!c->linkDir[0] || !link_path(c, L"coop_steam.log", p)) return;
-    HANDLE h = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
+    /* (lane 65) the handle is kept while lines come; let go after HANDLE_IDLE_MS without one (coop_tick) and at the move
+     * to coop_steam.log.old */
+    if (!c->logH) {
+        c->logH = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (c->logH == INVALID_HANDLE_VALUE) { c->logH = NULL; return; }
+    }
+    HANDLE h = c->logH;
+    c->logAt = c->now;
     if (!c->logChecked) {
         LARGE_INTEGER sz;
         if (GetFileSizeEx(h, &sz)) c->logBytes = (uint64_t)sz.QuadPart;
@@ -547,11 +570,11 @@ static void log_raw(Coop *c, const char *text)
     if (n < 0) n = (int)sizeof(line) - 2;
     line[n++] = '\n';
     DWORD w = 0;
-    WriteFile(h, line, (DWORD)n, &w, NULL);
-    CloseHandle(h);
+    if (!WriteFile(h, line, (DWORD)n, &w, NULL)) close_h(&c->logH);
     c->logBytes += (uint64_t)n;
     if (c->logBytes > LOG_CAP) {
         wchar_t old[MAX_PATH];
+        close_h(&c->logH);
         if (link_path(c, L"coop_steam.log.old", old) && MoveFileExW(p, old, MOVEFILE_REPLACE_EXISTING)) c->logBytes = 0;
     }
 }
@@ -714,8 +737,10 @@ static int seg_last(Coop *c, const wchar_t *base)
     return last;
 }
 
+static void tail_close(Tail *t) { close_h(&t->h); }
 static void tail_init(Tail *t, const wchar_t *leaf)
 {
+    tail_close(t);
     wcsncpy(t->leaf, leaf, 31); t->leaf[31] = 0;
     t->base[0] = 0; t->seg = 1; t->follow = 0;
     t->off = 0; t->part.n = 0; t->skip = 0; t->oversize = 0; t->active = 1;
@@ -731,6 +756,7 @@ static void tail_init_link(Tail *t, const wchar_t *base)
 }
 static void tail_set_seg(Tail *t, int seg)
 {
+    tail_close(t);                                     /* (lane 65) the kept handle was of the file before */
     t->seg = seg;
     seg_leaf(t->base, seg, t->leaf);
     t->off = 0; t->part.n = 0; t->skip = 0;
@@ -766,8 +792,22 @@ typedef void (*ShrinkFn)(Coop *c, void *ctx);
 static int tail_read_one(Coop *c, Tail *t, LineFn fn, ShrinkFn onShrink, void *ctx, int *shrunk)
 {
     wchar_t p[MAX_PATH];
-    if (!t->active || !link_path(c, t->leaf, p)) return 0;
-    HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (!t->active) { tail_close(t); return 0; }
+    if (!link_path(c, t->leaf, p)) return 0;
+    /* (lane 65) a kept handle, or a look at the attributes first (no open): opened only when the size changed. The
+     * handle shares delete, so a writer that starts again can delete the file meanwhile; such a file grows no more,
+     * and its handle is let go after HANDLE_IDLE_MS. */
+    HANDLE h = t->h;
+    if (!h) {
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExW(p, GetFileExInfoStandard, &fa)) {
+            uint64_t sz0 = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+            if (sz0 == t->off) return 0;                   /* nothing new, nothing shorter */
+            h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h == INVALID_HANDLE_VALUE) return 0;       /* (in use or going: the next tick tries again) */
+            t->h = h; t->growAt = c->now;
+        } else h = INVALID_HANDLE_VALUE;
+    }
     if (h == INVALID_HANDLE_VALUE) {
         DWORD e = GetLastError();
         if (!t->follow || t->seg <= 1 || (e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND)) return 0;
@@ -789,8 +829,9 @@ static int tail_read_one(Coop *c, Tail *t, LineFn fn, ShrinkFn onShrink, void *c
     }
     int moved = 0;
     LARGE_INTEGER sz;
-    if (!GetFileSizeEx(h, &sz)) { CloseHandle(h); return 0; }
+    if (!GetFileSizeEx(h, &sz)) { tail_close(t); return 0; }
     uint64_t len = (uint64_t)sz.QuadPart;
+    if (len != t->off) t->growAt = c->now;
     if (len < t->off) { *shrunk = 1; t->off = 0; t->part.n = 0; t->skip = 0; if (onShrink) onShrink(c, ctx); }
     if (len > t->off) {
         uint64_t want = len - t->off;
@@ -799,6 +840,7 @@ static int tail_read_one(Coop *c, Tail *t, LineFn fn, ShrinkFn onShrink, void *c
         DWORD got = 0;
         if (buf_reserve(&t->part, t->part.n + (size_t)want + 1) && SetFilePointerEx(h, pos, NULL, FILE_BEGIN) &&
             ReadFile(h, t->part.p + t->part.n, (DWORD)want, &got, NULL) && got > 0) {
+            t->growAt = c->now;
             t->off += got;
             t->part.n += got;
             uint8_t *d = t->part.p;
@@ -823,9 +865,9 @@ static int tail_read_one(Coop *c, Tail *t, LineFn fn, ShrinkFn onShrink, void *c
                 else if (rest > MAX_LINE) { t->skip = 1; t->oversize++; t->part.n = 0; }
                 else { if (at) memmove(d, d + at, rest); t->part.n = rest; }
             }
-        }
+        } else tail_close(t);                              /* (lane 65) a failed read: opened again next time */
     }
-    CloseHandle(h);
+    if (t->h && c->now - t->growAt >= HANDLE_IDLE_MS) tail_close(t);   /* (lane 65) quiet: let go */
     if (moved) { tail_set_seg(t, moved); return 2; }    /* anything after the "~NEXT" line in the old file is not read */
     return 0;
 }
@@ -839,8 +881,10 @@ static int tail_read(Coop *c, Tail *t, LineFn fn, ShrinkFn onShrink, void *ctx)
 }
 
 /* a mirror: base "host" or "friend<n>". It writes the same chain of files the far side's mod writes (turnover above). */
+static void mirror_close(Mirror *m) { close_h(&m->h); }
 static void mirror_init(Mirror *m, const wchar_t *base)
 {
+    mirror_close(m);
     wcsncpy(m->base, base, 15); m->base[15] = 0;
     m->seg = 1; m->low = 1; m->ncut = 0; m->nstale = 0;
     seg_leaf(m->base, 1, m->leaf);
@@ -860,6 +904,7 @@ static void mirror_add(Mirror *m, const uint8_t *d, uint32_t n)
 static void mirror_switch(Coop *c, Mirror *m, int k)
 {
     wchar_t leaf[32], p[MAX_PATH];
+    mirror_close(m);                                   /* (lane 65) the old file is done */
     seg_leaf(m->base, k, leaf);
     if (link_path(c, leaf, p)) {
         HANDLE h = CreateFileW(p, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -899,15 +944,30 @@ static int mirror_write(Coop *c, Mirror *m, const uint8_t *d, size_t n)
 {
     wchar_t p[MAX_PATH];
     if (!link_path(c, m->leaf, p)) return 1;
-    HANDLE h = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    /* (lane 65) the handle is kept while lines come (each WriteFile goes to the file at once: the mod on this PC reads
+     * it in the same frame); let go on a turnover, a clear, a failure, and after HANDLE_IDLE_MS without a line
+     * (mirror_flush). It does not share delete: nobody else deletes a mirror file, and a delete that went through
+     * under a kept handle would leave later lines in a file nobody reads. */
+    if (!m->h) {
+        m->h = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (m->h == INVALID_HANDLE_VALUE) m->h = NULL;
+    }
     DWORD w = 0;
-    int ok = h != INVALID_HANDLE_VALUE && WriteFile(h, d, (DWORD)n, &w, NULL) && w == (DWORD)n;
+    int ok = m->h && WriteFile(m->h, d, (DWORD)n, &w, NULL) && w == (DWORD)n;
+    DWORD err = ok ? 0 : GetLastError();
+    if (!ok && m->h && w > 0 && w < (DWORD)n) {
+        /* a part was written: the rest must follow it, never the whole again (a line would be doubled) */
+        memmove(m->pend.p, m->pend.p + w, m->pend.n - w);
+        m->pend.n -= w;
+        for (int i = 0; i < m->ncut; i++) m->cutAt[i] -= w;
+    }
     if (!ok && c->now >= m->warnAt) {
         char nm[40]; to_utf8(m->leaf, nm, 40);
-        logf_(c, "could not write to %s (error %lu), will keep trying", nm, GetLastError());
+        logf_(c, "could not write to %s (error %lu), will keep trying", nm, err);
         m->warnAt = c->now + 10000;
     }
-    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    if (!ok) mirror_close(m);                          /* opened again at the next try */
+    else m->usedAt = c->now;
     return ok;
 }
 static void mirror_flush(Coop *c, Mirror *m)
@@ -923,11 +983,12 @@ static void mirror_flush(Coop *c, Mirror *m)
         }
         if (m->pend.n == 0) break;
         size_t upto = m->ncut ? m->cutAt[0] : m->pend.n;
-        if (!mirror_write(c, m, m->pend.p, upto)) break;
+        if (!mirror_write(c, m, m->pend.p, upto)) break;   /* (a part written is taken off pend there) */
         memmove(m->pend.p, m->pend.p + upto, m->pend.n - upto);
         m->pend.n -= upto;
         for (int i = 0; i < m->ncut; i++) m->cutAt[i] -= upto;
     }
+    if (m->h && c->now - m->usedAt >= HANDLE_IDLE_MS) mirror_close(m);   /* (lane 65) quiet: let go */
     mirror_cleanup(c, m);
     if (m->nstale) {             /* the earlier chain's files that were in use when it was cleared */
         int k = 0;
@@ -944,6 +1005,7 @@ static void mirror_flush(Coop *c, Mirror *m)
 /* the far side started again (or a new session): empty the first file, then delete the numbered ones */
 static void mirror_clear(Coop *c, Mirror *m)
 {
+    mirror_close(m);                                   /* (lane 65) before the file is emptied and the rest deleted */
     m->pend.n = 0; m->ncut = 0;
     m->seg = 1; m->low = 1;
     seg_leaf(m->base, 1, m->leaf);
@@ -1224,6 +1286,7 @@ static void status_player(Coop *c, Buf *b, int slot, uint64_t sid, const char *s
 {
     char nm[100];
     persona(c, sid, nm, sizeof(nm));
+    if (c->shapeOnly && ping >= 0) ping = 0;          /* (lane 65) the shape: a ping is only "some ping" */
     buf_printf(b, "%d %llu %s %d %s\n", slot, (unsigned long long)sid, state, ping, nm);
 }
 static void build_status(Coop *c, Buf *b)
@@ -1278,9 +1341,17 @@ static void write_status(Coop *c, int force)
     if (!force && c->now - c->statusAt < STATUS_MIN_MS && c->statusAt) return;
     build_status(c, &c->status);
     if (!force && c->lastStatus.n == c->status.n && c->status.n && memcmp(c->lastStatus.p, c->status.p, c->status.n) == 0) return;
+    /* (lane 65) only the pings changed (every PING_EVERY_MS): written at most every STATUS_PING_MS. Every write is a
+     * new file (temp file and replace) that the mod opens up to four times a second, and a new file is what a
+     * real-time scan looks at again; any other change is written at once, as before. */
+    c->shapeOnly = 1; build_status(c, &c->shape); c->shapeOnly = 0;
+    if (!force && c->lastShape.n == c->shape.n && c->shape.n && memcmp(c->lastShape.p, c->shape.p, c->shape.n) == 0 &&
+        c->now - c->statusAt < STATUS_PING_MS) return;
     if (write_whole_atomic(c, L"steam_status.txt", L"steam_status.txt.tmp", c->status.p, c->status.n)) {
         c->lastStatus.n = 0;
         buf_add(&c->lastStatus, c->status.p, c->status.n);
+        c->lastShape.n = 0;
+        buf_add(&c->lastShape, c->shape.p, c->shape.n);
         c->statusAt = c->now;
     }
 }
@@ -1299,6 +1370,10 @@ static void go_off(Coop *c, const char *fmt, ...)
     c->st = ST_OFF;
     logf_(c, "OFF: %s", c->offReason);
     write_status(c, 1);
+    /* (lane 65) nothing of this DLL stays open once it is off */
+    for (int i = 0; i <= MAX_FRIENDS; i++) mirror_close(&c->mirrors[i]);
+    tail_close(&c->hostTail); tail_close(&c->myTail); tail_close(&c->cmdTail);
+    close_h(&c->logH);
 }
 
 /* ================================================================ configuration */
@@ -1698,7 +1773,7 @@ static void session_reset(Coop *c, int toState)
     }
     recv_close(&c->rcv, 1);
     memset(&c->rcv, 0, sizeof(c->rcv));
-    for (int i = 0; i <= MAX_FRIENDS; i++) mirror_flush(c, &c->mirrors[i]);
+    for (int i = 0; i <= MAX_FRIENDS; i++) { mirror_flush(c, &c->mirrors[i]); mirror_close(&c->mirrors[i]); }   /* (lane 65) */
     free_fifo(c);
     if (c->lobby && (c->st == ST_HOSTING || c->st == ST_JOINED || c->st == ST_JOINING)) {
         c->f.MM_LeaveLobby(c->mm, c->lobby);
@@ -1706,7 +1781,7 @@ static void session_reset(Coop *c, int toState)
     }
     c->lobby = 0; c->call = 0; c->callKind = CALL_NONE;
     c->mySlot = 0; c->roster[0] = 0; c->slotsSent[0] = 0;
-    c->hostTail.active = 0; c->myTail.active = 0;
+    c->hostTail.active = 0; c->myTail.active = 0; tail_close(&c->hostTail); tail_close(&c->myTail);   /* (lane 65) */
     c->nbans = 0; c->nmarks = 0;
     c->ownMiss = 0; c->backOnline = 0;
     c->lostAt = 0; c->memberOnly = 0; c->rejoinTries = 0; c->handTries = 0;
@@ -2726,6 +2801,7 @@ CS_STATIC void coop_tick(Coop *c)
 {
     c->now = c->clock();
     c->ticks++;
+    if (c->logH && c->now - c->logAt >= HANDLE_IDLE_MS) close_h(&c->logH);   /* (lane 65) a quiet log: let go */
     c->phase = "start-up";
     if (!c->started) { c->started = 1; if (!coop_init(c)) { write_status(c, 1); return; } }
     if (c->off) return;
@@ -2774,11 +2850,56 @@ CS_STATIC void coop_tick_safe(Coop *c)
     }
 }
 
+/* (lane 65, round three) THE FRAME'S ORDER. The mod calls coop_steam_tick FIRST in its frame (what came over Steam is in
+ * the mirror files before the mod reads them, the same frame) and coop_steam_flush LAST (what the mod wrote to its own
+ * file this frame leaves this frame). The flush only reads this copy's own file and sends what waits: no receive, no
+ * lobby work, no status. A mod that calls only coop_steam_tick works as before (one frame later each way). */
+CS_STATIC void coop_flush(Coop *c)
+{
+    if (!c->started || c->off || !c->steamOk) return;
+    c->now = c->clock();
+    c->phase = "flush";
+    if (c->st == ST_HOSTING && !c->lostAt) {                  /* (inside the window the next tick does it, as before) */
+        host_own_file(c);
+        host_fifo(c);
+        for (int s = 1; s <= MAX_FRIENDS; s++) if (c->peers[s].used) send_pending(c, &c->peers[s]);
+    } else if (c->st == ST_JOINED) {
+        if (c->myTail.active) tail_read(c, &c->myTail, friend_line, friend_shrink, NULL);
+        send_pending(c, &c->peers[0]);
+    }
+}
+CS_STATIC void coop_flush_safe(Coop *c)
+{
+    DWORD code = 0;
+    __try {
+        coop_flush(c);
+    } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        c->off = 1;
+    }
+    if (code) {
+        __try {
+            go_off(c, "internal fault 0x%08lX during %s; the Steam link switched itself off", code, c->phase ? c->phase : "?");
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+}
+
 #ifndef COOP_STEAM_MOCK
 static Coop g_coop;
 static uint64_t real_clock(void) { return GetTickCount64(); }
+/* (lane 65) the second export: the end of the mod's frame (see coop_flush) */
+__declspec(dllexport) int __cdecl coop_steam_flush(void *L)
+{
+    (void)L;
+    Coop *c = &g_coop;
+    if (c->off || c->busy || !c->started) return 0;
+    c->busy = 1;
+    coop_flush_safe(c);
+    c->busy = 0;
+    return 0;
+}
 
-/* The one export. lua_CFunction shape; never touches L; always returns 0. */
+/* The first export (coop_steam_flush above is the second). lua_CFunction shape; never touches L; always returns 0. */
 __declspec(dllexport) int __cdecl coop_steam_tick(void *L)
 {
     (void)L;

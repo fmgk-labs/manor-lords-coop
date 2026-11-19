@@ -29,7 +29,8 @@ local function enc(s) return "=" .. (tostring(s):gsub("[^%w]", function(ch) retu
 local function dec(s) return (tostring(s or ""):gsub("^=", ""):gsub("%%(%x%x)", function(x) return string.char(tonumber(x, 16)) end)) end
 local function stat(S, k) S.stats[k] = (S.stats[k] or 0) + 1 end
 
-local function reset() M.names = {}; M.fresh = {}; M.way = {}; M.worldT = os.clock() end
+local function reset() M.names = {}; M.fresh = {}; M.way = {}; M.worldT = os.clock()
+  M.form = {}; M.hostShape = {}; M.sentSeq = {}; M.sentT = {}; M.lastTag = {}; M.lent = {}; M.measQ = {}; M.pend = {}; M.pendSq = {}; M.ackWall = {} end   -- (lane 70) shapes
 if not M.names then reset() end
 
 -- ================================================================ NAME
@@ -176,7 +177,7 @@ local function onMessage(S, from, kind, w, line)
     local h = A.toLocal(hh)
     if R.sqValid(h) then
       local name = dec(w[6])
-      if nameOf(S, h) ~= name then setName(S, h, name); stat(S, "a_named"); log("ARMY squad %d is called [%s] on the host: named here", h, name) end
+      if nameOf(S, h) ~= name then setName(S, h, name); stat(S, "a_named"); log("ARMY squad %d is called [%s] on the host: named here", h, name); if C.panels and C.panels.touched then pcall(C.panels.touched, "A:NAME", nil) end end
     end
   elseif act == "SPREAD" and hh then
     local h = A.toLocal(hh)
@@ -187,6 +188,7 @@ local function onMessage(S, from, kind, w, line)
         -- the first run: two stray O MOVE lines). The core's watcher skips a squad the mirror touched; 1.6 s here.
         if S.mirT then S.mirT[h] = os.clock() + 1.0 end
         S.sc:SetSkillActive({ Value = h }, 4, on, true); stat(S, "a_spreadSet")
+        if C.panels and C.panels.touched then pcall(C.panels.touched, "A:SPREAD", nil) end   -- (lane 69) open army panels redraw
         log("ARMY squad %d spread out %s on the host: set here", h, w[6])
       end
     end
@@ -493,6 +495,7 @@ local function applyField(S, kind, mk, i, v)
   if f.read(u) == v then return "same" end
   local ok, e = pcall(f.write, u, v); if not ok then return "error " .. tostring(e) end
   RT[kind .. mk .. "#" .. i] = f.read(u) or v
+  if C.panels and C.panels.touched then pcall(C.panels.touched, "RETINUE", m) end   -- (lane 69) another player's retinue change: open panels redraw
   return "ok"
 end
 local function onRetinue(S, from, w)
@@ -658,7 +661,7 @@ local function applyLine(S, h, a, b, clock)
   local s = S.sc:GetSquad({ Value = h })
   local mid = { X = (a.X + b.X) / 2, Y = (a.Y + b.Y) / 2, Z = (a.Z + b.Z) / 2 }
   if s.isEngaged or s.targetSquad.Value ~= 0 then R.moveOrder(h, mid); return "ok (in a fight: a plain move)" end
-  local ok, e = pcall(function() R.issuer(s):formALineArmy({ { Value = h } }, { A = a, B = b }, FName("None"), { A = a, B = b }); R.commit(h) end)
+  local ok, e = pcall(function() R.issuer(s):formALineArmy({ { Value = h } }, { A = a, B = b }, FName("None"), { A = a, B = b }); (R.commitLine or R.commit)(h) end)
   if not ok then return "error " .. tostring(e) end
   stat(S, "a_lines")
   return "ok"
@@ -667,6 +670,493 @@ local function decLine(w, i)
   local n = {}; for k = i, i + 4 do n[#n + 1] = tonumber(w[k]) end
   if #n < 5 then return nil end
   return { X = n[1], Y = n[2], Z = n[5] }, { X = n[3], Y = n[4], Z = n[5] }
+end
+
+-- ================================================================ SHAPE (lane 70): the formation a line order ends in
+-- Read in the game file (lanes/lane_70/report.txt; RVAs of 0.8.117). A line order on ONE squad, formALineArmy(P, Q):
+--   * the squad's own line is P .. P + (L - 240) along P->Q (L = |Q - P| on the ground; half = L/2 - 120 at 4b459c4),
+--     so a drag is 2.4 m wider than the formation it gives, and the formation starts at the press place P;
+--   * files: fi = RoundToInt(segment / spread) clamped to 1..150 (4b43962); a rank holds fi + 1 men (columns 0..fi,
+--     4b43f27); ranks = ceil(men / (fi + 1)); rows go to the left of P->Q, one spread apart; a part-filled last rank
+--     is shifted (fi - m + 0.5) / 2 spreads along the line (4b43fbe); only men with their decals count (+0x440);
+--   * spread (Squad.spread) is set by the game on every skill change (4d8d780): 120 when the squad's FIRST man has
+--     meleeTraining <= 0.6, else 180 with spread out (skill 4), 95 with shield wall (skill 2), 180 mounted, else 120;
+--     with the first man's meleeTraining <= 0.5 the squad forms a heap without ranks (4b43a1d);
+--   * the target place the squad gets (TargetLocation) is the mean of its men's places (4b51eb0), not the middle of
+--     the drag: so "2 * target - release place" (lane 34) came out about 2.4 m too long and turned by the ranks'
+--     depth, and the host fitted about two files more than the player saw (the fault of G135);
+--   * SetSkillActive forms the squad again on its stored line (Squad+0x158, the last segment) with its new spread
+--     (4d83e11): a shield wall or spread out changes the files on the same line.
+-- So a line order is carried by its RESULT: the copy that knows the line (the host for a friend's drag, the dragging
+-- copy for its own) gives it with the game's routine, the host works out the shape it ended in and sends it to every
+-- copy, also the one that gave the order ("A SHAPE"); each copy forms its squad on the host's line with the length
+-- that gives the host's files with its own spread. The host sends the shape again whenever it changes (a skill, a
+-- head count during a muster). Log lines: "ARMY shape ...".
+local CUT, FMAX = 240.0, 150
+local F06, F05 = 0.60000002384185791, 0.5                  -- the game's float constants 0.6 and 0.5
+local function rhe(v)                                       -- round half to even (cvtsd2si)
+  local fl = math.floor(v); local d = v - fl
+  if d > 0.5 then return fl + 1 elseif d < 0.5 then return fl end
+  return (fl % 2 == 0) and fl or fl + 1
+end
+local function filesOf(seg, sp)                             -- the game's fi for a segment of this length (cm)
+  if not sp or sp <= 0 then sp = 100.0 end
+  local fi = math.floor(rhe(2.0 * (math.abs(seg) * (1.0 / sp)) + 0.5) / 2)
+  if fi > FMAX then fi = FMAX elseif fi < 1 then fi = 1 end
+  return fi
+end
+local function ranksOf(n, fi) if n <= 0 then return 0 end; return math.ceil(n / (fi + 1)) end
+-- the mean of the slots, in spreads: along the line from its start and across it (to the left)
+local function centroidOf(n, fi)
+  local per = fi + 1; local full = math.floor(n / per); local m = n - full * per
+  local sa, sr = full * per * (fi / 2), per * (full * (full - 1) / 2)
+  if m > 0 then sa = sa + m * ((m - 1) / 2 + (fi - m + 0.5) / 2); sr = sr + m * full end
+  return sa / n, sr / n
+end
+M.shapeMath = { filesOf = filesOf, ranksOf = ranksOf, centroidOf = centroidOf, CUT = CUT }
+local atan2 = math.atan2 or math.atan                -- (Lua 5.4: math.atan(y, x); 5.1 for the desk test: atan2)
+local function angD(a, b) local d = math.abs(a - b) % (2 * math.pi); return math.min(d, 2 * math.pi - d) end
+-- The press place behind a drag: the inverse of the game's one-squad line. Given the release place c, the squad's new
+-- target t (the slots' mean), its men n and spread sp: every files value fi whose line length L = along + sqrt(|t-c|^2 -
+-- across^2) gives fi back is a candidate; its direction follows from the same triangle. The men's own direction (dir,
+-- set by the order to the line's direction) picks one. Returns P, L, how ("exact" one candidate near the men's
+-- direction, "guess" otherwise) or nil.
+local function dragFrom(n, sp, cx, cy, tx, ty, hx, hy)
+  if n < 1 or not sp or sp <= 0 then return nil end
+  local ux, uy = tx - cx, ty - cy; local rho2 = ux * ux + uy * uy
+  local phi = atan2(uy, ux); local cands = {}
+  for fi = 1, FMAX do
+    local al, ac = centroidOf(n, fi)
+    local b = ac * sp; local d2 = rho2 - b * b
+    if d2 >= 0 then
+      local L = al * sp + math.sqrt(d2)
+      if L > CUT + 2 and filesOf(L - CUT, sp) == fi then cands[#cands + 1] = { fi = fi, L = L, th = phi - atan2(b, al * sp - L) } end
+    end
+  end
+  if #cands == 0 then return nil end
+  local pick, how = cands[1], (#cands == 1) and "exact" or "guess"
+  if hx then
+    local hth = atan2(hy, hx); local near = 0
+    table.sort(cands, function(a, b) return angD(a.th, hth) < angD(b.th, hth) end)
+    pick = cands[1]
+    for _, c in ipairs(cands) do if angD(c.th, hth) < math.rad(4) then near = near + 1 end end
+    how = (near == 1) and "exact" or "guess"
+  end
+  return { X = cx - pick.L * math.cos(pick.th), Y = cy - pick.L * math.sin(pick.th) }, pick.L, how, pick.fi, #cands
+end
+M.dragFrom = dragFrom
+-- the same when the line's direction (hx, hy) is known exactly (the order writes it into every man's dir): the target's
+-- part along the line gives L for each files value, its part across the line picks the files value. Offline
+-- (lanes/lane_70/tools/shape_model.py, 6000 drags): exact without the men's random offsets; with them one file off in
+-- 3.6 % (two ranks, nearly full: the offsets move the target as much as one file does); the drag's copy then follows
+-- the line it sent (see onOrderEvent)
+local function dragAlong(n, sp, cx, cy, tx, ty, hx, hy)
+  if n < 1 or not sp or sp <= 0 then return nil end
+  local a = (tx - cx) * hx + (ty - cy) * hy; local b = (tx - cx) * -hy + (ty - cy) * hx
+  local best
+  for fi = 1, FMAX do
+    local al, ac = centroidOf(n, fi); local L = al * sp - a
+    if L > CUT + 2 and filesOf(L - CUT, sp) == fi then
+      local res = math.abs(b - ac * sp)
+      if not best or res < best.res then best = { res = res, fi = fi, L = L } end
+    end
+  end
+  if not best then return nil end
+  return { X = cx - best.L * hx, Y = cy - best.L * hy }, best.L, best.res < 20 and "exact" or "guess", best.fi, best.res
+end
+M.dragAlong = dragAlong
+-- this copy's squad: men (those of unitArr), spread, its first man's training, fight state, target place
+local function shapeState(S, h)
+  local s = S.sc:GetSquad({ Value = h })
+  local arr = s.unitArr; local n = #arr; local units = {}
+  for i = 1, n do local u = A.un(arr[i]); if valid(u) then units[#units + 1] = u end end
+  local tr = -1; pcall(function() tr = tonumber(units[1].meleeTraining) or -1 end)
+  local sk = {}; pcall(function() for i = 1, #s.activeSkills do sk[tonumber(A.un(s.activeSkills[i])) or -1] = true end end)
+  local mount = false; pcall(function() mount = valid(units[1].mountActor) end)
+  -- the spread the game's own rule gives (4d8d780), for the log: the squad's field is what counts
+  local rule = 120.0
+  if tr > F06 then if sk[4] then rule = 180.0 elseif sk[2] then rule = 95.0 elseif mount then rule = 180.0 end end
+  return { s = s, n = #units, units = units, sp = tonumber(s.spread) or 0, rule = rule, train = tr, mob = tr >= 0 and tr <= F05,
+           eng = s.isEngaged and true or false, tgt = s.targetSquad.Value, tx = s.TargetLocation.X, ty = s.TargetLocation.Y, ctl = s.Control }
+end
+-- the men's mean direction, and whether every man has the same one (the order has just written it: exact)
+local function menDir(units)
+  local fx, fy, ds = 0, 0, {}
+  for _, u in ipairs(units) do local okD, d = pcall(function() return u.dir end); if okD and d then fx = fx + d.X; fy = fy + d.Y; ds[#ds + 1] = { d.X, d.Y } end end
+  local l = math.sqrt(fx * fx + fy * fy); if l < 0.01 then return nil end
+  local hx, hy = fx / l, fy / l; local same = #ds > 0
+  for _, d in ipairs(ds) do if math.abs(d[1] - hx) > 1e-4 or math.abs(d[2] - hy) > 1e-4 then same = false; break end end
+  return hx, hy, same
+end
+-- the press place of a drag from the squad's state (exact direction when the men all have it, else the angle fit)
+local function pressOf(st, cx, cy, tx, ty)
+  if st.mob then return nil, nil, "a heap" end
+  local hx, hy, same = menDir(st.units)
+  if hx and same then
+    local P, L, how, fi, res = dragAlong(st.n, st.sp, cx, cy, tx, ty, hx, hy)
+    if P then return P, L, how .. string.format(" (direction from the men, off by %.0f cm across)", res) end
+  end
+  local P, L, how, fi, nc = dragFrom(st.n, st.sp, cx, cy, tx, ty, hx, hy)
+  if P then return P, L, how .. string.format(" (%d candidates%s)", nc, hx and "; the men's directions differ" or "") end
+  return nil, nil, "no fit"
+end
+-- the segment the game forms on for a one-squad line P -> Q (signed: a line under 2.4 m turns round)
+local function segOf(P, Q)
+  local dx, dy = Q.X - P.X, Q.Y - P.Y; local L = math.sqrt(dx * dx + dy * dy); if L < 1 then return nil end
+  local ux, uy = dx / L, dy / L; local sg = L - CUT
+  if math.abs(sg) < 2 then return nil end
+  return { ax = P.X, ay = P.Y, bx = P.X + ux * sg, by = P.Y + uy * sg, z = P.Z or Q.Z or 0 }
+end
+local function segLen(g) return math.sqrt((g.bx - g.ax) ^ 2 + (g.by - g.ay) ^ 2) end
+-- the shape of squad h on this copy on segment g: files (fi), ranks, men, spread; key for "did it change"
+local function shapeOn(S, h, g)
+  local st = shapeState(S, h)
+  local fi = filesOf(segLen(g), st.sp)
+  local sh = { fi = fi, n = st.n, ranks = st.mob and 1 or ranksOf(st.n, fi), sp = st.sp, rule = st.rule, train = st.train, mob = st.mob, st = st }
+  sh.key = string.format("%d|%d|%d|%.0f|%s|%.0f,%.0f,%.0f,%.0f", sh.fi, sh.n, sh.ranks, sh.sp, tostring(sh.mob), g.ax / 10, g.ay / 10, g.bx / 10, g.by / 10)
+  return sh
+end
+-- "files" for a player: the men a full rank holds (fi + 1), or all the men when they fit in one rank
+local function filesSeen(n, fi) return math.min(n, fi + 1) end
+local function shapeText(sh) return string.format("%d men, %d files x %d ranks, spread %.0f (rule %.0f), first man's training %.2f%s", sh.n, filesSeen(sh.n, sh.fi), sh.ranks, sh.sp, sh.rule, sh.train, sh.mob and " (a heap: no ranks)" or "") end
+M.form = M.form or {}; M.hostShape = M.hostShape or {}
+-- note the line this copy just gave squad h (the mod's own orders: applyLine, the core's doMove and lineAt)
+local function hold(S, h, P, Q, src, tag)
+  local g = segOf(P, Q); if not g then M.form[h] = nil; return nil end
+  g.src, g.tag, g.t = src, tag, os.clock()
+  -- the target the order left (the stale test compares with it, not with the model)
+  pcall(function() local s = S.sc:GetSquad({ Value = h }); g.tx, g.ty = s.TargetLocation.X, s.TargetLocation.Y end)
+  M.form[h] = g
+  return g
+end
+-- (host) tell every copy the shape squad h is in now, on its held line
+local function sendShape(S, h, tag, why)
+  local g = M.form[h]; if not g or not R.sqValid(h) then return false end
+  local okS, sh = pcall(shapeOn, S, h, g); if not okS then log("ARMY shape squad %d: could not be read (%s)", h, tostring(sh)); return false end
+  g.key = sh.key; g.sentT = os.clock()
+  send(string.format("A SHAPE %d %s %d %d %d %.2f %.1f %.1f %.1f %.1f %.1f %d", h, tag or "host:-", sh.n, sh.fi, sh.ranks, sh.sp, g.ax, g.ay, g.bx, g.by, g.z, sh.mob and 1 or 0))
+  stat(S, "a_shapeSent")
+  log("ARMY shape squad %d (%s, %s): %s, line %.0f: sent to friends", h, tag or "-", why or "-", shapeText(sh), segLen(g))
+  return true, sh
+end
+-- the line P -> Q that gives, on this copy (spread sp), the host's files on the host's line, with the front rank's
+-- middle where the host's is
+local function lineForShape(H, sp)
+  local L = math.sqrt((H.bx - H.ax) ^ 2 + (H.by - H.ay) ^ 2); if L < 1 then return nil end
+  local ux, uy = (H.bx - H.ax) / L, (H.by - H.ay) / L
+  local seg, half, halfH = L, L / 2, L / 2
+  if not H.mob and sp and sp > 0 and H.sp > 0 then seg = H.fi * sp; half = seg / 2; halfH = H.fi * H.sp / 2 end
+  local mx, my = H.ax + ux * halfH, H.ay + uy * halfH
+  local ax, ay = mx - ux * half, my - uy * half
+  return { X = ax, Y = ay, Z = H.z }, { X = ax + ux * (seg + CUT), Y = ay + uy * (seg + CUT), Z = H.z }
+end
+M.shapeMath.lineForShape = lineForShape; M.shapeMath.segOf = segOf        -- (for the desk test, tests/lane70)
+local function sameSeg(g, P, Q, tol)
+  local g2 = segOf(P, Q); if not (g and g2) then return false end
+  return math.abs(g.ax - g2.ax) <= tol and math.abs(g.ay - g2.ay) <= tol and math.abs(g.bx - g2.bx) <= tol and math.abs(g.by - g2.by) <= tol
+end
+-- give squad h the line P -> Q on this copy and hold it (see hold)
+local function giveLine(S, h, P, Q, clock, src, tag)
+  local r = applyLine(S, h, P, Q, clock)
+  if r == "ok" then hold(S, h, P, Q, src, tag) else M.form[h] = nil end
+  return r
+end
+-- (friend) form squad h as the host's shape H says. why: for the log. Returns what was done.
+local function formAsHost(S, h, H, clock, why)
+  local st = shapeState(S, h)
+  if st.n == 0 then return "empty here" end
+  if st.eng or st.tgt ~= 0 or st.ctl == 3 then return "in a fight or fleeing here: left to the fight rules" end
+  if H.mob ~= st.mob then
+    stat(S, "a_shapeLeader")
+    return string.format("the first man differs (host %s, here %s): not fitted", H.mob and "a heap" or "ranks", st.mob and "a heap" or "ranks")
+  end
+  local P, Q = lineForShape(H, st.sp)
+  if not P then return "bad line" end
+  local g = M.form[h]
+  local fiHere = g and filesOf(segLen(g), st.sp)
+  -- the same start, direction and files: the same slots (the far ends may differ by up to half a spread: the held line
+  -- is the drag as drawn, the host's fitted one ends at fi spreads)
+  local same = false
+  if g and fiHere == H.fi then
+    local g2 = segOf(P, Q)
+    if g2 then
+      local L1, L2 = segLen(g), segLen(g2)
+      local cr = ((g.bx - g.ax) * (g2.by - g2.ay) - (g.by - g.ay) * (g2.bx - g2.ax)) / (L1 * L2)
+      local dt = ((g.bx - g.ax) * (g2.bx - g2.ax) + (g.by - g.ay) * (g2.by - g2.ay)) / (L1 * L2)
+      same = math.abs(g.ax - g2.ax) <= 5 and math.abs(g.ay - g2.ay) <= 5 and dt > 0 and math.abs(cr) < 0.004     -- 5 cm, 0.23 degrees
+    end
+  end
+  if same then
+    if st.n ~= H.n then stat(S, "a_shapeHeads"); return string.format("same line and files; head count differs (host %d, here %d)", H.n, st.n) end
+    stat(S, "a_shapeSame"); return "same"
+  end
+  local r = giveLine(S, h, P, Q, clock, "shape", H.tag)
+  if r ~= "ok" then return "not formed: " .. tostring(r) end
+  -- the order's own skill switch sets the spread again (4d8d780): when it moved, the length follows once more
+  local st2 = shapeState(S, h)
+  if math.abs(st2.sp - st.sp) > 0.5 then
+    local P2, Q2 = lineForShape(H, st2.sp)
+    if P2 then giveLine(S, h, P2, Q2, clock, "shape", H.tag) end
+  end
+  stat(S, "a_shapeFormed")
+  local sh = shapeOn(S, h, M.form[h] or { ax = P.X, ay = P.Y, bx = Q.X, by = Q.Y, z = P.Z })
+  local heads = (sh.n ~= H.n) and string.format("; head count differs (host %d, here %d)", H.n, sh.n) or ""
+  return string.format("formed as the host's (%s)%s", shapeText(sh), heads)
+end
+-- (friend) "A SHAPE <h> <tag> <men> <fi> <ranks> <spread> <ax> <ay> <bx> <by> <z> <heap>"
+local function onShape(S, w)
+  local h = A.toLocal(tonumber(w[5]) or 0); if not (h and R.sqValid(h)) then return end
+  if w[7] == "0" then M.hostShape[h] = nil; return end           -- the host dropped its line (another order, a fight)
+  local H = { tag = w[6] or "-", n = tonumber(w[7]) or 0, fi = tonumber(w[8]) or 1, ranks = tonumber(w[9]) or 0, sp = tonumber(w[10]) or 0,
+              ax = tonumber(w[11]), ay = tonumber(w[12]), bx = tonumber(w[13]), by = tonumber(w[14]), z = tonumber(w[15]) or 0, mob = w[16] == "1", t = os.clock() }
+  if not (H.ax and H.ay and H.bx and H.by) then return end
+  local clock = os.clock()
+  M.hostShape[h] = H
+  -- an order of this player's that is newer than the one this shape answers: its own shape comes next
+  local who, sq = H.tag:match("^(%S+):(%d+)$")
+  local mine = who == S.name
+  local last = M.sentSeq and M.sentSeq[h]
+  if mine and last and tonumber(sq) < last then log("ARMY shape squad %d (%s): an older order of this player's; a newer one is on its way", h, H.tag); return end
+  if not mine and ((S.localOrderT[h] and clock - S.localOrderT[h] < 3.0) or (C.orderPending and C.orderPending(h))) then log("ARMY shape squad %d (%s): this player has just ordered it: the host's next shape counts", h, H.tag); return end
+  local rtt = ""
+  if mine and M.sentT and M.sentT[h] and last and tonumber(sq) == last then rtt = string.format("; %.0f ms after this player's order (this PC's clock)", (clock - M.sentT[h]) * 1000) end
+  local ok, r = pcall(formAsHost, S, h, H, clock, "shape")
+  log("ARMY shape squad %d (%s): host %d men, %d files x %d ranks, spread %.0f: %s%s", h, H.tag, H.n, filesSeen(H.n, H.fi), H.ranks, H.sp, ok and tostring(r) or ("error " .. tostring(r)), rtt)
+end
+-- (friend) the core's doMove and the mirror's lineAt ask for a line (C.formLine): when the host's shape of this squad
+-- stands near that place, the host's line (fitted to this copy's spread) is given instead of one of this copy's own
+-- making (the mirror's own line was the men's extent: two files fewer, lane 70)
+C.formLine = function(h, x, y)
+  local S = C.s; if not S or S.role ~= "friend" then return nil end
+  local H = M.hostShape[h]; if not H or os.clock() - H.t > 120.0 then return nil end
+  local mx, my = (H.ax + H.bx) / 2, (H.ay + H.by) / 2
+  if far(mx, my, x, y, 800) then return nil end
+  local okS, st = pcall(shapeState, S, h); if not okS or st.mob ~= H.mob then return nil end
+  local P, Q = lineForShape(H, st.sp)
+  if P then stat(S, "a_shapeLent"); M.lent = M.lent or {}; M.lent[h] = { P = P, Q = Q, tag = H.tag } end
+  return P, Q
+end
+-- every copy: the core gave squad h the line P -> Q (doMove, lineAt): held, so the host's watcher sends its shape
+-- (tagged with the friend's order it answers, when it does: C.armyOrder notes every order's sender)
+C.formed = function(h, P, Q, why)
+  local S = C.s; if not S then return end
+  local src, tag = why or "core", nil
+  local lt = M.lastTag and M.lastTag[h]
+  if S.role == "host" and lt and os.clock() - lt.t < 0.3 then tag = lt.tag end
+  local ln = M.lent and M.lent[h]
+  if ln and sameSeg(segOf(ln.P, ln.Q), P, Q, 1) then src, tag = "shape", ln.tag end
+  if M.lent then M.lent[h] = nil end
+  hold(S, h, P, Q, src, tag)
+end
+-- the shape of squad h on this copy now, for the console and the test scripts: held line, computed shape and the
+-- shape the men stand in (their places on the held line, in spreads: rows and the most men in one row)
+function M.shape(h)
+  local S = C.s; if not S then return "not started" end
+  if not R.sqValid(h) then return "no such squad" end
+  local g = M.form[h]
+  local st = shapeState(S, h)
+  local out = { string.format("squad %d: %d men, spread %.0f (rule %.0f), training %.2f, engaged %s, target %.0f,%.0f", h, st.n, st.sp, st.rule, st.train, tostring(st.eng), st.tx, st.ty) }
+  if g then
+    local sh = shapeOn(S, h, g)
+    out[#out + 1] = string.format("held line (%s %s) %.0f,%.0f -> %.0f,%.0f (%.0f): %s", tostring(g.src), tostring(g.tag), g.ax, g.ay, g.bx, g.by, segLen(g), shapeText(sh))
+    local L = segLen(g); local ux, uy = (g.bx - g.ax) / L, (g.by - g.ay) / L; local rows = {}; local nr, most = 0, 0
+    for _, u in ipairs(st.units) do
+      local okP, q = pcall(function() return u.realPos end)
+      if okP and q then
+        local row = math.floor(((q.X - g.ax) * -uy + (q.Y - g.ay) * ux) / st.sp + 0.5)
+        if not rows[row] then rows[row] = 0; nr = nr + 1 end
+        rows[row] = rows[row] + 1; if rows[row] > most then most = rows[row] end
+      end
+    end
+    out[#out + 1] = string.format("men stand in %d rows, at most %d in one", nr, most)
+  else out[#out + 1] = "no held line" end
+  local H = M.hostShape[h]
+  if H then out[#out + 1] = string.format("host's last shape (%s, %.1f s ago): %d men, %d files x %d ranks, spread %.0f", H.tag, os.clock() - H.t, H.n, filesSeen(H.n, H.fi), H.ranks, H.sp) end
+  return table.concat(out, " | ")
+end
+-- (host, every 0.25 s) a held line whose shape changed (a skill, a head count) goes out again; a squad that has got
+-- another order (its target is no longer the held line's), or is in a fight, drops its line
+local function shapeWatch(S, clock)
+  for h, g in pairs(M.form) do
+    if not R.sqValid(h) then M.form[h] = nil
+    else
+      local okS, sh = pcall(shapeOn, S, h, g)
+      -- a dropped line on the host: the friends forget its shape too (their mirror would give it again nearby)
+      local function drop(why)
+        M.form[h] = nil
+        if S.role == "host" and g.key then send(string.format("A SHAPE %d - 0", h)); log("ARMY shape squad %d: held line dropped (%s): friends told", h, why) end
+      end
+      if not okS or sh.n == 0 then drop("no men")
+      elseif sh.st.eng or sh.st.tgt ~= 0 or sh.st.ctl == 3 then drop("a fight")
+      else
+        -- the target the order left, kept from the give (hold); a change of the shape itself (a skill's spread, the head
+        -- count) moves it with the game's own forming again, so it is taken anew then
+        if g.wkey ~= sh.key then g.wkey = sh.key; if g.wkey0 then g.tx, g.ty = sh.st.tx, sh.st.ty end; g.wkey0 = true end
+        if g.tx and far(sh.st.tx, sh.st.ty, g.tx, g.ty, 400) and clock - g.t > 0.5 then
+          g.off = (g.off or 0) + 1
+          if g.off >= 3 then drop(string.format("its target moved %.0f m: another order", math.sqrt((sh.st.tx - g.tx) ^ 2 + (sh.st.ty - g.ty) ^ 2) / 100)) end
+        else g.off = 0 end
+        if M.form[h] and S.role == "host" and sh.key ~= g.key then
+          -- a head count alone (a muster) at most every 2 s
+          local onlyN = g.key and g.key:gsub("^(%d+)|%d+|%d+", "%1") == sh.key:gsub("^(%d+)|%d+|%d+", "%1")
+          -- tagged with the order that changed it (a friend's skill) when there was one this second
+          local lt = M.lastTag and M.lastTag[h]
+          local tag = (lt and clock - lt.t < 1.0) and lt.tag or g.tag or ("host:" .. tostring(g.src))
+          if not onlyN or clock - (g.sentT or 0) >= 2.0 then sendShape(S, h, tag, g.key and "changed" or "new line") end
+        end
+      end
+    end
+  end
+end
+-- ---------------------------------------------------------------- measured shapes (lane 70, part B)
+-- Orders whose line the mod cannot know: the host's own plain right click (the game projects the line itself; the
+-- stored line Squad+0x158 is not reflected), an Alt drag (formation type "lock", another branch of formALineArmy),
+-- the end of a path. Their shape is MEASURED: every man's dir is the line's direction (written by formALine), and his
+-- target place (SMUnit:getTargetPos, a moment after the order; his place once he stands, at a path's end) lies on the
+-- game's grid: rows one spread apart to the left of the line, columns one spread apart from its start. From those the
+-- rows, the files and the line's start come back; the shape goes out as the equivalent one-squad line (start A', fi
+-- spreads long): on the host as A SHAPE, on a friend (its own Alt drag) as O LINE.
+-- returns { fi, ranks, n, P, Q } or nil, why
+local function measureShape(S, h, useReal)
+  local st = shapeState(S, h)
+  if st.n == 0 then return nil, "no men" end
+  if st.mob then return nil, "a heap" end
+  local hx0, hy0, same = menDir(st.units)
+  if not hx0 then return nil, "no direction" end
+  local sp = st.sp; if sp <= 0 then return nil, "no spread" end
+  local pts = {}
+  for _, u in ipairs(st.units) do
+    local okP, q = pcall(function() if useReal then return u.realPos end; return u:getTargetPos() end)
+    if okP and q and q.X then pts[#pts + 1] = { x = q.X, y = q.Y, z = q.Z } end
+  end
+  if #pts < st.n then return nil, string.format("%d of %d places read", #pts, st.n) end
+  -- the places must be this order's: their mean is the squad's target (measured: 1 cm); in the order's own tick the
+  -- men still have the last order's places (a whole grid, 8-12 m off), from about 0.3 s on the new ones
+  if not useReal then
+    local mx, my = 0, 0; for _, p in ipairs(pts) do mx = mx + p.x; my = my + p.y end
+    mx, my = mx / #pts, my / #pts
+    if (mx - st.tx) ^ 2 + (my - st.ty) ^ 2 > 100 * 100 then return nil, "the men's places are not yet this order's" end
+  end
+  -- (game run, lane 70) after a plain right click or at a path's end the men's dir is NOT the grid's axis (measured:
+  -- dir -140 degrees, the grid's axes at -84 / 6): the grid's own axis is found from each man's nearest neighbour
+  -- (their directions, modulo 90 degrees), and of its four ways the one nearest the men's dir is tried first; a full
+  -- grid read along either axis is the same set of places
+  local C4, S4 = 0, 0
+  for i, p in ipairs(pts) do
+    local bd, bx, by
+    for j, q in ipairs(pts) do if i ~= j then local d = (q.x - p.x) ^ 2 + (q.y - p.y) ^ 2; if not bd or d < bd then bd, bx, by = d, q.x - p.x, q.y - p.y end end end
+    if bd and bd > 1 then local a = atan2(by, bx); C4 = C4 + math.cos(4 * a); S4 = S4 + math.sin(4 * a) end
+  end
+  local th0 = (C4 * C4 + S4 * S4 > 0) and atan2(S4, C4) / 4 or atan2(hy0, hx0)
+  local hdir = atan2(hy0, hx0); local ways = {}
+  for k = 0, 3 do local a = th0 + k * math.pi / 2; ways[#ways + 1] = { a = a, d = angD(a, hdir) } end
+  if #pts < 2 then ways = { { a = hdir, d = 0 } } end
+  table.sort(ways, function(x, y) return x.d < y.d end)
+  if same then table.insert(ways, 1, { a = hdir, d = 0 }) end     -- every man has one dir (a line order): that axis first
+  local why
+  for _, w in ipairs(ways) do
+    local m, w2 = M.gridOn(pts, math.cos(w.a), math.sin(w.a), sp, st.n, same and w.d < 0.01)
+    if m then return m end
+    why = why or w2
+  end
+  return nil, why
+end
+-- the grid on axis (hx, hy): rows across it one spread apart, the front rank's columns one spread apart from its first man
+function M.gridOn(pts, hx, hy, sp, n, exactDir)
+  for _, p in ipairs(pts) do p.a = p.x * hx + p.y * hy; p.c = -p.x * hy + p.y * hx end
+  local cmin = math.huge; for _, p in ipairs(pts) do if p.c < cmin then cmin = p.c end end
+  local rows, R = {}, 0
+  for _, p in ipairs(pts) do
+    local r = math.floor((p.c - cmin) / sp + 0.5); p.r = r
+    if r > 80 then return nil, "not a grid (rows)" end
+    rows[r] = rows[r] or {}; table.insert(rows[r], p); if r + 1 > R then R = r + 1 end
+  end
+  for r = 0, R - 1 do if not rows[r] then return nil, "not a grid (a row is empty)" end end
+  local most = 0; for r = 0, R - 1 do if #rows[r] > most then most = #rows[r] end end
+  for r = 0, R - 2 do if #rows[r] ~= most then return nil, "not a grid (a front row is not full)" end end
+  -- the front rank's columns: one spread apart from its first man
+  local front = rows[0]; local amin = math.huge; local c0 = 0
+  for _, p in ipairs(front) do if p.a < amin then amin = p.a end; c0 = c0 + p.c end
+  c0 = c0 / #front
+  local off = 0
+  for _, p in ipairs(front) do local k = (p.a - amin) / sp; if math.abs(k - math.floor(k + 0.5)) > 0.35 then off = off + 1 end end
+  if off > math.max(1, math.floor(#front / 10)) then return nil, "not a grid (columns)" end
+  local fi = (R == 1) and math.max(1, n - 1) or (most - 1)
+  local ax, ay = amin * hx - c0 * hy, amin * hy + c0 * hx
+  local z = pts[1].z or 0
+  local P = { X = ax, Y = ay, Z = z }
+  local Q = { X = ax + hx * (fi * sp + CUT), Y = ay + hy * (fi * sp + CUT), Z = z }
+  return { fi = fi, ranks = R, n = n, P = P, Q = Q, exactDir = exactDir }
+end
+M.measureShape = measureShape
+M.measQ = M.measQ or {}
+-- measure squad h a moment from now: kind "order" (target places, tries at 0.3 / 0.7 / 1.5 / 3 s) or "arrive" (its
+-- places once it stands near (ex, ey), up to 120 s). what: "host" sends A SHAPE, "friend" sends O LINE
+local function measureLater(S, h, kind, tag, what, ex, ey)
+  M.measQ[h] = { t0 = os.clock(), kind = kind, tag = tag, what = what, ex = ex, ey = ey, n = 0 }
+end
+local MTRIES = { 0.3, 0.7, 1.5, 3.0 }
+local function measureTick(S, clock)
+  for h, q in pairs(M.measQ) do
+    if not R.sqValid(h) then M.measQ[h] = nil
+    else
+      local due, useReal = false, false
+      if q.kind == "order" then due = clock - q.t0 >= MTRIES[q.n + 1]
+      else
+        due = clock - (q.lt or 0) >= 0.5
+        if due then
+          q.lt = clock
+          local okA, standing = pcall(function()
+            local s = S.sc:GetSquad({ Value = h }); local c = s.WeightedCenter
+            if q.ex and far(c.X, c.Y, q.ex, q.ey, 1500) then return false end
+            local arr = s.unitArr; local n, v = #arr, 0
+            for i = 1, n do local u = A.un(arr[i]); if valid(u) then v = v + (tonumber(u.realSpeed) or 0) end end
+            return n > 0 and v / n < 0.5
+          end)
+          due = okA and standing; useReal = true
+          if clock - q.t0 > 120.0 then M.measQ[h] = nil; due = false; log("ARMY shape squad %d: never stood still at its path's end in 120 s: not measured", h) end
+        end
+      end
+      if due and M.measQ[h] then
+        local okM, m, why = pcall(measureShape, S, h, useReal)
+        if not okM then why = "error " .. tostring(m); m = nil end
+        q.n = q.n + 1
+        if m then
+          M.measQ[h] = nil
+          if q.what == "host" then
+            hold(S, h, m.P, m.Q, "measured", q.tag)
+            local okH, sent = pcall(sendShape, S, h, q.tag, "measured (" .. q.kind .. ")")
+            if not (okH and sent) then log("ARMY shape squad %d: measured, but the shape could not be sent", h) end
+          else
+            send(string.format("O LINE %d %.1f %.1f %.1f %.1f %.1f", A.toHost(h), m.P.X, m.P.Y, m.Q.X, m.Q.Y, m.P.Z or 0)); S.localOrderT[h] = clock
+            M.sentSeq[h] = S.seq; M.sentT[h] = clock
+            hold(S, h, m.P, m.Q, "measured", nil)
+            log("ARMY this player's Alt drag of squad %d measured: %d files x %d ranks: sent to the host as its line (%d)", h, filesSeen(m.n, m.fi), m.ranks, S.seq)
+          end
+        elseif q.kind == "order" and q.n >= #MTRIES then
+          M.measQ[h] = nil; log("ARMY shape squad %d: not measured (%s): left to the mirror", h, tostring(why))
+        end
+      end
+    end
+  end
+end
+-- (friend, every 0.5 s) this copy's squad on the host's line no longer has the host's files (this copy's skill
+-- changed the spread after the host's did, or the other way): formed again, at most once a second and 4 times a shape
+local function shapeCheck(S, clock)
+  for h, H in pairs(M.hostShape) do
+    if not R.sqValid(h) or clock - H.t > 120.0 then M.hostShape[h] = nil
+    else
+      local g = M.form[h]
+      if g and g.src == "shape" and g.tag == H.tag and clock - (H.fixT or 0) >= 1.0 and (H.fixN or 0) < 4 and not (S.localOrderT[h] and clock - S.localOrderT[h] < 3.0) then
+        local okS, sh = pcall(shapeOn, S, h, g)
+        if okS and sh.n > 0 and not (sh.st.eng or sh.st.tgt ~= 0) and sh.mob == H.mob and sh.fi ~= H.fi then
+          H.fixT = clock; H.fixN = (H.fixN or 0) + 1
+          local ok, r = pcall(formAsHost, S, h, H, clock, "check")
+          log("ARMY shape squad %d: here %d files, the host's %d (spread here %.0f, host %.0f): %s", h, filesSeen(sh.n, sh.fi), filesSeen(H.n, H.fi), sh.sp, H.sp, ok and tostring(r) or ("error " .. tostring(r)))
+        end
+      end
+    end
+  end
 end
 local function buildingByAddr(S, a)
   local arr = S.eng.buildingArr
@@ -695,6 +1185,7 @@ local function onOrderEvent(S, line, clock)
       if s.lastSquadTargetType == 0 and near2(s.TargetLocation.X, s.TargetLocation.Y, last.X, last.Y, 1500) then
         R.touch(h)                                           -- the core's watcher must not also send it as a plain move
         if S.role == "host" then send(string.format("A PATH %d %s", h, encPts1(pts))); log("ARMY this player gave squad %d a path of %d points: sent to friends", h, #pts)
+          measureLater(S, h, "arrive", "host:path", "host", last.X, last.Y)      -- (lane 70, B) its shape at the path's end
         else send(string.format("O PATH %d %s", A.toHost(h), encPts1(pts))); S.localOrderT[h] = clock; log("ARMY this player gave squad %d a path of %d points: sent to the host", h, #pts) end
         stat(S, "a_pathSent")
         return                                               -- the game gives a path to one squad only
@@ -709,15 +1200,65 @@ local function onOrderEvent(S, line, clock)
   -- on the other copies (lane 30: a one-rank line on the host, a block on the friend). The press place is not in the
   -- hook line; for ONE squad the new target is the line's middle, so press place = 2 * target - cur. Several squads
   -- dragged at once share the line: see the next branch (lane 37).
+  -- (lane 70) The press place is worked out from the squad's new target with the game's own line rule (dragFrom), the
+  -- squad is given that line again here (so this copy's squad stands on a line every copy knows; normally the same
+  -- line, as the player drew it), and the line goes out: a friend's to the host, which forms it and sends its shape
+  -- to every copy (A SHAPE); the host's own as its shape at once.
+  -- (lane 70, B) an Alt drag ("lock" formation: another branch of formALineArmy, not the line rule above): measured
+  -- (measureShape) a moment later, then sent as its equivalent line
+  if moved and mode == 0 and hb == 0 then
+    local alt = false; pcall(function() alt = S.p1.alt_pressed_b and true or false end)
+    if alt then
+      for _, h in ipairs(mine) do
+        local s = S.sc:GetSquad({ Value = h })
+        if (s.lastSquadTargetType == 1 or M.testDrag) and s.targetSquad.Value == 0 then
+          R.touch(h); if S.role ~= "host" then S.localOrderT[h] = clock end
+          measureLater(S, h, "order", S.role == "host" and "host:altdrag" or nil, S.role == "host" and "host" or "friend")
+          log("ARMY this player dragged squad %d with Alt: its shape is measured in a moment", h)
+        end
+      end
+      return
+    end
+  end
+  -- (lane 70, B) the host's own plain right click on open ground: the game picks the line; measured and sent
+  if not moved and mode == 0 and hb == 0 and S.role == "host" then
+    for _, h in ipairs(mine) do
+      local s = S.sc:GetSquad({ Value = h })
+      if s.lastSquadTargetType == 1 and s.targetSquad.Value == 0 then measureLater(S, h, "order", "host:move", "host") end
+    end
+    return
+  end
   if moved and mode == 0 and hb == 0 and #mine == 1 then
     local h = mine[1]; local s = S.sc:GetSquad({ Value = h })
     local tx, ty = s.TargetLocation.X, s.TargetLocation.Y
     local d = math.sqrt((tx - cx) ^ 2 + (ty - cy) ^ 2)
-    if s.lastSquadTargetType == 1 and s.targetSquad.Value == 0 and d > 150 and d < 30000 then
+    if (s.lastSquadTargetType == 1 or M.testDrag) and s.targetSquad.Value == 0 and d > 150 and d < 30000 then
       R.touch(h)                                             -- the core's watcher must not also send it as a plain move
-      local line2 = string.format("%.0f %.0f %.0f %.0f %.0f", 2 * tx - cx, 2 * ty - cy, cx, cy, cz)
-      if S.role == "host" then send("A LINE " .. h .. " " .. line2); log("ARMY this player dragged squad %d into a line %.0f long: sent to friends", h, 2 * d)
-      else send(string.format("O LINE %d %s", A.toHost(h), line2)); S.localOrderT[h] = clock; log("ARMY this player dragged squad %d into a line %.0f long: sent to the host", h, 2 * d) end
+      -- every new step in a pcall: a fault here must not lose the drag (then the old line, as 0.2.2 sent it)
+      local okP, P, L, how = pcall(function() return pressOf(shapeState(S, h), cx, cy, tx, ty) end)
+      if not okP then how = "error " .. tostring(P); P = nil end
+      if not P then P = { X = 2 * tx - cx, Y = 2 * ty - cy }; how = tostring(how) .. ": the old rule"; L = 2 * d end
+      P.Z = cz
+      local Q = { X = cx, Y = cy, Z = cz }
+      local okG, r = pcall(giveLine, S, h, P, Q, clock, "drag", nil)
+      if not okG then r = "error " .. tostring(r); M.form[h] = nil end
+      local g = M.form[h]
+      local okS, sh = pcall(function() return g and shapeOn(S, h, g) end); if not okS then sh = nil end
+      -- the check that the press place is the one the player drew: the target moves (next to) nothing when the line is
+      -- given again
+      local moved2 = -1; pcall(function() local s2 = S.sc:GetSquad({ Value = h }); moved2 = math.sqrt((s2.TargetLocation.X - tx) ^ 2 + (s2.TargetLocation.Y - ty) ^ 2) end)
+      local line2 = string.format("%.1f %.1f %.1f %.1f %.1f", P.X, P.Y, cx, cy, cz)
+      local what = string.format("a line %.0f long (%s): given again here %s, target moved %.0f cm: %s", L, how, tostring(r), moved2, sh and shapeText(sh) or "-")
+      if S.role == "host" then
+        local okH, sent = false, false
+        if g then g.tag = "host:drag"; okH, sent = pcall(sendShape, S, h, "host:drag", "this player's drag") end
+        if not (okH and sent) then send("A LINE " .. h .. " " .. line2) end
+        log("ARMY this player dragged squad %d into %s: sent to friends (%s)", h, what, (okH and sent) and "its shape" or "the line")
+      else
+        send(string.format("O LINE %d %s", A.toHost(h), line2)); S.localOrderT[h] = clock
+        M.sentSeq = M.sentSeq or {}; M.sentT = M.sentT or {}; M.sentSeq[h] = S.seq; M.sentT[h] = clock
+        log("ARMY this player dragged squad %d into %s: sent to the host (%d)", h, what, S.seq)
+      end
       stat(S, "a_lineSent")
     end
     return
@@ -732,7 +1273,7 @@ local function onOrderEvent(S, line, clock)
     local t = {}
     for _, h in ipairs(mine) do
       local s = S.sc:GetSquad({ Value = h })
-      if s.lastSquadTargetType == 1 and s.targetSquad.Value == 0 then t[#t + 1] = { h = h, x = s.TargetLocation.X, y = s.TargetLocation.Y } end
+      if (s.lastSquadTargetType == 1 or M.testDrag) and s.targetSquad.Value == 0 then t[#t + 1] = { h = h, x = s.TargetLocation.X, y = s.TargetLocation.Y } end
     end
     if #t < 2 then return end
     local far, fd = t[1], -1
@@ -742,15 +1283,50 @@ local function onOrderEvent(S, line, clock)
     dx, dy = dx / len, dy / len
     for _, e in ipairs(t) do e.p = (cx - e.x) * dx + (cy - e.y) * dy end     -- distance from cur back along the line
     table.sort(t, function(a, b) return a.p < b.p end)
-    local hw = math.max(150, t[1].p)
-    for i, e in ipairs(t) do
-      if i > 1 then hw = math.max(150, (e.p - t[i - 1].p) - hw) end
-      R.touch(e.h)
-      local line2 = string.format("%.0f %.0f %.0f %.0f %.0f", e.x - dx * hw, e.y - dy * hw, e.x + dx * hw, e.y + dy * hw, cz)
-      if S.role == "host" then send("A LINE " .. e.h .. " " .. line2) else send(string.format("O LINE %d %s", A.toHost(e.h), line2)); S.localOrderT[e.h] = clock end
+    -- (lane 70) the game cuts the drag P..cur into #t equal pieces (4b45bdf: piece k from P + k L/n, each formed like
+    -- one squad's line). The piece of the squad nearest cur ends at cur: the inverse of the one-squad line on that squad
+    -- gives the piece's length and the line's direction; every piece follows. Without a fit: the old rule (halves).
+    local near = t[1]
+    local okN, stN = pcall(shapeState, S, near.h)
+    local P0, l, how
+    if okN then
+      local okP, a1, a2, a3 = pcall(pressOf, stN, cx, cy, near.x, near.y)
+      if okP then P0, l, how = a1, a2, a3 else how = "error " .. tostring(a1) end
+    end
+    local pieces = {}
+    if P0 then
+      local ux, uy = (cx - P0.X) / l, (cy - P0.Y) / l
+      for i, e in ipairs(t) do
+        local ex, ey = cx - ux * l * (i - 1), cy - uy * l * (i - 1)
+        pieces[i] = { h = e.h, P = { X = ex - ux * l, Y = ey - uy * l, Z = cz }, Q = { X = ex, Y = ey, Z = cz } }
+      end
+    else
+      how = "no fit: the old rule"
+      local hw = math.max(150, t[1].p)
+      for i, e in ipairs(t) do
+        if i > 1 then hw = math.max(150, (e.p - t[i - 1].p) - hw) end
+        pieces[i] = { h = e.h, P = { X = e.x - dx * hw, Y = e.y - dy * hw, Z = cz }, Q = { X = e.x + dx * hw, Y = e.y + dy * hw, Z = cz } }
+      end
+    end
+    for _, pc in ipairs(pieces) do
+      R.touch(pc.h)
+      local okG, r = pcall(giveLine, S, pc.h, pc.P, pc.Q, clock, "drag", nil)
+      if not okG then r = "error " .. tostring(r); M.form[pc.h] = nil end
+      local line2 = string.format("%.1f %.1f %.1f %.1f %.1f", pc.P.X, pc.P.Y, pc.Q.X, pc.Q.Y, cz)
+      if S.role == "host" then
+        local okH, sent = false, false
+        if r == "ok" then okH, sent = pcall(sendShape, S, pc.h, "host:drag", "this player's drag") end
+        if not (okH and sent) then send("A LINE " .. pc.h .. " " .. line2) end
+      else
+        send(string.format("O LINE %d %s", A.toHost(pc.h), line2)); S.localOrderT[pc.h] = clock
+        M.sentSeq = M.sentSeq or {}; M.sentT = M.sentT or {}; M.sentSeq[pc.h] = S.seq; M.sentT[pc.h] = clock
+      end
+      local g = M.form[pc.h]; local okS, sh = pcall(function() return g and shapeOn(S, pc.h, g) end)
+      log("ARMY this player dragged squad %d (one of %d) into its piece %.0f long (%s): given again here %s: %s", pc.h, #t,
+          math.sqrt((pc.Q.X - pc.P.X) ^ 2 + (pc.Q.Y - pc.P.Y) ^ 2), tostring(how), tostring(r), (okS and sh) and shapeText(sh) or "-")
       stat(S, "a_lineSent")
     end
-    log("ARMY this player dragged %d squads into one line %.0f long: each squad's piece sent to %s", #t, t[#t].p + hw, S.role == "host" and "friends" or "the host")
+    log("ARMY this player dragged %d squads into one line: each squad's piece sent to %s", #t, S.role == "host" and "friends" or "the host")
     return
   end
   local hbt, hbc = tonumber(line:match(" hbt=(%-?%d+)")), tonumber(line:match(" hbc=(%-?%d+)"))
@@ -786,6 +1362,9 @@ end
 -- ticked (it writes what its hook noted since the last tick) and the new lines are read. So a path or building order
 -- is known, and its squads marked, before the watcher could report the same click as a plain move, and before the
 -- host's snapshot carries the squad's new target to friends.
+-- (lane 70) for the test scripts: a drag line handed in as if read from the hook; M.testDrag = true lets a line given
+-- by the console count as a drag (the console cannot set Squad.lastSquadTargetType, which only MoveSelected sets)
+M.orderEvent = function(S, line, clock) return onOrderEvent(S, line, clock or os.clock()) end
 C.preOrders = function(S, clock)
   local Pt = C.patch
   if C.hold or not (Pt and Pt.fn and Pt.orderEvents) or not (valid(S.p1) and valid(S.sc)) then return end
@@ -798,16 +1377,32 @@ end
 -- host: a friend's PATH or BLD (the core hands every order to C.armyOrder first)
 local armyOrder0 = C.armyOrder
 C.armyOrder = function(S, kind, h, w)
+  -- (lane 70, C) a friend's round-trip probe: answered at once ("A PONG <friend> <its stamp>")
+  if kind == "PING" then send(string.format("A PONG %s %s", tostring(S.curPeer or "?"), tostring(w[6]))); return "ok" end
+  -- (lane 70) who gave the order now applied to squad h: a line the core gives for it (doMove) is that order's shape
+  if h and (kind == "MOVE" or kind == "SKILL" or kind == "STOP" or kind == "WAY") then M.lastTag = M.lastTag or {}; M.lastTag[h] = { tag = tostring(S.curPeer or "?") .. ":" .. tostring(w[1]), t = os.clock() } end
   if kind == "PATH" then
     if not (h and R.sqValid(h)) then return "no such squad" end
     if S.sc:GetUnitCount({ Value = h }) == 0 then return "empty" end
     local pts = C.patch and C.patch.decPoints and C.patch.decPoints(w[6]) or {}
     local r = applyPath(S, h, pts, os.clock())
-    if r == "ok" then send(string.format("A PATH %d %s", h, w[6])) end
+    if r == "ok" then
+      send(string.format("A PATH %d %s", h, w[6]))
+      local last = pts[#pts]
+      if last then measureLater(S, h, "arrive", tostring(S.curPeer or "?") .. ":" .. tostring(w[1]), "host", last.X, last.Y) end   -- (lane 70, B)
+    end
     return r
   elseif kind == "LINE" then                                  -- O LINE <squad> <ax> <ay> <bx> <by> <z> (lane 34)
     local a, b = decLine(w, 6); if not a then return "bad line" end
-    local r = applyLine(S, h, a, b, os.clock())
+    local tag = tostring(S.curPeer or "?") .. ":" .. tostring(w[1])
+    local okG, r = pcall(giveLine, S, h, a, b, os.clock(), "line", tag)
+    if not okG then r = "error " .. tostring(r); M.form[h] = nil end
+    -- (lane 70) formed: its shape goes to every copy, also to the one that dragged; in a fight (a plain move), or when
+    -- the shape cannot be read, the line as before
+    if r == "ok" and M.form[h] then
+      local okH, sent, sh = pcall(sendShape, S, h, tag, "a friend's drag")
+      if okH and sent then return "ok (" .. shapeText(sh) .. ")" end
+    end
     if r:sub(1, 2) == "ok" then send(string.format("A LINE %d %s %s %s %s %s", h, w[6], w[7], w[8], w[9], w[10])) end
     return r
   elseif kind == "BLD" then
@@ -862,14 +1457,129 @@ local function onOrderMsg(S, w)
   end
 end
 
+-- ================================================================ ORDER ANSWERS (lane 70, G139)
+-- Every order a friend sends ("O <KIND> <host squad(s)> ...", any kind the order path knows) is logged when it leaves
+-- (C.orderSent, called by the core's send) and answered by the host for every kind, also "ok" (C.orderAnswer, called
+-- by hostInbox after its APPLIED line): "A ACK <friend> <seq> <kind> ok|changed|refused <answer>". The sequence number
+-- (the first word of the friend's line; the host's APPLIED line prints it) is the key. The host's lines come in the
+-- order the host wrote them, so on the friend every host line read BEFORE the answer is from before the order was
+-- applied, every line after it from after: until the answer (at most 3 s) the order is this player's (C.orderPending:
+-- the mirror leaves the squad alone), and C.orderAckWall(h) gives the host's clock of the answer line, so a host line
+-- stamped earlier is older than the order (for the men module, lane 73). A changed or refused order puts a notice in
+-- the game's notice list. No answer in 3 s: logged, the mirror follows the host again.
+local ORDER_NOSQ = { SPEED = true, RAISE = true, HIRE = true, PING = true }      -- word 3 is not a host squad number
+M.pend = M.pend or {}; M.pendSq = M.pendSq or {}; M.ackWall = M.ackWall or {}
+local function orderKindText(k)
+  local t = { MOVE = "move", ATTACK = "attack", STOP = "halt", PUSH = "stance", BEHAV = "stance", SKILL = "command", LINE = "line",
+              PATH = "path", BLD = "attack on a building", WAY = "waypoint", RALLY = "call-up", HOME = "send home",
+              REMOVE = "remove", RAISE = "raise a unit", HIRE = "hire", NAME = "rename" }
+  return t[k] or string.lower(tostring(k))
+end
+-- the host's answer in plain words: ok / changed / refused, and why
+local function classify(kind, ok, r)
+  r = tostring(r)
+  if not ok then return "refused", "the host's game raised an error" end
+  if r:find("plain move", 1, true) then return "changed", "the unit is in a fight there, so it only moves to that place" end
+  if r == "true" or r == "ok" or r:sub(1, 3) == "ok " or r:sub(1, 6) == "queued" or r == "same" then return "ok", r end
+  local why = ({ ["building not found"] = "the building is no longer there", empty = "the unit has no men there",
+                 ["no such squad"] = "the unit no longer exists there", gone = "the target is gone", refused = "the host's game did not allow it",
+                 ["false"] = "the host's game did not allow it right now", ["unknown order"] = "the host does not know this order" })[r]
+  return "refused", why or r
+end
+M.classify = classify
+-- (host) the answer to one applied order of a friend's
+C.orderAnswer = function(S, peer, w, ok, r)
+  local kind = tostring(w[4])
+  if kind == "PING" then return end
+  local cl, why = classify(kind, ok, r)
+  send(string.format("A ACK %s %s %s %s %s", tostring(peer), tostring(w[1]), kind, cl, enc(cl == "ok" and tostring(r) or why)))
+  stat(S, "a_ack_" .. cl)
+end
+-- (friend) an order of this player's leaves (every "O" line the core's send writes)
+C.orderSent = function(seq, line)
+  local S = C.s; if not S or S.role ~= "friend" then return end
+  local w = {}; for x in line:gmatch("%S+") do w[#w + 1] = x end
+  local kind = w[2]; if not kind or kind == "PING" then return end
+  local lhs, hs = {}, {}
+  if not ORDER_NOSQ[kind] and w[3] then
+    for v in w[3]:gmatch("%d+") do local hh = tonumber(v); hs[#hs + 1] = hh; local lh = A.toLocal(hh); if lh then lhs[#lhs + 1] = lh end end
+  end
+  local clock = os.clock()
+  M.pend[seq] = { kind = kind, hs = hs, lhs = lhs, t = clock }
+  for _, lh in ipairs(lhs) do M.pendSq[lh] = seq end
+  local here = {}; for i, lh in ipairs(lhs) do here[i] = tostring(lh) end
+  log("ORDER %d sent: %s %s (here %s)", seq, kind, (#hs > 0) and ("host squad " .. table.concat(hs, ",")) or tostring(w[3] or "-"), (#here > 0) and table.concat(here, ",") or "-")
+end
+-- (friend) the host's answer
+local function onAck(S, w)
+  if S.role ~= "friend" or w[5] ~= S.name then return end
+  local seq = tonumber(w[6]); local p = seq and M.pend[seq]
+  local kind, cl, txt = w[7], w[8], dec(w[9])
+  local rtt = p and string.format("%.0f ms", (os.clock() - p.t) * 1000) or "an order not in the list (older than 3 s?)"
+  log("ORDER %s answered: %s %s: %s (%s); round trip %s (this PC's clock)", tostring(w[6]), tostring(kind), tostring(cl), txt, p and table.concat(p.hs, ",") or "-", rtt)
+  stat(S, "a_answer_" .. tostring(cl))
+  if p then
+    M.pend[seq] = nil
+    for _, lh in ipairs(p.lhs) do if M.pendSq[lh] == seq then M.pendSq[lh] = nil; M.ackWall[lh] = tonumber(w[2]) end end
+    if cl ~= "ok" and C.notify then
+      local who = {}
+      for _, lh in ipairs(p.lhs) do local n = R.sqValid and R.sqValid(lh) and nameOf(S, lh); who[#who + 1] = (n and n ~= "") and n or ("unit " .. lh) end
+      local unit = (#who > 0) and table.concat(who, ", ") or "your units"
+      if cl == "changed" then C.notify("info", string.format("Your order (%s) for %s was changed by the host: %s.", orderKindText(kind), unit, txt))
+      else C.notify("info", string.format("Your order (%s) for %s was not carried out: %s.", orderKindText(kind), unit, txt)) end
+    end
+  end
+end
+M.onAck = onAck
+-- (friend) orders with no answer in 3 s: the mirror follows the host again
+function M.orderTick(S, clock)
+  for seq, p in pairs(M.pend) do
+    if clock - p.t >= 3.0 then
+      M.pend[seq] = nil
+      for _, lh in ipairs(p.lhs) do if M.pendSq[lh] == seq then M.pendSq[lh] = nil end end
+      log("ORDER %d (%s %s): no answer from the host in 3 s: the mirror follows the host again", seq, p.kind, table.concat(p.hs, ","))
+      stat(S, "a_answer_none")
+    end
+  end
+end
+C.orderPending = function(lh) return M.pendSq[lh] ~= nil end
+C.orderAckWall = function(lh) return M.ackWall[lh] end
 local armyTick, armyMsg = tick, onMessage
 local function tick2(S, clock)
   armyTick(S, clock)
   if C.hold or not valid(S.p1) then return end
   if clock - (M.tRet or 0) >= 0.5 then M.tRet = clock; local ok, e = pcall(scanRetinue, S, clock); if not ok then log("RETINUE scan error: %s", tostring(e)) end; hookPay(S, clock); pcall(function() M.silv = S.p1.silver end); pcall(function() M.rwealth = rmanors(S)[1]:GetRegion().regionalWealth end) end
+  -- (lane 70) shapes: the host's watcher every 0.25 s, a friend's check every 0.5 s
+  if next(M.form) and clock - (M.tShape or 0) >= 0.25 then M.tShape = clock; local ok, e = pcall(shapeWatch, S, clock); if not ok then log("ARMY shape watch error: %s", tostring(e)) end end
+  -- (lane 70, C) once a minute a friend measures the real round trip ("O PING", answered by the host's army module)
+  if S.role == "friend" and clock - (M.pingT or (clock - 50.0)) >= 60.0 then M.pingT = clock; send(string.format("O PING 0 %.4f", clock)) end
+  if not M.pingT then M.pingT = clock - 50.0 end
+  if S.role == "friend" and next(M.pend) then local ok, e = pcall(M.orderTick, S, clock); if not ok then log("ORDER tick error: %s", tostring(e)) end end
+  if next(M.measQ) then local ok, e = pcall(measureTick, S, clock); if not ok then log("ARMY shape measure error: %s", tostring(e)) end end
+  if S.role == "friend" and next(M.hostShape) and clock - (M.tShapeC or 0) >= 0.5 then M.tShapeC = clock; local ok, e = pcall(shapeCheck, S, clock); if not ok then log("ARMY shape check error: %s", tostring(e)) end end
 end
 local function onMessage2(S, from, kind, w, line)
   if kind == "K" then return onRetinue(S, from, w) end
+  -- (lane 70, C) the host's answer to this friend's probe: the real round trip on this PC's own clock, and how far the
+  -- host's clock is from this one (the host's stamp against the middle of the round trip). The APPLIED lines' delay_ms
+  -- on the host is the host's clock minus this PC's: it holds this offset (about 0.9 s in the 2026-11-17 session).
+  if kind == "A" and w[4] == "ACK" then local ok, e = pcall(onAck, S, w); if not ok then log("ORDER answer error: %s", tostring(e)) end; return true end
+  if kind == "A" and w[4] == "PONG" then
+    if S.role == "friend" and from == "host" and w[5] == S.name then
+      local sent = tonumber(w[6]); local ht = tonumber(w[2])
+      if sent then
+        local rtt = os.clock() - sent
+        local mid = A.now() - rtt / 2
+        log("link: round trip to the host and back %.0f ms (this PC's clock); the host's clock is %+.0f ms from this PC's", rtt * 1000, ht and (ht - mid) * 1000 or 0)
+        stat(S, "a_pings")
+      end
+    end
+    return true
+  end
+  if kind == "A" and w[4] == "SHAPE" then
+    if S.role == "friend" and from == "host" and not C.hold then local ok, e = pcall(onShape, S, w); if not ok then log("ARMY SHAPE from the host: error %s", tostring(e)) end end
+    return true
+  end
   if kind == "A" and (w[4] == "PATH" or w[4] == "BLD" or w[4] == "LINE") then
     if S.role == "friend" and from == "host" and not C.hold then local ok, e = pcall(onOrderMsg, S, w); if not ok then log("ARMY %s from the host: error %s", tostring(w[4]), tostring(e)) end end
     return true

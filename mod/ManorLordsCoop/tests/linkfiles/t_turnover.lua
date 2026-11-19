@@ -5,6 +5,7 @@
 -- real link folder or a save. Without a folder argument it makes one in the system's temp folder and removes it after.
 -- STATUS: written 2026-11-13 but NOT RUN: there is no Lua interpreter on the PC it was written on. Its first run is also
 -- its syntax check. Do not run it in the game's console: C.start would restart the running mod.
+-- (lane 65, 2026-11-17) run with LuaJIT 5.1 through the shim in t_kepthandle.lua's header: all pass.
 
 local function here() return (debug.getinfo(1, "S").source:gsub("^@", ""):gsub("\\", "/")) end
 local scripts = (here():match("^(.*)/tests/linkfiles/[^/]*$") or ".") .. "/Scripts/"
@@ -89,11 +90,21 @@ check(markAt and back and back > 0 and inorder, "rewind to the MARK across turno
 check(Rd.replay and Rd.replay.to >= lastEnd, "the replay ends at the newest place read")
 
 -- the host's game starts again: host.txt emptied, numbered files deleted; the reader starts again with the new lines only
+-- (lane 65) the reader keeps its file open, and the C runtime's handle does not share delete: the file it is in can
+-- only be deleted once the reader let go of it (after READ_IDLE s of quiet, then closed for READ_GAP s); until then
+-- the start keeps it in its retry list (S.stale, tried again at each line sent). Both waits are made to look passed.
 local segBefore = W.outSeg
 C.start("host", "host", { "friend1" })
 W = C.s
-check(not exists(dir .. "host." .. segBefore .. ".txt") and slurp(dir .. "host.txt") == "", "a start empties host.txt and deletes host.<k>.txt")
+local held = Rd.readers.host.fh ~= nil
+check(slurp(dir .. "host.txt") == "" and (not exists(dir .. "host." .. segBefore .. ".txt") or (held and #W.stale > 0)),
+      "a start empties host.txt and deletes host.<k>.txt (or keeps trying while a reader holds the file: " .. tostring(held) .. ")")
 for i = 0, 9 do sendAs("X tov " .. i) end
+Rd.readers.host.growT = os.clock() - 2; drain()                -- the reader's file was quiet for a second: let go
+check(Rd.readers.host.fh == nil, "a quiet file's handle is let go")
+Rd.readers.host.waitT = os.clock() - 0.01                      -- READ_GAP passed
+sendAs("H")                                                    -- the writer's retry deletes the old file now
+check(not exists(dir .. "host." .. segBefore .. ".txt"), "the old numbered file is deleted once the reader let go of it")
 got = {}; drain()
 inorder = #got == 10; for i = 1, #got do if got[i] ~= i - 1 then inorder = false end end
 check(inorder, "a reader in a deleted file starts again at host.txt and gets only the 10 new lines (" .. #got .. ")")

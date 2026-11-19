@@ -24,6 +24,19 @@
 --           A man leaves the table at his death (hostKill, the events module's deaths), his squad's change of head
 --           count, the squad's end (G, its removal); the whole table when a load or resync begins (the join module),
 --           a new world, a role change and when the mod stops (ALLOFF).
+-- (lane 73) A WALKING SQUAD'S MEN: LED POINT AND PACE. Live fault (a real session over Steam, game speed 1): on the
+-- friends a marching squad went about five steps, stopped, went on; smooth on the host. A man was given the host's
+-- man's own place, a round old, every metre he moved: he reached it before the next one came and stood. (Lane 52's
+-- sittings ran at speed 4: places 1.5 m apart every round. The link's delay was 0.1 to 0.15 s each way in that
+-- session: the host's "delay_ms" of about 1000 was the two PCs' clocks, 0.3 and 0.9 s apart.)
+--   host    with the native MEN LEAD (2000 ms; Coop.m73leadMs), a walking man's line entry also carries the point of
+--           his OWN way that he reaches in that time and his speed: "<i>[.<mark>]:<x>,<y>,<z>/<lx>,<ly>,<lz>,<cm/s>"
+--           (never past his way's end). A man who stopped is sent at once, where he stands.
+--   friend  the man walks to the led point; his pace is held to the host's man's own place (native: coop_men.h, LEAD):
+--           slower when he is ahead, so he does not reach the point and stand; a new point is given to him only near
+--           the end of the way he has, or at a bend. He stops where the host's man's way ends, on the host's word.
+-- Test switches: Coop.m73lead = false on the host (no led points are sent: the lines of before) or on a friend (the
+-- led points are not used). The link's real delay is logged once a minute on a friend ("MEN link"; the MQ lines).
 -- Test switch (console only, friend): Coop.m43off = true gives the "before" (the table emptied, the hook out);
 -- Coop.m43off = "ways" lets walking squads go (items 1 and 3 only).
 -- Research: research/2026-11-10-game-probe/lanes/lane_s21_43/report.txt (round 2: the cost cut to a few calls a squad).
@@ -48,6 +61,10 @@ local function avail()
   M.avT = now; M.avOk = it ~= nil and it.state ~= "unavailable"; M.avState = it and it.state
   -- (lane 52) the native run-off check counted a held man far from his place for 2 s: the squad's side of it, logged
   M.paceIn = (st.text or ""):find(" pace=in ", 1, true) ~= nil      -- (lane 52, round 3) the native pace rule is hooked
+  M.farOk = (st.text or ""):find(" fars=", 1, true) ~= nil          -- (lane 73) it knows the far-held mark (the merchants: SET ...,3)
+  M.leadOk = (st.text or ""):find(" lead=", 1, true) ~= nil         -- (lane 73) this native piece knows led points (a SET with them)
+  -- (lane 73) the native count of held men of walking squads who came to a stand under a fresh host line (the live fault)
+  do local h, hm, wm = (st.text or ""):match(" halts=(%d+) haltms=(%d+) walkms=(%d+)"); if h then M.halt = { tonumber(h), tonumber(hm), tonumber(wm) } end end
   local ro, rl = (st.text or ""):match(" runoffs=(%d+) rlast=(%x+)")
   ro = tonumber(ro)
   if ro and ro > (M.roSeen or 0) then
@@ -59,11 +76,13 @@ end
 
 local function reset()
   M.watch = {}; M.last = {}; M.sent = {}; M.here = {}; M.sq = {}; M.wsq = {}; M.pos = {}; M.asked = {}; M.wp = {}; M.hoffOn = nil   -- host
+  M.ld = {}; M.stopped = {}; M.ldT = {}                                                                                                          -- host (lane 73)
   M.held = {}; M.cache = {}; M.tgt = {}; M.heldT = {}; M.heldK = {}; M.placedT = {}; M.relW = {}; M.farT = {}; M.tokP = {}; M.joinT = {}; M.emptyT = {}  -- friend
+  M.heldL = {}                                                                                                                       -- friend (lane 73)
   M.polled = nil; M.pend = nil; M.needTick = nil
 end
 if not M.watch then reset() end
-M.asked = M.asked or {}; M.wp = M.wp or {}
+M.asked = M.asked or {}; M.wp = M.wp or {}; M.ld = M.ld or {}; M.stopped = M.stopped or {}; M.heldL = M.heldL or {}
 
 -- commands to the DLL wait in M.cmds and go out in one append to its command file at the end of this module's tick
 -- (round 2, fA3: each append cost up to 20 ms; one a frame now). cmdNow: one command at once (with what waits).
@@ -83,8 +102,11 @@ local function forget(why)
   local P = patch()
   local ms = C.merch and C.merch.set                           -- (lane 59) the merchants module puts its own entries into the native table
   if P and (next(M.held) or next(M.watch) or (ms and next(ms))) then M.cmds = nil; P.send("MEN FORGET"); P.tick(); log("MEN: table emptied (%s)", why) end
+  -- (lane 73) the merchants are held in this table now: what the merchants module thinks is set there is not any more
+  if C.merch then C.merch.set = {}; C.merch.dropQ = nil end
   M.held = {}; M.watch = {}; M.last = {}; M.sent = {}; M.here = {}; M.sq = {}; M.cache = {}; M.tgt = {}; M.heldT = {}; M.pend = nil
   M.wsq = {}; M.pos = {}; M.rehold = {}; M.farT = {}; M.who = {}; M.relog = {}; M.asked = {}; M.wp = {}; M.tokP = {}; M.joinT = {}; M.emptyT = {}
+  M.ld = {}; M.stopped = {}; M.ldT = {}; M.heldL = {}
 end
 local function hook(on)
   local P = patch(); if not P then return end
@@ -93,11 +115,12 @@ local function hook(on)
   if on and state ~= "hooked" and (not M.hookT or os.clock() - M.hookT > 2.0) then
     -- the hook was out (never in, or taken out with the table by an ALLOFF of another module): the table is empty,
     -- so everything here is sent again
-    M.hookT = os.clock(); M.held = {}; M.watch = {}; M.sq = {}; M.sent = {}; M.heldT = {}; M.wsq = {}; M.pos = {}; M.hoffOn = nil; M.hoffF = nil; M.regoSaid = nil; M.paceSaid = nil; M.keepSaid = nil; M.catchSaid = nil
+    M.hookT = os.clock(); M.held = {}; M.watch = {}; M.sq = {}; M.sent = {}; M.heldT = {}; M.wsq = {}; M.pos = {}; M.hoffOn = nil; M.hoffF = nil; M.regoSaid = nil; M.paceSaid = nil; M.keepSaid = nil; M.catchSaid = nil; M.leadSaid = nil; M.ld = {}; M.stopped = {}; M.ldT = {}
     P.send("MEN HOOK ON"); P.tick(); log("MEN HOOK ON (%s)", C.s.role)
+    if C.merch then C.merch.set = {}; C.merch.dropQ = nil end      -- (lane 73) the table was emptied with the hook: the merchants are set again
     M.avT = os.clock(); M.avState = "hooked"   -- (the status file is looked at again in 2 s)
   end
-  if not on and state == "hooked" then P.send("MEN HOOK OFF"); P.tick(); M.held = {}; M.heldT = {}; M.avT = os.clock(); M.avState = "idle"; log("MEN HOOK OFF") end
+  if not on and state == "hooked" then P.send("MEN HOOK OFF"); P.tick(); M.held = {}; M.heldT = {}; if C.merch then C.merch.set = {}; C.merch.dropQ = nil end; M.avT = os.clock(); M.avState = "idle"; log("MEN HOOK OFF") end
 end
 
 -- ================================================================ host
@@ -109,7 +132,7 @@ local function hostWatch(S)
   local add, gone, now = {}, {}, {}
   local function out(a, h)
     local w = M.watch[a]
-    if w and w.h == h then M.watch[a] = nil; gone[#gone + 1] = a; M.last[a] = nil; M.asked[a] = nil; M.wp[a] = nil; M.sent[a] = nil; M.here[a] = nil; M.pos[a] = nil; if M.vel then M.vel[a] = nil end; if M.posT then M.posT[a] = nil end end
+    if w and w.h == h then M.watch[a] = nil; gone[#gone + 1] = a; M.last[a] = nil; M.asked[a] = nil; M.wp[a] = nil; M.sent[a] = nil; M.here[a] = nil; M.pos[a] = nil; M.ld[a] = nil; M.stopped[a] = nil; if M.ldT then M.ldT[a] = nil end; if M.vel then M.vel[a] = nil end; if M.posT then M.posT[a] = nil end end
   end
   for h, K in pairs(S.sq or {}) do
     now[h] = true
@@ -148,14 +171,21 @@ local function realPosOffset(u)
   return off
 end
 -- (lane 52, round 3) "l" after the place: it was LED (sent ahead of the man along his way, a running man)
-local function entry(i, tok, q, led)
-  return string.format("%d%s:%d,%d,%d%s", i, (tok and tok ~= "-") and ("." .. tok) or "", math.floor(q[1] / 10 + 0.5), math.floor(q[2] / 10 + 0.5), math.floor(q[3] / 10 + 0.5), led and "l" or "")
+-- (lane 73) "/<lx>,<ly>,<lz>,<cm/s>" after it: the point of his own way he reaches in the lead time, and his speed
+local function entry(i, tok, q, led, ld)
+  local s = string.format("%d%s:%d,%d,%d%s", i, (tok and tok ~= "-") and ("." .. tok) or "", math.floor(q[1] / 10 + 0.5), math.floor(q[2] / 10 + 0.5), math.floor(q[3] / 10 + 0.5), led and "l" or "")
+  if ld then s = s .. string.format("/%d,%d,%d,%d", math.floor(ld[1] / 10 + 0.5), math.floor(ld[2] / 10 + 0.5), math.floor(ld[3] / 10 + 0.5), math.floor(ld[4] + 0.5)) end
+  return s
 end
 -- a man's own place: (lane 48) the native piece's last word on it (HERE: written when it moved 1 m, read this round
--- by the POLL); only when HERE is not to be had (no offset found, or it read wrong once) through the mod loader
-local function luaHere(e)
+-- by the POLL). Read it directly when HERE is unavailable or a held line needs a missing final stop.
+local function luaHere(e, stoppedOnly)
   if not valid(e.u) then return nil end   -- (lane 47 round four) the core's squad list is read again only when its head count changes
-  local ok, q = pcall(function() local p = e.u.realPos; return { p.X, p.Y, p.Z } end)
+  local ok, q = pcall(function()
+    if stoppedOnly and e.u.realSpeed ~= 0 then return nil end
+    local p = e.u.realPos
+    return { p.X, p.Y, p.Z }
+  end)
   if ok and q and q[1] then return q end
 end
 local function hereOf(e)
@@ -240,6 +270,12 @@ local function hostStep(S, clock)
       end
     end
   end
+  -- (lane 73) the native piece adds each walking man's led point to his HERE line (test switch, host console:
+  -- Coop.m73lead = false; Coop.m73leadMs = the time ahead, 2000)
+  do
+    local lw = (M.hoffOn and C.m73lead ~= false) and math.max(0, math.min(5000, math.floor(tonumber(C.m73leadMs) or 2000))) or 0
+    if lw ~= M.leadSaid then M.leadSaid = lw; cmd("MEN LEAD " .. lw); log("MEN: led points %s", lw > 0 and string.format("on (%d ms ahead along each man's own way)", lw) or "off") end
+  end
   -- this round's path points for the walking squads' men (the men of the core's list this round: checked again by
   -- the native piece), then the POLL, in one append and one DLL tick a round; the answer (asked places, "W <squad>"
   -- path points, "H" own places) is read at once. (mA: answers a round late made the marches 99 % 7-8 m against round
@@ -258,6 +294,8 @@ local function hostStep(S, clock)
   cmd("MEN POLL"); flushCmds(); M.polled = true
   sec(S, "poll", tw0)
   local per, fresh = {}, nil
+  local paused = false                                 -- (lane 73) the game stands: a man who "stopped" has not
+  if A.isPaused then local okP, p = pcall(A.isPaused); paused = okP and p and true or false end
   if t ~= "" then
     for line in t:gmatch("[^\r\n]+") do
       local ha, hx, hy, hz, rest = line:match("^H (%x+) (%-?%d+) (%-?%d+) (%-?%d+)(.*)")
@@ -266,6 +304,14 @@ local function hostStep(S, clock)
           -- (lane 52, round 3) the point of his way he walks to now, when the native piece wrote it
           local wx, wy = rest:match("^ (%-?%d+) (%-?%d+)")
           M.wp[ha] = wx and { tonumber(wx), tonumber(wy) } or nil
+          -- (lane 73) his led point and speed (" L x y z cm/s end"); " S": he stopped, this is where he stands. A line
+          -- without either (his way is being asked for again) leaves the last led point: it is used for 1 s more
+          local lx, ly, lz, lv = rest:match(" L (%-?%d+) (%-?%d+) (%-?%d+) (%d+) %d")
+          if lx then M.ld[ha] = { tonumber(lx), tonumber(ly), tonumber(lz), tonumber(lv), clock }; stat(S, "m73led") end
+          -- (his exact resting place is known from a " S" line until he has moved a metre again)
+          M.restAt = M.restAt or {}; M.restAt[ha] = (rest:find(" S", 1, true) and not paused) and true or nil
+          -- (not while the game is paused: every man stands then, and none of them has stopped)
+          if rest:find(" S", 1, true) and not paused then M.stopped[ha] = true; M.ld[ha] = nil; stat(S, "m73stop") end
           -- (lane 48, round 4) the man's velocity from his last two reports (for the lead of a walking squad's places)
           local q = { tonumber(hx), tonumber(hy), tonumber(hz) }; local p, pt = M.pos[ha], M.posT and M.posT[ha]
           M.vel = M.vel or {}; M.posT = M.posT or {}
@@ -308,7 +354,8 @@ local function hostStep(S, clock)
     end
     if Q and Q.mode and K.list then
       local list, kind, mode = {}, "MM", Q.mode
-      local function add(i, e, q, led) M.sent[e.addr] = q; list[#list + 1] = entry(i, e.tok, q, led) end
+      local function add(i, e, q, led, ld) M.sent[e.addr] = q; list[#list + 1] = entry(i, e.tok, q, led, ld) end
+      local L73 = M.hoffOn and (M.leadSaid or 0) > 0     -- (lane 73) the native piece sends led points
       -- (lane 48, round 4) lead: a walking man's place is sent LEAD s ahead along his own velocity (from his last two
       -- native reports; at most LEAD_MAX), so the friend's man, who reaches it a round and the link later, walks beside
       -- the host's instead of behind him (h4: the bandits' chase 10-20 m behind, then 5 s late at the clash). No lead
@@ -356,9 +403,41 @@ local function hostStep(S, clock)
         end
         return { q[1] + dx, q[2] + dy, q[3] }
       end
-      local function follow(i, e, cm, lead)
-        local q = hereOf(e); local q0 = q; if q and lead and M.hoffOn then q = ahead(e.addr, q) end
-        if q and moved(q, M.sent[e.addr], cm) then M.last[e.addr] = q; M.here[e.addr] = true; add(i, e, q, q ~= q0); stat(S, "m43here") end
+      -- (lane 73) walk: a man of a walking squad (MV, MF, MG, MU). With the native led points his line entry is his own
+      -- place as it is (the friend's pace is held to it) and the led point (where the friend's man walks to); the lead
+      -- along his velocity (lane 48, 52: only for a man over 9 m/s, so never at game speed 1) is not added then.
+      -- A man who stopped is sent where he stands at once (the native " S"), not only after a metre.
+      local function follow(i, e, cm, lead, walk)
+        local q = hereOf(e); local q0 = q
+        local led73 = walk and L73
+        if q and lead and M.hoffOn and not led73 then q = ahead(e.addr, q) end
+        local st = led73 and e.addr and M.stopped[e.addr]
+        if st then M.stopped[e.addr] = nil end
+        if q and (moved(q, M.sent[e.addr], cm) or (st and moved(q, M.sent[e.addr], 10))) then
+          local ld = led73 and not st and M.ld[e.addr] or nil
+          if ld and clock - ld[5] > 1.0 then ld = nil end
+          -- an older led point (his way was being asked for again this round): only while it still lies ahead of him
+          if ld and ld[5] ~= clock then local v = M.vel and M.vel[e.addr]; if not v or (ld[1] - q[1]) * v[1] + (ld[2] - q[2]) * v[2] <= 0 then ld = nil end end
+          -- a moving man without a led point this round (his way is being asked for again on the host) who was sent
+          -- one in the last 1.5 s is NOT sent his bare place: on the friend that would be "walk to where the host's
+          -- man was, and stand". The friend's man keeps the led point he has; the next round names a new one.
+          M.ldT = M.ldT or {}
+          -- (game run 7, the camp fights: the bandits' rout was 11 m apart for 45 s, lane 70's base 5 to 9 m; the host's
+          -- men lines came up to 1.6 s apart in that minute, 23 waits over 0.6 s: routing men often have no way at the
+          -- moment of a look, and waiting left the friend's men at their last led point while the host's ran on at
+          -- 15 m a second.) A moving man without a way this round gets a led point straight on along his velocity
+          -- (his speed x the lead time, 6 to 15 m): for the one round, until his way is there again.
+          if led73 and not ld and not st and C.m73vlead ~= false then      -- (test switch, host console: Coop.m73vlead = false)
+            local v = M.vel and M.vel[e.addr]; local sp = v and math.sqrt(v[1] * v[1] + v[2] * v[2]) or 0
+            if sp >= 20 then
+              local d = math.max(600, math.min(1500, sp * (M.leadSaid or 2000) / 1000))
+              ld = { q[1] + v[1] / sp * d, q[2] + v[2] / sp * d, q[3], sp, clock }; stat(S, "m73vlead")
+            end
+          end
+          if led73 and not ld and not st and M.ldT[e.addr] and clock - M.ldT[e.addr] < 1.5 then stat(S, "m73wait"); return end
+          if ld then stat(S, "m73sent"); M.ldT[e.addr] = clock end
+          M.last[e.addr] = q; M.here[e.addr] = true; add(i, e, q, q ~= q0, ld); stat(S, "m43here")
+        end
       end
       local full = not Q.key or clock - Q.key >= 10.0
       if mode == "fight" or mode == "camp" then
@@ -374,33 +453,73 @@ local function hostStep(S, clock)
         -- a new asked place (an order was given: the men ask for their new slots before the squad moves): at once
         for _, a in ipairs(per[h] or {}) do local w = M.watch[a]; add(w.i, { addr = a, tok = w.tok }, M.last[a]); M.here[a] = nil end
         if per[h] then Q.ft = clock end
-        -- its men's own places once it has stood 1 s (and every 10 s); between: whoever moved 1 m, every 2 s
+        -- (lane 73) a man who has just stopped (the native " S"): where he stands, at once (the squad counts as standing
+        -- before its last men have stopped; before, such a man's resting place went out with the "stood 1 s" round)
+        -- (lane 73) A MAN AT REST IS SENT HIS SLOT, NOT A STALE PLACE. Lane 70 measured (20 line drags): with this module
+        -- on, a friend's men stood where the host's stood in 1 to 2 of 20 drags (0.35 to 0.58 m off, up to 1.27 m);
+        -- with it off 18 of 20 (0.15 to 0.22 m). The asked places (the men's new slots) went out at once and exact,
+        -- and a second later the "stood 1 s" round sent every man's OWN place over them: the native piece writes an
+        -- own place only when it moved a metre, so that place was up to a metre old, and the friend's man was held
+        -- to it against his slot. Now a standing squad's man is sent the place his own game last asked for him (his
+        -- slot; the native piece writes it to 5 cm while he rests) when it lies within 2 m of where he stands; only
+        -- a man with no such place (he was pushed, he never asked) is sent where he stands. The same for a man who
+        -- has just stopped (the native " S"). Test switch, host console: Coop.m73slot = false (own places, as before).
+        local inPer = {}
+        for _, a in ipairs(per[h] or {}) do inPer[a] = true end
+        local heldLine = C.army and C.army.form and C.army.form[h]
+        local function rest(i, e, cm, why)
+          local q = hereOf(e); if not q or inPer[e.addr] then return end
+          local g = C.m73slot ~= false and M.asked[e.addr]
+          -- In game run 8 the formation was given the same on both copies in 20 of 20 drags, the men stood the same
+          -- in 16; in the four misses ONE friend man stood 0.2 to 1.5 m from his host twin. A host man does not always
+          -- rest IN his slot (a neighbour stands in his way). So when his exact resting place is known (the native
+          -- " S"), the slot is sent only if he rests within 40 cm of it; else where he rests.
+          local at = q
+          if g then
+            local d2 = (g[1] - q[1]) ^ 2 + (g[2] - q[2]) ^ 2
+            if M.restAt and M.restAt[e.addr] then if d2 < 40 * 40 then at = g end
+            elseif d2 < 200 * 200 then
+              -- A line drag can leave him at rest without a final S. In three measured misses
+              -- his old request was 1.41 to 1.56 m away. Check where he actually stopped.
+              at = (heldLine and luaHere(e, true)) or g
+            end
+          end
+          if moved(at, M.sent[e.addr], cm) then
+            M.last[e.addr] = at; M.here[e.addr] = at ~= g or nil
+            add(i, e, at); stat(S, at == g and "m73slot" or "m43here"); if why then stat(S, why) end
+          end
+        end
+        if L73 then
+          for i, e in ipairs(K.list) do if e.addr and M.stopped[e.addr] then rest(i, e, 10, "m73stopSent") end end
+        end
+        -- its men's places once it has stood 1 s (and every 10 s); between: whoever's place changed 10 cm, every 2 s
         if clock - Q.since >= 1.0 and not per[h] then
-          if full then Q.key = clock; Q.ft = clock; for i, e in ipairs(K.list) do if e.addr then follow(i, e, 0) end end
-          elseif clock - (Q.ft or 0) >= 2.0 then Q.ft = clock; for i, e in ipairs(K.list) do if e.addr then follow(i, e, 100) end end end
+          if full then Q.key = clock; Q.ft = clock; for i, e in ipairs(K.list) do if e.addr then rest(i, e, 0) end end
+          elseif clock - (Q.ft or 0) >= 2.0 then Q.ft = clock; for i, e in ipairs(K.list) do if e.addr then rest(i, e, 10) end end end
         end
       elseif mode == "muster" then
         kind = "MU"
         -- (lane 48) every round, as a march (round 2: every 0.5 s; t1: a retinue sprinting in the battle 2-3 s behind)
-        for i, e in ipairs(K.list) do if e.addr then follow(i, e, 100) end end
+        for i, e in ipairs(K.list) do if e.addr then follow(i, e, 100, false, true) end end
       elseif mode == "march" then
         -- (lane 48) a militia on the move: its men's own places, every round (round 1's rule for it)
         -- (lane 48, round 2) "MG" for another lord's militia (its men walk in from their homes: a friend may put an
         -- unseen man 40 m off at his place); the player's own militia ("MV") is never put outright (t7: all 13 put
         -- in a charge, the squad 50 m behind after it)
         kind = Q.foreign and "MG" or "MV"
-        for i, e in ipairs(K.list) do if e.addr and (M.hoffOn or valid(e.u)) then follow(i, e, 100, true) end end
+        for i, e in ipairs(K.list) do if e.addr and (M.hoffOn or valid(e.u)) then follow(i, e, 100, true, true) end end
       else
         -- (lane 48) any other squad that walks or routs: its men's own places too, every round ("MF"). Round 2 sent
         -- path points (the point after each man's current one, "MW"); sitting w1, the company's marches: own places
         -- 0.4-0.5 m at 99 %, path points 5.2 m (both answered in the same round): path points taken out
         kind = "MF"
-        for i, e in ipairs(K.list) do if e.addr and (M.hoffOn or valid(e.u)) then follow(i, e, 100, true) end end
+        for i, e in ipairs(K.list) do if e.addr and (M.hoffOn or valid(e.u)) then follow(i, e, 100, true, true) end end
       end
       if #list > 0 then sendLines(S, kind, h, #K.list, list) end
     end
   end
   sec(S, "squads", tq)
+  if next(M.stopped) then M.stopped = {} end     -- (lane 73) a stop is this round's word (used above, or the squad's mode has no use for it)
   flushLines(S)
 end
 
@@ -495,6 +614,23 @@ local function onMM(S, w, kind)
   local lh = A.toLocal(tonumber(w[4])); local n = tonumber(w[5])
   if not (lh and w[6]) then return end
   local clock = os.clock()
+  -- (lane 73) this player's own order for the squad waits for the host's answer: a host line from before it is not taken
+  local o = M.own and M.own[lh]
+  if o and not o.said then
+    local age = clock - o.t
+    local after
+    -- (lane 70's answer to a player's order, coop_x_army.lua, when it is there: while the answer is on its way no host
+    -- line is from after his order; once it came, a line whose clock is 0.3 s past the answer's is (its places are
+    -- up to a round older than the line))
+    local ack = C.orderAckWall and C.orderAckWall(lh)
+    if C.orderPending and C.orderPending(lh) then after = false
+    elseif ack and M.curWall then after = M.curWall >= ack + 0.3
+    elseif M.curWall and M.lkOff then after = M.curWall >= (A.now() - age) + M.lkOff + (M.lkRt or 0.25) / 2 + 0.5
+    else after = age >= 0.75 end
+    if not after then o.skipped = o.skipped + 1; stat(S, "m73ownSkip"); return end
+    o.said = true
+    log("MEN: this player's order for squad %d: its men were let go; %d line(s) of the host's from before the order were not taken; the host's first line after it came %.0f ms after the order", lh, o.skipped, age * 1000)
+  end
   local cn, okN
   local Mi = S.mir and S.mir[lh]; local st = Mi and Mi.st
   local fresh = st and Mi.stT and clock - Mi.stT < 0.15     -- (lane 48) lane 38's mirror's read of this squad
@@ -512,17 +648,25 @@ local function onMM(S, w, kind)
       M.emptyT = M.emptyT or {}; M.emptyT[lh] = clock
       M.tokP = M.tokP or {}; local tp = M.tokP[lh]; if not tp then tp = {}; M.tokP[lh] = tp end
       for item in w[6]:gmatch("[^;]+") do
-        local tok, x, y, z = item:match("^%d+%.([^:]+):(%-?%d+),(%-?%d+),(%-?%d+)l?$")
+        local tok, x, y, z = item:match("^%d+%.([^:/]+):(%-?%d+),(%-?%d+),(%-?%d+)l?")     -- (lane 73: a led point may follow)
         if tok then tp[tok] = { tonumber(x) * 10, tonumber(y) * 10, tonumber(z) * 10, clock } end
       end
     end
     return
   end
+  M.cnt = M.cnt or {}; M.cnt[lh] = { cn, n, clock }       -- (lane 73) men here / on the host, for the minute line
   if not M.tgt[lh] then if fresh then M.tgt[lh] = { st.tx, st.ty } else pcall(function() local t = S.sc:GetSquad({ Value = lh }).TargetLocation; M.tgt[lh] = { t.X, t.Y } end) end end
   local c = listOf(lh, clock, cn); local sets = M.pend or {}; M.pend = sets
-  local k = 0
+  local k, ledN = 0, 0
+  -- (lane 73) led points are used with the native pace rule only (it holds the man's pace to the host's man's place)
+  local use73 = C.m73lead ~= false and M.leadOk and M.paceIn and C.m52pace ~= false and C.m52catch ~= false
   for item in w[6]:gmatch("[^;]+") do
-    local i, tok, x, y, z, led = item:match("^(%d+)%.?([^:]*):(%-?%d+),(%-?%d+),(%-?%d+)(l?)$")
+    local i, tok, x, y, z, led, more = item:match("^(%d+)%.?([^:]*):(%-?%d+),(%-?%d+),(%-?%d+)(l?)(.*)$")
+    local lx, ly, lz, lv
+    if more and more ~= "" then
+      lx, ly, lz, lv = more:match("^/(%-?%d+),(%-?%d+),(%-?%d+),(%d+)$")
+      if not lx then i, tok = nil, nil; stat(S, "m73badTail") end      -- a tail this build does not know: not taken
+    end
     local e
     if tok and tok ~= "" then
       -- the marks (family.name) are read only for a squad whose host lines carry them (a militia), once per list
@@ -554,9 +698,22 @@ local function onMM(S, w, kind)
       -- own rout of the militia ended 8 s before the host's (its own retreat point was nearer); from then on its men
       -- were ordinary held men at pace 1 to 1.5 (16 to 23 against the host's 44), 73 m behind, 10 s late at the end.
       local routing = Mi and Mi.routed and M.paceIn and C.m52rout ~= false   -- (test switch, friend console: Coop.m52rout = false)
-      local pl = string.format(routing and "%d,%d,%d,2" or ((kind == "MV" or kind == "MF") and led ~= "l") and "%d,%d,%d,1" or ((kind == "MG" or kind == "MU") and M.paceIn and C.m52mus ~= false) and "%d,%d,%d,2" or "%d,%d,%d", x, y, z)
+      local mode = routing and 2 or ((kind == "MV" or kind == "MF") and led ~= "l") and 1 or ((kind == "MG" or kind == "MU") and M.paceIn and C.m52mus ~= false) and 2 or 0
+      local pl = string.format(mode == 2 and "%d,%d,%d,2" or mode == 1 and "%d,%d,%d,1" or "%d,%d,%d", x, y, z)
+      local own = pl
+      -- (lane 73) LED: he walks to the led point; the host's man's own place and speed follow for his pace. The place
+      -- is a round old when the host sends it (the POLL's answer is read a round later): moved on towards the led
+      -- point by that quarter second of his walk, and never past it.
+      if lx and mode > 0 and use73 then
+        lx, ly, lz, lv = tonumber(lx) * 10, tonumber(ly) * 10, tonumber(lz) * 10, tonumber(lv)
+        local dx, dy = lx - x, ly - y; local d = math.sqrt(dx * dx + dy * dy)
+        local ax, ay = x, y
+        if d > 1 then local adv = math.min(lv * 0.25, d); ax, ay = x + dx / d * adv, y + dy / d * adv end
+        pl = string.format("%d,%d,%d,%d,%d,%d,%d", lx, ly, lz, mode, math.floor(ax + 0.5), math.floor(ay + 0.5), lv)
+        ledN = ledN + 1
+      end
       sets[#sets + 1] = e.addr .. "=" .. pl
-      M.held[e.addr] = { lh = lh, p = pl }; k = k + 1
+      M.held[e.addr] = { lh = lh, p = own }; k = k + 1      -- (p: for the rehold after an order: his own place, never a led point)
       M.who = M.who or {}; M.who[e.addr] = { lh = lh, i = i, tok = tok, kind = kind, p = pl, t = clock }   -- (lane 52, the run-off dump)
     elseif i then
       stat(S, "m43nomatch")
@@ -568,7 +725,8 @@ local function onMM(S, w, kind)
       end
     end
   end
-  if k > 0 then M.heldT[lh] = clock; M.heldK[lh] = kind; stat(S, "m43set", k); if M.rehold then M.rehold[lh] = nil end
+  if ledN > 0 then stat(S, "m73set", ledN) end
+  if k > 0 then M.heldT[lh] = clock; M.heldK[lh] = kind; M.heldL[lh] = ledN > 0 or nil; stat(S, "m43set", k); if M.rehold then M.rehold[lh] = nil end
     if M.relT0 and M.relT0[lh] then local g = math.floor((clock - M.relT0[lh]) * 1000); M.relT0[lh] = nil; stat(S, "m52relGapMs", g); stat(S, "m52relGapN"); if g > (S.stats.m52relGapMax or 0) then S.stats.m52relGapMax = g end end
   end
 end
@@ -580,6 +738,30 @@ local function friendCheck(S, clock)
   local sqs = {}
   for _, e in pairs(M.held) do sqs[e.lh] = true end
   for lh in pairs(M.heldT) do if not sqs[lh] then M.heldT[lh] = nil end end   -- (lane 48) no man of it held any more
+  -- (lane 73) THIS PLAYER'S OWN ORDER is not thrown away on his copy (live report: "a friend sent an order to a troop
+  -- unit and right after his command got overridden"). The core notes the moment of his order (S.localOrderT, as
+  -- lane 38's mirror uses it for 2 s). From that moment: the squad's men are let go at once, also while the host's
+  -- lines for the old walk still come (before, such a squad stayed held to the host's men for the second until they
+  -- turned); host lines from BEFORE his order are not taken (by the host's clock in the line, set against the
+  -- measured difference of the two clocks; without it for 0.75 s); and the men are not held again to the host's old
+  -- places 0.75 s later (the rehold below: on a real link the host's first line after an order needs 0.55 to 0.8 s,
+  -- on two test copies 0.4 to 0.65). After 2 s without a host line for the squad (the host did not move it) the
+  -- old rules count again. One log line per order. Test switch, friend console: Coop.m73own = false.
+  M.own = M.own or {}
+  if C.m73own ~= false and S.mine and S.localOrderT then
+    for lh, ot in pairs(S.localOrderT) do
+      if S.mine[lh] and clock - ot < 2.0 and (not M.own[lh] or M.own[lh].t ~= ot) then
+        M.own[lh] = { t = ot, skipped = 0 }; stat(S, "m73own")
+        if sqs[lh] then dropSquad(lh, "order"); sqs[lh] = nil end
+      end
+    end
+  end
+  for lh, o in pairs(M.own) do
+    if clock - o.t >= 2.0 and not (C.orderPending and C.orderPending(lh) and clock - o.t < 3.5) then      -- (lane 70: its answer may take 3 s)
+      if not o.said then log("MEN: this player's order for squad %d: no line of the host's for it in 2 s (%d from before the order not taken): the host's last places count again", lh, o.skipped) end
+      M.own[lh] = nil
+    end
+  end
   for lh in pairs(sqs) do
     -- (lane 48) the squad's values lane 38's mirror read in the last 0.15 s when it has them (no reads here)
     local ok, n, x, y, eng
@@ -605,7 +787,9 @@ local function friendCheck(S, clock)
       -- is taken as the one to compare with. A squad whose host is silent (it stands) is let go at an order as before.
       local t0 = M.tgt[lh]; local kd = M.heldK[lh]
       if t0 and not eng and kd ~= "MU" and (x - t0[1]) ^ 2 + (y - t0[2]) ^ 2 > 300 * 300 then
-        local fed = (kd == "MV" or kd == "MG" or kd == "MF") and M.heldT[lh] and clock - M.heldT[lh] < 1.0
+        -- (lane 73) a squad whose last line carried led points has way for 2 s and more: its lines may come 1 s late and
+        -- in bursts (a slow link) without the squad being let go at the mirror's next corrective order
+        local fed = (kd == "MV" or kd == "MG" or kd == "MF") and M.heldT[lh] and clock - M.heldT[lh] < (M.heldL[lh] and 2.5 or 1.0)
         if fed and C.m52rel ~= true then M.tgt[lh] = { x, y }; stat(S, "m52kept_" .. kd)   -- (test switch, friend console: Coop.m52rel = true lets go as before)
         else dropSquad(lh, "order") end
       end
@@ -614,7 +798,7 @@ local function friendCheck(S, clock)
   -- (lane 48) squads let go at an order and not held again by a host line in 0.75 s: their men's last host places
   -- again (men still in the squad's list only; not for a squad that routs or is gone)
   for lh, Rh in pairs(M.rehold or {}) do
-    if clock - Rh.t >= 0.75 then
+    if clock - Rh.t >= 0.75 and not M.own[lh] then      -- (lane 73: not while this player's own order waits for the host's answer)
       M.rehold[lh] = nil
       local ok, n, x, y, rout
       local Mi = S.mir and S.mir[lh]; local st = Mi and Mi.st
@@ -696,7 +880,144 @@ function M.loadBegins() local ms = C.merch and C.merch.set; if M.held and (next(
 -- (another lord's muster or march, a host line in the last 1.5 s)? Then the core gives the squad no pace of its own.
 -- (test switch, friend console: Coop.m52mus = false gives the old speed matching back)
 function M.musters(lh) local t = M.heldT and M.heldT[lh]; local k = M.heldK and M.heldK[lh]; return t ~= nil and (k == "MG" or k == "MU") and os.clock() - t < 1.5 and M.paceIn == true and C.m52mus ~= false and C.m43off ~= true end
+-- (lane 73) A VILLAGER TAKEN LATE INTO A MILITIA UNIT IS ARMED AS ITS SOLDIERS ARE: the safe way (the core's mirror
+-- calls this; lane 52 wrote the fields there). A friend's copy closed 5 s after the fourth such man of one call-up
+-- (lane 67, r1): an access violation in the game's own "play this animation" (4dee840, from the unit's tick 4de7b00).
+-- Read in the game file: the unit's tick takes the ROW of its animation number from the unit's own table
+-- (SMUnit.currentAnimsetDT, +DF0h; 4cc1d60) and plays the animation the row names; the name is looked up in the
+-- unit's animation data (448a7e60) and the result is used unchecked: not found = -1 = a read 58h bytes before the
+-- list (the dump: rax = -1, the fault address is the list's start - 58h, animation number 159). Lane 52 wrote
+-- animMode = 1 and currentAnimset = "combat" but left currentAnimsetDT at the villager's work table: soldier's
+-- animation numbers were then looked up in the work table. The game has no reflected function for the change
+-- (SMUnit has none with "anim" or "mode" in its name; turnToSoldierJoinSquad, already called, does not do it).
+-- So: the three fields are written TOGETHER and only when the table is known to be right: the reference soldier's own
+-- table (ref.currentAnimsetDT) is a live object AND it is the table the engine itself gives for that set's name
+-- (RTSMultiEngineCPP:getAnimsetDataTable). Table first, then the name, the mode last (the mode makes the unit ask for
+-- a soldier's animations). Otherwise NOTHING is written (no training, no equipment either) and the man stays as he
+-- is: the core asks again on its next pass (30 s after he was taken). Returns ok, things equipped, what was done.
+-- Test switch, friend console: Coop.m73arm = false writes as lane 52 did (the probe's "old way").
+function M.armLate(S, u, ref, rt, rset, rids)
+  if not (valid(u) and valid(ref)) then return false, 0, "the man or the soldier is gone" end
+  if C.m73arm == false then
+    local n = 0
+    u.meleeTraining = rt
+    for s = 1, 11 do local g = rids[s]; if g and g ~= 0 and u:GetEquippedID(s) ~= g then u:equip(g, true, false); n = n + 1 end end
+    u.animMode = 1; u.currentAnimset = FName(rset)
+    return true, n, "the old way (mode and set name only)"
+  end
+  local dt = ref.currentAnimsetDT
+  if not valid(dt) then return false, 0, "waits: the unit's soldier has no animation table" end
+  local okE, edt = pcall(function() return S.eng:getAnimsetDataTable(FName(rset)) end)
+  if not (okE and valid(edt)) then return false, 0, "waits: the game has no animation table for the set " .. tostring(rset) end
+  if edt:GetAddress() ~= dt:GetAddress() then return false, 0, "waits: the soldier's animation table is not the game's table for the set " .. tostring(rset) end
+  local n = 0
+  u.meleeTraining = rt
+  for s = 1, 11 do local g = rids[s]; if g and g ~= 0 and u:GetEquippedID(s) ~= g then u:equip(g, true, false); n = n + 1 end end
+  u.currentAnimsetDT = dt; u.currentAnimset = FName(rset); u.animMode = 1
+  return true, n, "animation table, set and mode written together"
+end
+-- (lane 73) for the core and other modules on a friend: the host's clock now, and whether it is known (the MQ lines).
+-- A host line's age is hostClock() minus the line's second word; this copy's own clock minus that word is off by the
+-- difference of the two PCs' clocks (0.3 and 0.9 s in the first real session).
+function M.hostClock() return A.now() + (M.lkOff or 0), M.lkOff ~= nil end
+-- How old a host line is (seconds; wall = its second word, the host's clock), held to 0 .. cap. EVERY place of the mod
+-- that needs a host line's age on a friend asks here (lane 38's mirror in coop.lua, the merchants, the fields' count):
+-- "this copy's now() minus the line's clock" gave 0 on a friend whose PC clock is behind the host's and the cap on one
+-- whose clock is ahead (the mirror then aimed a marching squad a whole second ahead of the host's). Until the first
+-- MQ answer (and with a host that sends none) the clocks count as equal, as before.
+function M.lineLag(wall, cap)
+  local d = A.now() + (M.lkOff or 0) - (tonumber(wall) or 1e18)
+  if d ~= d or d < 0 then return 0 end
+  if cap and d > cap then return cap end
+  return d
+end
+-- host: " link_ms=<n>" for the log line of a friend's order: the host's clock now minus the friend's clock in the line
+-- (the "delay_ms" of that line) less the difference of the two clocks as that friend measured it; "" while not known
+function M.linkMs(peer, stamp)
+  local off = M.peerOff and M.peerOff[peer]; stamp = tonumber(stamp)
+  if not (off and stamp) then return "" end
+  return string.format(" link_ms=%.0f", (A.now() - stamp - off) * 1000)
+end
 function M.holds(lh) local t = M.heldT and M.heldT[lh]; local k = M.heldK and M.heldK[lh]; return t ~= nil and ((k ~= "MV" and k ~= "MG" and k ~= "MF") or os.clock() - t > 1.0) and C.m43off ~= true end
+
+-- (lane 73) THE LINK'S REAL DELAY, measured on a friend and logged once a minute ("MEN link").
+-- Why: the host logs "delay_ms" for a friend's order = the host's clock now minus the friend's clock in the line. In
+-- the first real session that read 1020 to 1082 for one friend and about 420 for the other, and was taken for a
+-- second of link delay. It was the two PCs' clocks: the same orders' answers came back to the friend 0.22 to 0.35 s
+-- after it had sent them (both ways and the frames of both copies). Nothing measured the way host to friend.
+--   friend  every 5 s: "MQ <this copy's clock>"; the host answers "MQ <friend's name> <that clock>". The time until
+--           the answer is the round trip (this copy's clock alone). The host's clock in the answer line, against the
+--           middle of the round trip, is how far the two clocks are apart (taken from the fastest answer of the minute).
+--           With that, each men line's age when it comes (host's stamp to now), the longest wait between two men
+--           lines while they flow, and the frames in which two or more came together (a burst).
+local function median(t) if #t == 0 then return 0 end; local c = {}; for i, v in ipairs(t) do c[i] = v end; table.sort(c); return c[math.floor((#c + 1) / 2)] end
+local function linkNew(clock) return { t = clock, rt = {}, age = {}, gap = 0, gapN = 0, lines = 0, bursts = 0, inFrame = 0 } end
+local function linkLine(S, w)                       -- friend: a men line of the host's came
+  local K = M.lk; if not K or S.replay then return end      -- (lines read again after a load of this copy alone are old)
+  local now = os.clock()
+  K.lines = K.lines + 1; K.inFrame = K.inFrame + 1
+  if K.lastT and now - K.lastT < 3.0 then local g = now - K.lastT; if g > K.gap then K.gap = g end; if g > 0.6 then K.gapN = K.gapN + 1 end end
+  K.lastT = now
+  local wall = tonumber(w[2])
+  if wall and M.lkOff then K.age[#K.age + 1] = (A.now() + M.lkOff - wall) * 1000 end
+end
+local function linkAnswer(S, w)                     -- friend: "MQ <name> <the clock this copy sent>"
+  local K = M.lk; local t0, wall = tonumber(w[5]), tonumber(w[2])
+  if not (K and t0 and wall) or S.replay then return end
+  local rt = A.now() - t0
+  if rt < 0 or rt > 30 then return end
+  K.rt[#K.rt + 1] = rt * 1000
+  -- the clocks' difference from the FASTEST answer of the last 5 minutes (a slow answer is lopsided: its middle is not
+  -- the moment the host stamped it). The clocks drift about 80 ms an hour against each other (the first real session).
+  local c = os.clock()
+  if not M.lkBest or rt <= M.lkBest or c - (M.lkBestT or 0) > 300 then M.lkBest = rt; M.lkBestT = c; M.lkOff = wall - (t0 + rt / 2); M.lkRt = rt end
+end
+local function linkStep(S, clock)                   -- friend, every frame
+  local K = M.lk; if not K then K = linkNew(clock); K.halt0 = M.halt; M.lk = K end
+  if K.inFrame >= 2 then K.bursts = K.bursts + 1 end
+  K.inFrame = 0
+  -- (test switch, friend console: Coop.m73probe = false: no MQ lines are sent)
+  -- a new session (another host, another PC's clock): what was measured before does not count; asked again at once
+  if M.lkSess ~= S.startWall then M.lkSess = S.startWall; M.lkOff = nil; M.lkRt = nil; M.lkBest = nil; M.lkAskT = nil end
+  -- (the clocks' difference as this copy knows it rides along: the host's log line of this copy's orders uses it)
+  if C.m73probe ~= false and clock - (M.lkAskT or -10) >= 5.0 then M.lkAskT = clock; send(string.format("MQ %.3f%s", A.now(), M.lkOff and string.format(" %.3f", M.lkOff) or "")) end
+  if clock - K.t < 60.0 then return end
+  if #K.rt > 0 or K.lines > 0 then
+    table.sort(K.rt); table.sort(K.age)
+    log("MEN link, last 60 s: round trip %.0f ms (least %.0f, most %.0f; %d answers); this PC's clock is %s; the host's men lines: %d, %s; longest wait between two %.0f ms (%d over 600 ms); frames with two or more: %d",
+        median(K.rt), K.rt[1] or 0, K.rt[#K.rt] or 0, #K.rt,
+        M.lkOff and string.format("%.0f ms %s the host's (the host's delay_ms for this copy's orders reads that much %s)", math.abs(M.lkOff) * 1000, M.lkOff >= 0 and "behind" or "ahead of", M.lkOff >= 0 and "more" or "less") or "not compared with the host's yet",
+        K.lines, #K.age > 0 and string.format("%.0f ms old as they came (most %.0f)", median(K.age), K.age[#K.age]) or "age not known",
+        K.gap * 1000, K.gapN, K.bursts)
+  end
+  -- the men of walking squads in that minute (the native count): how often one came to a stand while the host's walked
+  local h1, h0 = M.halt, K.halt0
+  if h1 and h0 and (h1[2] + h1[3]) > (h0[2] + h0[3]) then
+    local st, wk = h1[2] - h0[2], h1[3] - h0[3]
+    log("MEN walk, last 60 s: men of walking squads came to a stand %d times while the host's walked; they stood %.1f %% of %.0f man-seconds under a fresh host line (led points %s)",
+        h1[1] - h0[1], 100 * st / math.max(1, st + wk), (st + wk) / 1000, (M.leadOk and M.paceIn and C.m73lead ~= false) and "used" or "not used")
+  end
+  -- what the table of held men did in that minute, by reason (for the next report: live, 14 men of two squads were
+  -- taken out and held again every second or two for minutes, and no log said why)
+  do
+    local keys = { "m43drop_order", "m43drop_left", "m43drop_death", "m43drop_release", "m43drop_gone", "m43drop_squad", "m43placed", "m43regive", "m43rehold", "m73own", "m73ownSkip", "m43nomatch" }
+    local now, was, d, any = {}, K.st0 or {}, {}, false
+    for i, k in ipairs(keys) do now[k] = S.stats[k] or 0; d[i] = now[k] - (was[k] or 0); if d[i] ~= 0 then any = true end end
+    if any and K.st0 then
+      log("MEN table, last 60 s: men let go at an order %d, left their squad %d, died %d, released by the host %d, squad gone %d (ended %d); put outright %d (given again %d); held again after an order %d; this player's orders %d (host lines from before them not taken %d); host entries with no man here %d",
+          d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12])
+    end
+    K.st1 = now
+    -- the head count of every squad the host named in that minute, here / on the host (this player's own marked *)
+    local hc, bad = {}, 0
+    for lh, c in pairs(M.cnt or {}) do
+      if clock - c[3] < 60.0 then hc[#hc + 1] = string.format("%s%d %d/%d", (S.mine and S.mine[lh]) and "*" or "", lh, c[1], c[2]); if c[1] ~= c[2] then bad = bad + 1 end end
+    end
+    table.sort(hc)
+    if #hc > 0 then log("MEN heads, last 60 s (squad here/host, * this player's own): %s: %s", bad == 0 and "all equal" or (bad .. " DIFFERENT"), table.concat(hc, ", ", 1, math.min(#hc, 40))) end
+  end
+  local last = K.lastT; local st1 = K.st1; M.lk = linkNew(clock); M.lk.lastT = last; M.lk.halt0 = M.halt; M.lk.st0 = st1
+end
 
 local function tick(S, clock)
   M.lb = 1          -- (lane 48) one squad list read again this frame (listOf)
@@ -705,6 +1026,7 @@ local function tick(S, clock)
     local ok, state = avail(); if ok and state == "hooked" then hostStep(S, clock) end
     local tf = os.clock(); flushCmds(); sec(S, "flush", tf)
   elseif S.role == "friend" then
+    linkStep(S, clock)                                  -- (lane 73) the link's real delay, once a minute in the log
     local want = not C.hold and C.m43off ~= true
     if want ~= M.fWant then
       M.fWant = want
@@ -753,8 +1075,18 @@ local function tick(S, clock)
 end
 
 local function onMessage(S, from, kind, w)
+  if kind == "MQ" then
+    -- (lane 73) the link's delay: the host answers a friend's question with the friend's own clock; the friend reads it
+    if S.role == "host" and from ~= "host" and tonumber(w[4]) then
+      send("MQ " .. tostring(from) .. " " .. w[4])
+      M.peerOff = M.peerOff or {}; M.peerOff[from] = tonumber(w[5])      -- (host clock minus that friend's)
+    elseif S.role == "friend" and from == "host" and w[4] == S.name then linkAnswer(S, w) end
+    return true
+  end
   if kind ~= "MX" then return false end
   if S.role ~= "friend" or from ~= "host" then return true end
+  linkLine(S, w)
+  M.curWall = tonumber(w[2])                           -- (lane 73) the host's clock in this line (onMM: this player's own order)
   local t0 = os.clock()
   for k = 4, #w do
     local kd, hs, ns, rest = w[k]:match("^(%u%u)/(%-?%d+)/(%d+)/(.*)$")

@@ -35,11 +35,21 @@
  *                                         the game's pace rule ran for a squad, a held man's speed factor from the lengths of the ways is 1 (PACE)
  *   MEN KEEP ON|OFF                       friend (lane 52, round 2; on by default): a held man's own request is not run
  *                                         again while his way already leads to the host's place (KEEP)
+ *   MEN LEAD <ms>                         host (lane 73; 0 = off, the default): each HERE line of a walking man also carries
+ *                                         " L <x> <y> <z> <cm/s> <0|1>": the point of his own way he reaches in <ms> (never past
+ *                                         its end; 1 = that end), and his speed; a man who stopped is written at once (" S")
+ *   MEN SET <hex>=<x>,<y>,<z>,3           friend (lane 73): a FAR place (a free merchant's path end, often a kilometre off).
+ *                                         He is held like any man (the place goes into every request of his, a GO at once,
+ *                                         a GO that waits while he is busy), but the pace rule, the run-off check, the
+ *                                         FOREIGN dump, REGO and the halt count leave him alone
+ *   MEN SET <hex>=<x>,<y>,<z>,<1|2>,<ax>,<ay>,<cm/s>   friend (lane 73): x,y,z is that LED point (where he walks to), ax,ay the
+ *                                         host's man's own place and his speed (what his pace is held to): LEAD below
  * Refused on another game build (the record's layout and the man's +CE0h are not held by a signature). */
 #include <intrin.h>                /* _ReturnAddress (lane 52: the ring notes who asked) */
 #define MEN_HOOK_LEN   8
 #define MEN_MAX        1536        /* men in the table (both roles); a large battle has about 600 */
 #define MEN_STEP_CM    50.0        /* host: a new asked place is written when it moved this far (round 1: 25 cm; round 2: 1 m made the walks lag, fA1-fA4) */
+#define MEN_SLOT_CM    5.0         /* host (lane 73): the same for a man at rest, with MEN LEAD */
 #define MEN_GO_CM      50.0        /* friend: a host place this far from the last one given is given at once */
 #define MEN_REC        0x88        /* the point record */
 #define MEN_MAN_BYTES  0xE60       /* bytes of a man that must be readable for a GO (the routine reads +E3Ch, +E50h) */
@@ -55,7 +65,12 @@ typedef void (*mpath_fn)(void *man, uint8_t *rec, uint64_t flag, void *list);
 #define MF_TRACE 32                /* friend (lane 52): let go at an order (MEN LET), still watched by the run-off check */
 #define MF_HERE  64                /* host: the man's own place was written (HERE, lane 48) */
 #define MF_SANE 128                /* host: the man's bytes were found committed and readable (HERE, lane 48) */
-typedef struct { uintptr_t a; double ht[3], seen[3], sent[3], given[3], here[3]; uint32_t tcall, tgo, tset, tfar, tfar6, tpos, trun; uint8_t lvl, flags, fired, pend, follow; float dfar, dfar6, px, py, vel; } ment;
+typedef struct { uintptr_t a; double ht[3], seen[3], sent[3], given[3], here[3]; uint32_t tcall, tgo, tset, tfar, tfar6, tpos, trun; uint8_t lvl, flags, fired, pend, follow; float dfar, dfar6, px, py, vel;
+                 /* lane 73, LEAD. friend: nt = the newest led point (ht is the one he walks to), ax/ay = the host's man's own place when
+                  * the line came, hv his speed (cm/s), dlead = his way from that place to nt, tanc = when it came. host: still = his stop was written */
+                 double nt[3]; float ax, ay, hv, dlead; uint32_t tanc; uint8_t lead, still;
+                 float ibias; uint32_t tpace;   /* friend: what the pace rule has learnt of the host's pace for this man (PACE_I), when it last looked */
+               } ment;
 /* a man's fields read here beside realPos (the known build only: MEN is refused on another one) */
 #define MEN_DEST_OFF   0x510       /* the place of the request he walks by (a copy of the record at +508h; set by the path request) */
 #define MEN_DESTLVL    0x586       /* its level byte */
@@ -88,6 +103,8 @@ static struct {
     int pace_avail, pace_off, keep_off, catch_off; char pace_why[120];
     uint8_t *p_entry, *p_tramp; void *p_find; uint8_t p_jmp[PACE_HOOK_LEN];
     unsigned long long raised, sped, mustered, pcalls, pother, keeps, ro6, seated, stood; LONGLONG qpace;
+    /* lane 73: LEAD */
+    uint32_t lead_ms; unsigned long long leads, stills, leadsets, leadgos, leadturns, leadkeeps, slowed, halts, haltms, walkms, fars;
 } MV;
 
 static int men_bytes_on(void)  { return MV.stub && memcmp(MV.entry, MV.jmp, MEN_HOOK_LEN) == 0; }
@@ -143,14 +160,16 @@ static int men_status(char *buf, size_t len)
                    "menstat held=%d watched=%d calls=%llu subst=%llu seen=%llu gos=%llu gofail=%llu ce0=%llu sets=%llu setmen=%llu polls=%llu lines=%llu outbytes=%llu "
                    "drops=%llu forgets=%llu full=%llu other=%llu refused=%llu faults=%llu ushook=%lld usgo=%lld uspoll=%lld "
                    "hoff=%X heres=%llu herelines=%llu herebad=%llu ushere=%lld regos=%llu regolooks=%llu rego=%d runoffs=%llu rlast=%IX lets=%llu diags=%llu landms=%llu/%llu/%llu/%llu/%llu/%llu supers=%llu foreign=%llu e3cwait=%llu e3cgos=%llu "
-                   "ro6=%llu seated=%llu pace=%s raised=%llu pcalls=%llu pother=%llu uspace=%lld keep=%d keeps=%llu catch=%d sped=%llu mustered=%llu stood=%llu\r\n",
+                   "ro6=%llu seated=%llu pace=%s raised=%llu pcalls=%llu pother=%llu uspace=%lld keep=%d keeps=%llu catch=%d sped=%llu mustered=%llu stood=%llu "
+                   "lead=%u leads=%llu stills=%llu leadsets=%llu leadgos=%llu leadturns=%llu leadkeeps=%llu slowed=%llu halts=%llu haltms=%llu walkms=%llu fars=%llu\r\n",
                    held, watched, MV.calls, MV.subst, MV.seen, MV.gos, MV.gofail, MV.ce0, MV.sets, MV.setmen, MV.polls, MV.lines, MV.outbytes,
                    MV.drops, MV.forgets, MV.full, MV.other, MV.refused, MV.faults,
                    MV.qpf ? MV.qhook * 1000000 / MV.qpf : 0, MV.qpf ? MV.qgo * 1000000 / MV.qpf : 0, MV.qpf ? MV.qpoll * 1000000 / MV.qpf : 0,
                    MV.hoff, MV.heres, MV.herelines, MV.herebad, MV.qpf ? MV.qhere * 1000000 / MV.qpf : 0, MV.regos, MV.regolooks, MV.rego_off ? 0 : 1,
                    MV.runoffs, MV.rlast, MV.lets, MV.diags, MV.land[0], MV.land[1], MV.land[2], MV.land[3], MV.land[4], MV.land[5], MV.supers, MV.foreign, MV.e3cwait, MV.e3cgos,
                    MV.ro6, MV.seated, !MV.pace_avail ? "na" : MV.pace_off ? "off" : pace_bytes_on() ? "in" : "out", MV.raised, MV.pcalls, MV.pother,
-                   MV.qpf ? MV.qpace * 1000000 / MV.qpf : 0, MV.keep_off ? 0 : 1, MV.keeps, MV.catch_off ? 0 : 1, MV.sped, MV.mustered, MV.stood);
+                   MV.qpf ? MV.qpace * 1000000 / MV.qpf : 0, MV.keep_off ? 0 : 1, MV.keeps, MV.catch_off ? 0 : 1, MV.sped, MV.mustered, MV.stood,
+                   MV.lead_ms, MV.leads, MV.stills, MV.leadsets, MV.leadgos, MV.leadturns, MV.leadkeeps, MV.slowed, MV.halts, MV.haltms, MV.walkms, MV.fars);
     return n < 0 ? 0 : n;
 }
 
@@ -174,6 +193,64 @@ static ment *men_add(uintptr_t a)
 }
 static void men_del(int i) { memmove(&MV.e[i], &MV.e[i + 1], (size_t)(MV.n - i - 1) * sizeof(ment)); MV.n--; memset(&MV.e[MV.n], 0, sizeof(ment)); }
 static double men_d2(const double *a, const double *b) { double x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2]; return x * x + y * y + z * z; }
+
+/* ---------------------------------------------------------------- lane 73: LEAD
+ * The live fault (a real session over Steam, game speed 1): "on the host the troops march smoothly, on the friends they
+ * go about five steps, stop, and go on". A man of a walking squad was given the host's man's own place, a round old,
+ * every metre: ONE place did two jobs, where he walks to and where he should be. He reached it before the next one
+ * came (the catch-up makes him faster than the host's man whenever he is behind) and stood until the next line and
+ * the path finder's answer. Lane 52's sittings ran at speed 4, where the places come 1.5 m apart every round and he is
+ * always a few metres behind the newest. (The link's delay was not the cause: 0.1 to 0.15 s each way in that session.)
+ * Now the two jobs are apart:
+ *   host    each HERE line of a moving man also names the point of his OWN way that he reaches in MV.lead_ms at his
+ *           speed (MEN_LEAD_MIN to MEN_LEAD_MAX cm ahead along the way's points, never past its last one), and his speed.
+ *   friend  the man WALKS TO that point (ht) and his PACE is held to the host's man's own place (the anchor), moved on
+ *           by his speed for the time since the line came (at most MEN_LEAD_AGE_MS, never past the led point): he is
+ *           as far from the led point as the host's man is. Behind: faster, as the catch-up was. Ahead: slower, down to
+ *           PACE_MIN: he does not run to the end of what he was given and stand there. A constant delay of the link
+ *           only shifts him along the host's track; what the led point must cover is the longest GAP between two lines
+ *           and the path finder's answer.
+ *           A new led point is given to him (a GO, which empties his way until the path finder answers) only when he
+ *           is near the end of the way he has (the host's man's MEN_LEAD_NEAR_MS of walking and MEN_LEAD_NEAR_CM), or
+ *           when the point he walks to no longer lies on the straight way to the new one (a bend, a halt, a turn:
+ *           MEN_LEAD_OFF_CM). The host's man stops: his way's end IS the led point, and his resting place comes at
+ *           once: the friend's man stops there, on the host's word, not because the lines ran out. */
+#define MEN_LEAD_MIN     600.0       /* (300 at first: at game speed 1 that is 2 s of walking, the "near the end" rule below gave a GO at nearly every line) */
+#define MEN_LEAD_MAX     1500.0
+#define MEN_LEAD_STILL   20.0        /* cm/s: slower than this he stands */
+#define MEN_LEAD_AGE_MS  1000
+#define MEN_LEAD_NEAR_MS 1000
+#define MEN_LEAD_NEAR_CM 100.0
+#define MEN_LEAD_OFF_CM  150.0
+#define PACE_MIN         0.5
+#define PACE_SLOW_CM     300.0
+/* (game run a2, b1: with the gap alone setting the pace, the friend's militia walked 2.5 m AHEAD of the host's for the
+ * whole march, "slowed" 30 000 times: the host's men walk at about 0.55 of a man's pace at factor 1 (their own rule
+ * keeps the formation), and a gap of 1.5 m was what it took to hold a factor of 0.5 to 0.6.) So the rule also LEARNS
+ * the host's pace: a bias on the factor, moved by the gap over time (PACE_I a second per 4 m of gap), kept within
+ * PACE_I_MAX; the gap then only has to correct what is left, and a steady march settles at the host's man's place. */
+#define PACE_I           0.5
+#define PACE_I_MAX       0.6
+#define PACE_I_MS        50          /* looked at no more often than this */
+static double men_xy(double ax, double ay, double bx, double by) { double x = ax - bx, y = ay - by; return sqrt(x * x + y * y); }
+/* how far the point c lies from the straight way a -> b (cm, in the plane) */
+static double men_seg_dist(const double *c, const double *a, const double *b)
+{
+    double vx = b[0] - a[0], vy = b[1] - a[1], l2 = vx * vx + vy * vy, t;
+    if (l2 < 1.0) return men_xy(c[0], c[1], a[0], a[1]);
+    t = ((c[0] - a[0]) * vx + (c[1] - a[1]) * vy) / l2; if (t < 0) t = 0; if (t > 1) t = 1;
+    return men_xy(c[0], c[1], a[0] + vx * t, a[1] + vy * t);
+}
+/* friend: how much MORE way a led man has left than the host's man has by now (cm; over 0 = he is behind) */
+static double men_lead_gap(const ment *e, const double *rp, uint32_t now)
+{
+    uint32_t age = now - e->tanc;
+    double hrem, mine;
+    if (age > MEN_LEAD_AGE_MS) age = MEN_LEAD_AGE_MS;
+    hrem = (double)e->dlead - (double)e->hv * (double)age / 1000.0; if (hrem < 0) hrem = 0;
+    mine = men_xy(rp[0], rp[1], e->ht[0], e->ht[1]) + men_xy(e->ht[0], e->ht[1], e->nt[0], e->nt[1]);
+    return mine - hrem;
+}
 
 /* ---------------------------------------------------------------- the hook */
 static void men_fault(DWORD code)
@@ -288,13 +365,31 @@ static void pace_wrap(void *comp, uint32_t squad)
             MV.pcalls++;
             if (sq) {
                 int n = *(const int32_t *)(sq + 0x20), i; uint8_t **men = *(uint8_t ***)(sq + 0x18);
+                uint32_t now = GetTickCount();
                 if (men && n > 0 && n <= 4096)
                     for (i = 0; i < n; i++) {
                         ment *e = men_find((uintptr_t)men[i]);
-                        if (e && (e->flags & MF_HOLD) && (men[i][0x3B4] == 0 || e->follow == 2)) {
+                        if (e && (e->flags & MF_HOLD) && e->follow != 3 && (men[i][0x3B4] == 0 || e->follow == 2)) {   /* (3: a far-held man keeps the rule's pace) */
                             float *f = (float *)(men[i] + MEN_FACTOR_OFF), want = 1.0f;
                             double top = e->follow == 2 ? PACE_MAX_MUS : PACE_MAX;
-                            if (e->follow && MV.hoff && !MV.catch_off) {
+                            if (e->follow && e->lead && MV.hoff && !MV.catch_off) {
+                                /* (lane 73) LEAD: he walks to the led point; his pace is held to the host's man's own place */
+                                const double *rp = (const double *)(men[i] + MV.hoff);
+                                double g = men_lead_gap(e, rp, now), r;
+                                uint32_t dtm = e->tpace ? now - e->tpace : 0;
+                                if (!e->tpace || dtm >= PACE_I_MS) {
+                                    if (dtm > 500) dtm = 500;
+                                    e->tpace = now;
+                                    e->ibias += (float)(g / 400.0 * (double)dtm / 1000.0 * PACE_I);
+                                    if (e->ibias > (float)PACE_I_MAX) e->ibias = (float)PACE_I_MAX; if (e->ibias < -(float)PACE_I_MAX) e->ibias = -(float)PACE_I_MAX;
+                                }
+                                r = 1.0 + (double)e->ibias;
+                                if (g > PACE_NEAR_CM) r += (g - PACE_NEAR_CM) / (e->follow == 2 ? 200.0 : 400.0);
+                                else if (g < -PACE_NEAR_CM) r += (g + PACE_NEAR_CM) / PACE_SLOW_CM;
+                                if (r > top) r = top; if (r < PACE_MIN) r = PACE_MIN;
+                                want = (float)r;
+                                if (r > 1.0) MV.sped++; else if (r < 1.0) MV.slowed++;
+                            } else if (e->follow && MV.hoff && !MV.catch_off) {
                                 const double *rp = (const double *)(men[i] + MV.hoff);
                                 double dx = rp[0] - e->ht[0], dy = rp[1] - e->ht[1], d2 = dx * dx + dy * dy;
                                 /* (round 3) how far he is behind: his distance to the place. A place the host LED (sent ahead
@@ -469,7 +564,20 @@ static int men_hex(const char *s, uintptr_t *a)
     *a = (uintptr_t)v;
     return 1;
 }
-/* MEN SET <hex>=<x>,<y>,<z>;...  (friend) */
+static int men_read_pos(ment *e, double *q);
+/* (lane 73) friend, LEAD: is the newest led point (e->nt) given to him now? (the rule is at the head of this file's LEAD block) */
+static int men_lead_wants_go(ment *e)
+{
+    double q[3];
+    if (!(e->flags & MF_GIVEN)) return 1;
+    if (men_d2(e->nt, e->given) < MEN_GO_CM * MEN_GO_CM) return 0;          /* the point he walks to already */
+    if (!MV.hoff || !men_read_pos(e, q)) return 1;                           /* his own place is not to be had: every new point, as before */
+    if (men_seg_dist(e->given, q, e->nt) > MEN_LEAD_OFF_CM) { MV.leadturns++; return 1; }
+    if (men_xy(q[0], q[1], e->given[0], e->given[1]) < (double)e->hv * MEN_LEAD_NEAR_MS / 1000.0 + MEN_LEAD_NEAR_CM) return 1;
+    MV.leadkeeps++;
+    return 0;
+}
+/* MEN SET <hex>=<x>,<y>,<z>[,<1|2>[,<ax>,<ay>,<cm/s>]];...  (friend) */
 static void men_set(const char *arg)
 {
     char buf[MAX_LINE], *p, *next;
@@ -477,20 +585,41 @@ static void men_set(const char *arg)
     strcpy(buf, arg);
     MV.sets++;
     for (p = buf; p && *p; p = next) {
-        char *eq, *end; uintptr_t a; double v[3]; int k, fol; ment *e;
+        char *eq, *end; uintptr_t a; double v[3], x[3] = { 0, 0, 0 }; int k, fol, lead = 0, go; ment *e;
         next = strchr(p, ';'); if (next) *next++ = 0;
         eq = strchr(p, '='); if (!eq) { MV.refused++; continue; }
         *eq = 0;
         if (!men_hex(p, &a)) { MV.refused++; continue; }
         end = eq + 1;
         for (k = 0; k < 3; k++) { v[k] = strtod(end, &end); if (k < 2) { if (*end != ',') break; end++; } }
-        fol = 0; if (k == 3 && end[0] == ',' && (end[1] == '1' || end[1] == '2') && end[2] == 0) { fol = end[1] - '0'; end += 2; }
+        fol = 0; if (k == 3 && end[0] == ',' && (end[1] == '1' || end[1] == '2' || end[1] == '3') && (end[2] == 0 || end[2] == ',')) { fol = end[1] - '0'; end += 2; }
+        /* (lane 73) LEAD: the host's man's own place and his speed follow the mark; all three, or the form is refused */
+        if (fol && fol != 3 && *end == ',') {
+            int j;
+            for (j = 0; j < 3; j++) { char *e0 = ++end; x[j] = strtod(end, &end); if (end == e0 || !(x[j] == x[j]) || fabs(x[j]) > 1e8 || (j < 2 && *end != ',')) break; }
+            if (j < 3 || x[2] < 0) { MV.refused++; continue; }
+            lead = 1;
+        }
         if (k < 3 || *end || !(v[0] == v[0]) || fabs(v[0]) > 1e8 || fabs(v[1]) > 1e8 || fabs(v[2]) > 1e8) { MV.refused++; continue; }
         e = men_add(a); if (!e) continue;
-        e->follow = (uint8_t)fol;
-        e->flags |= MF_HOLD; e->flags &= (uint8_t)~MF_TRACE; memcpy(e->ht, v, sizeof(v)); e->tset = GetTickCount();
+        e->follow = (uint8_t)fol; if (fol == 3) MV.fars++;
+        e->flags |= MF_HOLD; e->flags &= (uint8_t)~MF_TRACE; e->tset = GetTickCount();
         MV.setmen++;
-        if (MV.enabled && (!(e->flags & MF_GIVEN) || men_d2(e->ht, e->given) >= MEN_GO_CM * MEN_GO_CM)) {
+        if (lead) {
+            /* the newest led point is noted; it becomes the point he walks to (ht) only with its GO */
+            memcpy(e->nt, v, sizeof(v)); e->ax = (float)x[0]; e->ay = (float)x[1]; e->hv = (float)x[2]; e->tanc = e->tset;
+            e->dlead = (float)men_xy(x[0], x[1], v[0], v[1]);
+            MV.leadsets++;
+            if (!e->lead) { e->ibias = 0; e->tpace = 0; }
+            go = !e->lead || men_lead_wants_go(e);
+            if (go || !(e->flags & MF_GIVEN)) memcpy(e->ht, v, sizeof(v));
+            e->lead = 1;
+            if (go) MV.leadgos++;
+        } else {
+            e->lead = 0; memcpy(e->ht, v, sizeof(v));
+            go = !(e->flags & MF_GIVEN) || men_d2(e->ht, e->given) >= MEN_GO_CM * MEN_GO_CM;
+        }
+        if (MV.enabled && go) {
             if (!men_go(e)) { if (!MV.avail) return; }
         }
     }
@@ -530,30 +659,63 @@ static void men_hereat(const char *arg)
 static int men_here_feed(char *out, int n, int cap)
 {
     int i;
+    uint32_t now = GetTickCount();
     LARGE_INTEGER t0, t1;
     if (!MV.hoff) return n;
     QueryPerformanceCounter(&t0);
     MV.heres++;
     for (i = 0; i < MV.n; i++) {
-        ment *e = &MV.e[i]; double q[3]; uintptr_t vt = 0; char why[200];
+        ment *e = &MV.e[i]; double q[3], sp = 0; uintptr_t vt = 0; char why[200]; int stop = 0;
         if (!(e->flags & MF_WATCH)) continue;
         if (!(e->flags & MF_SANE)) { if (!comp_sane(e->a, MV.hoff + 24, why, sizeof(why))) { MV.herebad++; continue; } e->flags |= MF_SANE; }
         __try { vt = *(const uintptr_t *)e->a; memcpy(q, (const void *)(e->a + MV.hoff), sizeof(q)); }
         __except (EXCEPTION_EXECUTE_HANDLER) { MV.faults++; e->flags &= (uint8_t)~MF_SANE; continue; }
         if (vt < (uintptr_t)g_base || vt >= (uintptr_t)g_base + g_imgsize || (vt & 7) ||
             !(q[0] == q[0]) || !(q[1] == q[1]) || !(q[2] == q[2]) || fabs(q[0]) > 1e8 || fabs(q[1]) > 1e8 || fabs(q[2]) > 1e8) { MV.herebad++; e->flags &= (uint8_t)~MF_SANE; continue; }
-        if ((e->flags & MF_HERE) && men_d2(q, e->here) < MEN_HERE_CM * MEN_HERE_CM) continue;
-        if (n > cap - 96) break;
+        /* (lane 73) LEAD: his speed from his last two places here (cm a second of wall time), and his stop: a man who
+         * walked and now stands is written at once (" S"), wherever he stands: the friend's man stops on this word */
+        if (MV.lead_ms) {
+            int have = 0;
+            if (e->tpos && now - e->tpos >= 100 && now - e->tpos < 2000) { e->vel = (float)(men_xy(q[0], q[1], e->px, e->py) * 1000.0 / (double)(now - e->tpos)); have = 1; }
+            else if (!e->tpos || now - e->tpos >= 2000) e->vel = 0;
+            if (!e->tpos || now - e->tpos >= 100) { e->px = (float)q[0]; e->py = (float)q[1]; e->tpos = now; }
+            sp = e->vel;
+            /* (two looks in a row under MEN_LEAD_STILL: a man held up for a moment by another is not "stopped") */
+            if (sp >= MEN_LEAD_STILL) e->still = 0;
+            else if (have && e->still < 2) { if (++e->still == 2 && (e->flags & MF_HERE) && men_d2(q, e->here) >= 10.0 * 10.0) stop = 1; }
+        }
+        if (!stop && (e->flags & MF_HERE) && men_d2(q, e->here) < MEN_HERE_CM * MEN_HERE_CM) continue;
+        if (n > cap - 224) break;
         n += _snprintf(out + n, (size_t)(cap - n), "H %IX %.0f %.0f %.0f", e->a, q[0], q[1], q[2]);
+        if (stop) { n += _snprintf(out + n, (size_t)(cap - n), " S"); MV.stills++; }
         /* (lane 52, round 3) and the point of his way he walks to now (SMUnit.Path[PathPoint]), when he has one: the
          * Lua leads a running man's place ALONG his way, never past that point (a lead straight on at a bend of the
          * way sent the friend's man off the host's track: the militia 4.4 to 5.5 m at the same bend, r2, lc53_3) */
-        if (MV.hoff + 24 <= MEN_PATH_OFF && comp_sane(e->a, MEN_PATH_OFF + 0x18, why, sizeof(why))) {
+        if (!stop && MV.hoff + 24 <= MEN_PATH_OFF && comp_sane(e->a, MEN_PATH_OFF + 0x18, why, sizeof(why))) {
             __try {
                 const uint8_t *pd = *(const uint8_t *const *)(e->a + MEN_PATH_OFF); int pn = *(const int32_t *)(e->a + MEN_PATH_OFF + 8), pp = *(const int32_t *)(e->a + MEN_PATH_OFF + 0x10);
                 if (pd && pn > 0 && pn < 4096 && pp >= 0 && pp < pn && range_readable(pd + (size_t)pp * 0x88, 0x88)) {
                     const double *pc = (const double *)(pd + (size_t)pp * 0x88 + 8);
                     if (pc[0] == pc[0] && pc[1] == pc[1] && fabs(pc[0]) < 1e8 && fabs(pc[1]) < 1e8) n += _snprintf(out + n, (size_t)(cap - n), " %.0f %.0f", pc[0], pc[1]);
+                    /* (lane 73) LEAD: the point of his way he reaches in MV.lead_ms at his speed: along the way's points
+                     * from the one he walks to now (64 of them at most), never past the last one (then: 1, his way's end) */
+                    if (MV.lead_ms && sp >= MEN_LEAD_STILL) {
+                        int last = pn - 1, j, end = 1;
+                        double D = sp * (double)MV.lead_ms / 1000.0, cur[3], lp[3] = { 0, 0, 0 };
+                        if (last > pp + 63) last = pp + 63;
+                        if (D < MEN_LEAD_MIN) D = MEN_LEAD_MIN; if (D > MEN_LEAD_MAX) D = MEN_LEAD_MAX;
+                        cur[0] = q[0]; cur[1] = q[1]; cur[2] = q[2];
+                        if (!range_readable(pd + (size_t)pp * 0x88, (size_t)(last - pp + 1) * 0x88)) end = -1;
+                        for (j = pp; end == 1 && j <= last; j++) {
+                            const double *pt = (const double *)(pd + (size_t)j * 0x88 + 8); double seg;
+                            if (!(pt[0] == pt[0]) || !(pt[1] == pt[1]) || !(pt[2] == pt[2]) || fabs(pt[0]) > 1e8 || fabs(pt[1]) > 1e8 || fabs(pt[2]) > 1e8) { end = -1; break; }
+                            seg = men_xy(cur[0], cur[1], pt[0], pt[1]);
+                            if (seg >= D) { double t = D / seg; lp[0] = cur[0] + (pt[0] - cur[0]) * t; lp[1] = cur[1] + (pt[1] - cur[1]) * t; lp[2] = cur[2] + (pt[2] - cur[2]) * t; end = 0; break; }
+                            D -= seg; cur[0] = pt[0]; cur[1] = pt[1]; cur[2] = pt[2];
+                        }
+                        if (end == 1) { lp[0] = cur[0]; lp[1] = cur[1]; lp[2] = cur[2]; if (last < pn - 1) end = 0; }   /* (his way goes on past the points looked at: not its end) */
+                        if (end >= 0) { n += _snprintf(out + n, (size_t)(cap - n), " L %.0f %.0f %.0f %.0f %d", lp[0], lp[1], lp[2], sp, end); MV.leads++; }
+                    }
                 }
             } __except (EXCEPTION_EXECUTE_HANDLER) { MV.faults++; }
         }
@@ -567,7 +729,7 @@ static int men_here_feed(char *out, int n, int cap)
 static void men_poll(void)
 {
     wchar_t path[MAX_PATH];
-    static char out[MEN_MAX * 48 + MEN_MAX * 80 + 128];
+    static char out[MEN_MAX * 48 + MEN_MAX * 160 + 256];   /* (lane 73: a HERE line with its led point is up to 150 bytes) */
     int n = 0, i;
     HANDLE h; DWORD wr;
     LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
@@ -575,7 +737,9 @@ static void men_poll(void)
     for (i = 0; i < MV.n; i++) {
         ment *e = &MV.e[i];
         if ((e->flags & (MF_WATCH | MF_SEEN)) != (MF_WATCH | MF_SEEN)) continue;
-        if ((e->flags & MF_SENT) && men_d2(e->seen, e->sent) < MEN_STEP_CM * MEN_STEP_CM) continue;
+        /* (lane 73) a man at rest (still at the last look; with MEN LEAD): his asked place, his slot, is written to
+         * MEN_SLOT_CM: the friend's man stands in that slot (a place half a metre old left him beside it) */
+        if ((e->flags & MF_SENT) && men_d2(e->seen, e->sent) < ((MV.lead_ms && e->still) ? MEN_SLOT_CM * MEN_SLOT_CM : MEN_STEP_CM * MEN_STEP_CM)) continue;
         if (n > (int)sizeof(out) - 64) break;
         n += _snprintf(out + n, sizeof(out) - (size_t)n, "%IX %.0f %.0f %.0f\r\n", e->a, e->seen[0], e->seen[1], e->seen[2]);
         memcpy(e->sent, e->seen, sizeof(e->sent)); e->flags |= MF_SENT;
@@ -621,6 +785,7 @@ static void men_rego(void)
     for (i = 0; i < MV.n; i++) {
         ment *e = &MV.e[i]; double q[3]; uintptr_t vt = 0; char why[200];
         if ((e->flags & (MF_HOLD | MF_GIVEN)) != (MF_HOLD | MF_GIVEN)) continue;
+        if (e->follow == 3) continue;   /* (lane 73) a far-held man (a merchant) stands where his own doings keep him */
         if (now - e->tcall < MEN_REGO_IDLE || now - e->tgo < MEN_REGO_IDLE) continue;
         MV.regolooks++;
         if (!(e->flags & MF_SANE)) { if (!comp_sane(e->a, MV.hoff + 24, why, sizeof(why))) continue; e->flags |= MF_SANE; }
@@ -629,6 +794,7 @@ static void men_rego(void)
         if (vt < (uintptr_t)g_base || vt >= (uintptr_t)g_base + g_imgsize || !(q[0] == q[0]) || !(q[1] == q[1])) { e->flags &= (uint8_t)~MF_SANE; continue; }
         if ((q[0] - e->ht[0]) * (q[0] - e->ht[0]) + (q[1] - e->ht[1]) * (q[1] - e->ht[1]) < MEN_REGO_CM * MEN_REGO_CM) continue;
         e->tgo = now;   /* at most once per idle span, also when the GO fails */
+        if (e->lead) memcpy(e->ht, e->nt, sizeof(e->ht));   /* (lane 73) a led man: the newest led point */
         men_force = 1; if (men_go(e)) { men_force = 0; MV.regos++; } else { men_force = 0; if (!MV.avail) return; }
     }
 }
@@ -646,6 +812,7 @@ static void men_rego(void)
 #define MEN_RO_MS      2000
 #define MEN_RO_DUMPS   40
 #define MEN_TRACE_MS   3000
+#define MEN_HALT_MS    1200        /* lane 73: a walking squad's host line this fresh: the host's man walks */
 static int men_read_pos(ment *e, double *q)
 {
     uintptr_t vt = 0; char why[200];
@@ -682,6 +849,8 @@ static int men_dump_man(char *out, int n, int cap, const char *tag, ment *e, uin
             if (pp >= 0 && pp < pn) { const double *pc = (const double *)(pd + (size_t)pp * 0x88 + 8); n += _snprintf(out + n, (size_t)(cap - n), " cur=%.0f,%.0f", pc[0], pc[1]); }
         }
         { const double *ds = (const double *)(m + MEN_DEST_OFF); n += _snprintf(out + n, (size_t)(cap - n), " dest=%.0f,%.0f far6=%u\r\n", ds[0], ds[1], e->tfar6 ? now - e->tfar6 : 0); }
+        if (e->lead) n += _snprintf(out + n, (size_t)(cap - n), "  led: newest=%.0f,%.0f host's man=%.0f,%.0f at %.0f cm/s %u ms ago, gap=%.0f (over 0: behind)\r\n",
+                                    e->nt[0], e->nt[1], (double)e->ax, (double)e->ay, (double)e->hv, now - e->tanc, men_lead_gap(e, rp, now));
     } __except (EXCEPTION_EXECUTE_HANDLER) { MV.faults++; n += _snprintf(out + n, (size_t)(cap - n), "  (read fault)\r\n"); }
     /* his path requests of the last 5 s, oldest first */
     for (k = MEN_RING; k >= 1; k--) {
@@ -705,11 +874,19 @@ static void men_runoff(void)
     for (i = 0; i < MV.n; i++) {
         ment *e = &MV.e[i]; double q[3], d; int big = 0, six = 0;
         if (!(e->flags & (MF_HOLD | MF_TRACE))) continue;
+        if (e->follow == 3 && (e->flags & MF_HOLD)) continue;   /* (lane 73) far-held: his place is his path's end, not where he should be now */
         if (!(e->flags & MF_HOLD) && now - e->tset > MEN_TRACE_MS) {   /* traced, no word of the host's for 3 s: out */
             e->flags &= (uint8_t)~MF_TRACE; if (!(e->flags & ~(MF_GIVEN | MF_SANE))) { men_del(i); i--; } continue;
         }
         if (!men_read_pos(e, q)) continue;
         d = men_dxy(q, e->ht);
+        /* (lane 73) a led man walks to a point up to MEN_LEAD_MAX ahead of the host's man: "off his place" is how far he
+         * is behind or ahead of the host's man along the way, or off the stretch from the host's man's place to the led point */
+        if (e->lead && (e->flags & MF_HOLD)) {
+            double an[2], side, g = men_lead_gap(e, q, now);
+            an[0] = e->ax; an[1] = e->ay; side = men_seg_dist(q, an, e->nt);
+            d = fabs(g) > side ? fabs(g) : side;
+        }
         /* lane 52 round 2: a man who sits or is busy (+E3Ch set: the path request leaves at once for him, his GO waits
          * until it clears) cannot walk: not a man held off his place. Counted apart once per sitting-down (seated=).
          * His clocks STAND while the byte is set (they are not started again: a byte that flickers must not hide a man
@@ -720,6 +897,20 @@ static void men_runoff(void)
             if (busy) { if (d > MEN_RO6_CM && !(e->fired & 16)) { e->fired |= 16; MV.seated++; } if (e->tfar) e->tfar += step; if (e->tfar6) e->tfar6 += step; continue; }
             e->fired &= (uint8_t)~16;
         }
+        /* (lane 73) HALTS: the measure of the live fault ("five steps, stop, go on"). A held man of a walking squad (SET's
+         * mark 1 or 2) whose host line is under MEN_HALT_MS old (the host's man moved a metre in that time) and who STANDS
+         * (realSpeed under 1): halts= counts each time he comes to a stand, haltms= / walkms= the time he stood / walked
+         * under such a line. Four times a second; in the status line, so also in a bug report of a real session. */
+        /* He stands: his realSpeed is under 1, OR he moved under MEN_LEAD_STILL cm/s between his last two places here
+         * (lane 52's dumps show realSpeed still at 15.62 on a man whose way was empty: the field alone may miss a stand). */
+        if ((e->flags & MF_HOLD) && (e->follow == 1 || e->follow == 2) && now - e->tset < MEN_HALT_MS) {
+            float real = 1.0f; int slow = 0;
+            __try { real = *(const float *)(e->a + 0x594); } __except (EXCEPTION_EXECUTE_HANDLER) { MV.faults++; e->flags &= (uint8_t)~MF_SANE; continue; }
+            if (e->tpos && now - e->tpos >= 200 && now - e->tpos < 2000)
+                slow = sqrt((q[0] - e->px) * (q[0] - e->px) + (q[1] - e->py) * (q[1] - e->py)) * 1000.0 / (double)(now - e->tpos) < MEN_LEAD_STILL;
+            if (real < 1.0f || slow) { if (!(e->fired & 32)) { e->fired |= 32; MV.halts++; } MV.haltms += step; }
+            else { e->fired &= (uint8_t)~32; MV.walkms += step; }
+        } else e->fired &= (uint8_t)~32;
         /* the 6 m check (the same rule: 2 s over 6 m and not 1.2 m closer in that time). A man on the move follows a
          * place that moves: only when he is also more than 0.8 s of his own speed from it (his speed from his last two
          * places here; a running man 8 m behind the place sent 6 m ahead of the host's man is beside him) */
@@ -779,6 +970,7 @@ static void men_landwatch(void)
             continue;
         }
         if (!e->pend) {
+            if (e->follow == 3) continue;   /* (lane 73) far-held: no FOREIGN dump */
             /* a held man whose path ends 15 m or more from the place he was last given, 1 s after it was given: someone
              * else wrote his path (FOREIGN; counted, the first MEN_RO_DUMPS written out with his requests of 60 s) */
             uint32_t last = e->tgo > e->tcall ? e->tgo : e->tcall;
@@ -850,5 +1042,10 @@ static void men_cmd(int argc, char **argv)
     if (argc == 3 && _stricmp(argv[1], "PACE") == 0 && on_off(argv[2], &v)) { MV.pace_off = !v; log_line("MEN PACE %s", v ? "on" : "off"); return; }
     if (argc == 3 && _stricmp(argv[1], "KEEP") == 0 && on_off(argv[2], &v)) { MV.keep_off = !v; log_line("MEN KEEP %s", v ? "on" : "off"); return; }
     if (argc == 3 && _stricmp(argv[1], "CATCH") == 0 && on_off(argv[2], &v)) { MV.catch_off = !v; log_line("MEN CATCH %s", v ? "on" : "off"); return; }
+    if (argc == 3 && _stricmp(argv[1], "LEAD") == 0) {   /* lane 73: host, the led point's time ahead (ms; 0 = off) */
+        char *end; unsigned long ms = strtoul(argv[2], &end, 10);
+        if (*end || end == argv[2] || ms > 5000) { MV.refused++; log_line("MEN LEAD refused: %s", argv[2]); return; }
+        MV.lead_ms = (uint32_t)ms; log_line("MEN LEAD %u ms", MV.lead_ms); return;
+    }
     log_line("MEN: unknown form"); MV.refused++;
 }

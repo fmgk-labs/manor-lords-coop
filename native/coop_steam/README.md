@@ -36,6 +36,13 @@ local tick = package.loadlib([[...\Scripts\coop_steam.dll]], "coop_steam_tick")
 pcall(tick)
 ```
 
+Since 0.5 (lane 65) there is a second export of the same shape, `coop_steam_flush`. The mod calls `coop_steam_tick`
+FIRST in its frame (what came over Steam is in the link files before the mod reads them) and `coop_steam_flush` LAST
+(it only reads this copy's own file and sends what waits), so a line received is read in the frame it came and a line
+the mod wrote leaves in the frame it was written. Before, the tick ran among the mod's modules: a frame later each way
+(about 60 ms a hop at 16 fps). The mock counts it: a host line to the friend's read 2 frames before, 1 after; a friend
+module's line to the host's read 3 before, 1 after (one frame of each is the mock's network).
+
 On the first call it does the following:
 
 - **Pins itself** (`GetModuleHandleExW` with `PIN`), so Lua can never unload it while Steam holds pointers to its
@@ -83,6 +90,19 @@ mirror file that is locked keeps its lines and up to 16 waiting turnovers until 
 but a friend's DLL older than 0.2 mirrors the `~NEXT` line without following it, and that friend's mod then waits for a
 file nobody writes: every player needs DLL 0.2 (it ships with the mod, which already demands one version for all).
 
+### File opens (0.5, lane 65; mock-tested only, NOT run in the game)
+
+On a friend's PC whose real-time scan checks every file opened after a write, each open of a link file cost
+milliseconds, and DLL 0.4 opened about 2 to 3 files a tick (the command file, the tail's file, the mirror file at every
+write, the log at every line). Since 0.5 a handle is kept while its file is in use and let go after 1 s without use
+(`HANDLE_IDLE_MS`), on a turnover, on a clear and on a failure. A tail without a handle looks at its file's attributes
+first (no open) and opens it only when the size changed; its read handle shares delete, so a writer that starts again
+can delete the file meanwhile (that file grows no more, and the handle is let go). A mirror's write handle does not share
+delete (nobody else deletes a mirror file); a write that fails keeps its lines and is tried again with a new handle (a
+part written is not written twice). The mock test counts the opens (`INFO file opens a second ...`): with a host's mod
+writing about 40 lines a second and a friend's one a second, 132 (host) and 173 (friend) opens a second at 62 ticks a
+second with 0.4, 0.2 and 0.2 with 0.5.
+
 ### Commands: `steam_cmd.txt`
 
 The mod appends one command per line. The DLL reads them from a stored offset and logs each one.
@@ -99,7 +119,7 @@ The mod appends one command per line. The DLL reads them from a stored offset an
 ### Status: `steam_status.txt`
 
 The DLL rewrites this file atomically (temp file, then `MoveFileEx` with replace) whenever its content changes, at
-most 10 times a second. It is UTF-8, with `\n` line ends.
+most 10 times a second; a change of the pings alone at most every 5 s (0.5). The mod reads it at most twice a second. It is UTF-8, with `\n` line ends.
 
 ```
 <state> <my steamid64> [state arguments]                  line 1, always
@@ -278,7 +298,7 @@ with MSVC 14.51 (VS 18 Community) using `/O2 /MT /W4 /WX /GS /std:c11`, with zer
 
 `dumpbin` on `out\coop_steam.dll` (built 2026-11-10):
 
-- **`/exports`:** one export, `coop_steam_tick`.
+- **`/exports`:** one export, `coop_steam_tick` (since 0.5 also `coop_steam_flush`).
 - **`/dependents`:** `KERNEL32.dll` and `bcrypt.dll` only. Both are Windows system DLLs, and there is no CRT DLL
   (`/MT`).
 

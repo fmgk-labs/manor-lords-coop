@@ -1,0 +1,8 @@
+# Known differences the owner accepted ("soft"): listed by the sweep as SOFT, they do not fail a release check.
+# One regular expression per line, matched against "<panel>\t<tab>\t<widget path>". Add a line only with the owner's
+# decision and its date; never for a difference whose cause is not known.
+#
+# A villager's task label a few seconds out of step with the host's (the owner, 2026-11-16, gate 0c: "villager a few s
+# out of step does not block v1 while stock, totals and population stay 100 %"). Seen in the first sweep (2026-11-18):
+# "Waiting" / "Going somewhere", "Debranching a Tree" / "Gathering", "Stocks goods for sale" / "Transporting".
+/Border:TaskOverlay#\d+/MLTextBlock:TaskText#\d+$

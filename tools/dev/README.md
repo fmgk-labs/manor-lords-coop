@@ -118,6 +118,35 @@ Logs: `$LK/host_log.txt`, `$LK/friend1_log.txt` (what was seen, sent, applied, r
 35 quarry, 59 fisherman, 72 storehouse, 79 livestock trader, 80 granary, 86 forester, 89 woodcutter, 91 / 93 stalls,
 97 small stable. It has no manor, no farm, no pasture, no tavern, no retinue.
 
+### A slow link and a slow friend (lane 73)
+
+Two test copies on one PC share the link folder: a line is read some tens of ms after it was written, and `up.sh` caps
+both copies at 15 frames a second. A real session over Steam is different (first one measured: 0.1 to 0.15 s each way,
+the host at 59 frames a second, one friend at 14 to 22; game speed 1). Two switches of the development build
+(`coop_dev.lua`, never in a zip for players) give a copy a slow link and its own frame cap. Both are files in the link
+folder (`$LK`), read every 2 s, one line per copy, `#` starts a comment, a line for the copy's own name wins over `*`:
+
+| file | line | what it does |
+|---|---|---|
+| `$LK/dev_linkdelay.txt` | `<name or *> <D ms> [<B ms> [<jitter ms>]]` | every line that copy READS from another copy's link file is held D ms (plus or minus the jitter) and let out at the next multiple of B ms: late and in bursts, in the order written. Every module gets its lines late. |
+| `$LK/dev_fps.txt` | `<name or *> <frames a second>` | that copy's `t.MaxFPS` (0 = no cap). |
+
+```bash
+printf 'friend1 150 100 30\nhost 150 100 30\n' > "$LK/dev_linkdelay.txt"       # the default test values: 150 ms each way, bursts every 0.1 s (a real Steam link)
+printf 'friend1 1000 500 100\nhost 1000 500 100\n' > "$LK/dev_linkdelay.txt"   # the stress case: 1 s each way, bursts every 0.5 s
+printf 'host 60\nfriend1 15\n' > "$LK/dev_fps.txt"                             # the host fast, the friend slow
+grep "dev: " "$LK/friend1_log.txt" | tail -3                                   # "dev: LINK DELAY on for friend1: ...", "dev: FRAME CAP ..."
+rm "$LK/dev_linkdelay.txt" "$LK/dev_fps.txt"                                   # off again (what is held comes out at once; no frame cap)
+```
+
+Only the reading side is delayed: `friend1 1000 500` alone delays host to friend; add a `host` line for friend to
+host. Run a walking test at game speed 1 as well as 4: at speed 1 a man moves 1.5 m a second and the men module's
+lines come a metre apart (the live stop-and-go march showed only there). What the link really did in a session is in
+a friend's log once a minute: `MEN link, last 60 s: round trip ... ms; this PC's clock is ... ms behind the host's; the
+host's men lines: ... ms old as they came; longest wait between two ...`. The host's `delay_ms=` (in `APPLIED` lines)
+is NOT the link's delay: it holds the difference of the two PCs' clocks (0.3 and 0.9 s in the first real session).
+Self-tests without the game: `mod/ManorLordsCoop/tests/lane73/t_linkdelay.lua`, `t_menlead.lua`.
+
 ## "Panel press": how a click is exercised without the pointer
 
 Find the shown widget by its object name and call the function a real click runs. Checked once against a real click:

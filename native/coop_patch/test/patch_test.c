@@ -234,6 +234,13 @@ typedef struct {
     size_t guide;                                                           /* lane 49: a "guide assignment" holding the GUIDE pattern */
     size_t fell;                                                            /* lane 54: a "tree lookup" and a "felling stroke" holding FELL's two patterns */
     size_t eh_end, eh_in, eh_out;                                           /* lane 49, round four: an end-task, a caller in the task steps, one outside */
+    size_t nd_die, nd_acc, nd_hunger, nd_accsite, nd_fire, nd_crush, nd_animal;                 /* lane 64: NODEATH (just_die, the accident, the five callers) */
+    size_t nd_bury, nd_bury_patch;                                                               /* ... and the burial chooser's test */
+    size_t nd_hunger_patch, nd_acc_patch, nd_fire_patch, nd_crush_patch, nd_animal_patch;       /* ... and each caller's patched bytes */
+    size_t hadd;                                                            /* lane 72: a "tracker add routine" with HADD's first bytes */
+    size_t cl_ent, cl_kill, cl_call;                                        /* lane 71: a "collapseBuilding" that runs, its death roll site, a caller of it */
+    size_t mr_day, mr_acc;                                                  /* lane 71: a "daily maintenance roll" and a "work accident" that run */
+    size_t fr_mk, fr_a, fr_b, fr_c, fr_sick;                                /* lane 71: a "person maker" that runs, three callers, the sickness roll */
 } img_t;
 
 typedef struct {
@@ -260,7 +267,13 @@ typedef struct {
     int pace;               /* lane 52 (last: some tests fill this record by position): 0 = no pace rule, 1 = one (both calls reach the lookup), 2 = its second call reaches another routine */
     int fell;               /* lane 54: 0 = neither FELL pattern, 1 = both, 2 = the lookup twice, 3 = a stroke that writes +1Ch, 4 = only the lookup */
     int endtask;            /* lane 49, round four: 0 = no ENDTASK, 1 = one (and two callers) */
+    int nodeath;            /* lane 64: 0 = none of NODEATH's routines, 1 = all, 2 = the fire routine's call reaches another routine, 3 = the hunger step's jump lies across an 8-byte block */
     int maint;              /* lane 67: 0 = none of MAINT's patterns, 1 = all three, 2 = MSTAT twice, 3 = a wear that writes +14h */
+    int hist;               /* lane 72: 0 = no HADD, 1 = one, 2 = two */
+    int collapse;           /* lane 71: 0 = no COLLAPSE patterns, 1 = both, 2 = the entry twice, 3 = only the entry */
+    int sprog;              /* lane 71: 0 = no SPROG pattern, 1 = one, 2 = two */
+    int mroll;              /* lane 71: 0 = no MROLL routines, 1 = both, 2 = the daily roll twice */
+    int famroll;            /* lane 71: 0 = no FAMROLL routines, 1 = both, 2 = the maker twice, 3 = no sickness roll */
 } opts_t;
 
 static void emit_hex(img_t *m, const char *s)
@@ -1116,6 +1129,33 @@ static void emit_fell(img_t *m, int variant)
     emit_hex(m, "C3");
 }
 
+/* lane 72: HIST TRYADD. The tracker's add routine with the game's first bytes (HADD: the prologue, the owner read at
+ * +90h and its null test), undone, then a jump to a C recorder; the null test's target (pattern end + 35h) holds a
+ * second copy of the same tail, so an owner of null also lands in the recorder. */
+static volatile LONG g_hadd_calls;
+static void *volatile g_hadd_t, *volatile g_hadd_w;
+static volatile int g_hadd_good, g_hadd_amt;
+__declspec(noinline) static void fake_hadd_impl(void *t, int good, int amount, void *w)
+{
+    InterlockedIncrement(&g_hadd_calls); g_hadd_t = t; g_hadd_good = good; g_hadd_amt = amount; g_hadd_w = w;
+}
+static void emit_hadd_tail(img_t *m)
+{
+    emit_hex(m, "48 83 C4 50 41 5F 41 5E 41 5D 41 5C 5F 5E 5D 48 8B 5C 24 18 48 B8");   /* add rsp,50h; pop r15..rbp; mov rbx,[rsp+18h] */
+    emit_imm64(m, (uint64_t)(uintptr_t)&fake_hadd_impl);
+    emit_hex(m, "FF E0");
+}
+static void emit_hadd(img_t *m)
+{
+    size_t end;
+    align_to(m, 16, 0); m->hadd = m->pos;
+    emit_hex(m, "48 89 5C 24 18 89 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 50 48 8B A9 90 00 00 00 45 33 FF 4D 8B F1 45 8B E0 44 8B D2 48 8B D9 48 85 ED 74 35");
+    end = m->pos;
+    emit_hadd_tail(m);
+    while (m->pos < end + 0x35) emit_u8(m, 0xCC);
+    emit_hadd_tail(m);
+}
+
 /* lane 49, round four: ENDHOLD. An end-task with the game's first bytes (ENDTASK) that sets the unit's task count
  * (+8A0h) to 0, and two callers of it (unit rcx): one the test names as the task steps' range, one outside it. */
 static void emit_endtask(img_t *m)
@@ -1123,11 +1163,159 @@ static void emit_endtask(img_t *m)
     size_t h;
     align_to(m, 16, 0); m->eh_end = m->pos;
     emit_hex(m, "4C 8B DC 55 56 49 8D 6B A1 48 81 EC B8 00 00 00 4D 89 6B D8 48 8B F1 45 33 ED C6 81 25 0D 00 00 00 41 8B C5 4C 89 6D 67 48 89 81 90 08 00 00");
-    emit_hex(m, "C7 81 A0 08 00 00 00 00 00 00 48 81 C4 B8 00 00 00 5E 5D C3");
+    /* (lane 71) r13 back from where the prologue saved it ([r11-28h] = [rsp+A0h]) before the epilogue: the prologue's
+     * "xor r13d,r13d" left the caller's r13 at 0 (a callee-saved register; in main() it held a constant 1 once lanes
+     * added scenarios, and every check after E1's last unhooked call read 0 for it) */
+    emit_hex(m, "C7 81 A0 08 00 00 00 00 00 00 4C 8B AC 24 A0 00 00 00 48 81 C4 B8 00 00 00 5E 5D C3");
     align_to(m, 16, 0); m->eh_in = m->pos;
     emit_hex(m, "48 83 EC 28 E8"); h = emit_rel_hole(m); fix_rel(m, h, m->eh_end); emit_hex(m, "48 83 C4 28 C3");
     align_to(m, 256, 0x90); m->eh_out = m->pos;
     emit_hex(m, "48 83 EC 28 E8"); h = emit_rel_hole(m); fix_rel(m, h, m->eh_end); emit_hex(m, "48 83 C4 28 C3");
+}
+
+/* lane 64: NODEATH. A just_die and a work accident with the game's first bytes (JUSTDIE, ACCIDENT), and five callers
+ * holding the five sites' exact bytes, each one runnable:
+ *   just_die(unit rcx)                 sets the unit's dead byte (+30Ch)
+ *   accident(unit rcx, edx, r8)        counts in the unit's first dword
+ *   hunger(family rcx, time rdx, region r8)   the day test, the lord's byte, then 2 = "the death roll is reached", 1 = not
+ *   accsite(unit rcx, record rdx)      a building's accident roll that has found its worker: calls accident
+ *   fire(unit rcx)                     fireDamage's end: just_die, returns 1 in al
+ *   crush(frame rcx)                   a collapse with [frame-41h] units inside: 2 = one is picked, 1 = nobody inside
+ *   animal(list rcx, count rdx)        the death list's loop: just_die for each
+ * Variant 2: fire's second call reaches the stub (another routine); variant 3: hunger's jne lies across a block. */
+static void emit_nodeath(img_t *m, int variant)
+{
+    size_t h, j1, j2, none, epi, slot;
+    align_to(m, 16, 0); m->nd_die = m->pos;
+    emit_hex(m, "48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 55 41 54 41 55 41 56 41 57 48 8B EC 48 81 EC 80 00 00 00 48 8B 05 00 00 00 00");
+    emit_hex(m, "C6 81 0C 03 00 00 01");                                                   /* mov byte [rcx+30Ch],1 */
+    emit_hex(m, "48 81 C4 80 00 00 00 41 5F 41 5E 41 5D 41 5C 5D 48 8B 5C 24 10 48 8B 74 24 18 48 8B 7C 24 20 C3");
+    align_to(m, 16, 0); m->nd_acc = m->pos;
+    emit_hex(m, "48 89 5C 24 10 48 89 6C 24 20 57 48 83 EC 60 49 8B E8 8B DA 48 8B F9 4D 85 C0 74 17 48 8D 91 E8 04 00 00");
+    emit_hex(m, "FF 07 48 83 C4 60 5F 48 8B 5C 24 10 48 8B 6C 24 20 C3");                  /* inc dword [rdi]; undo */
+    /* hunger: push r13 r14 r15; r15 = family, r14 = time, r13 = region; the site; mov eax,2 / 1 */
+    align_to(m, 8, variant == 3 ? 4 : 0); m->nd_hunger = m->pos;
+    emit_hex(m, "41 55 41 56 41 57 4C 8B F9 4C 8B F2 4D 8B E8");
+    emit_hex(m, "41 0F B6 47 2F 41 39 86 68 01 00 00");
+    m->nd_hunger_patch = m->pos;
+    emit_hex(m, "0F 85"); j1 = emit_rel_hole(m);
+    emit_hex(m, "49 8B 85 50 03 00 00 80 B8 09 0A 00 00 00 0F 85"); j2 = emit_rel_hole(m);
+    emit_hex(m, "B8 02 00 00 00 EB 05");
+    none = m->pos; emit_hex(m, "B8 01 00 00 00");
+    emit_hex(m, "41 5F 41 5E 41 5D C3");
+    fix_rel(m, j1, none); fix_rel(m, j2, none);
+    /* accsite: rdi = unit, rax = record, rsi = [rax+98h] (so the je is taken), the site, the call */
+    align_to(m, 8, 2); m->nd_accsite = m->pos;
+    emit_hex(m, "53 55 56 57 48 83 EC 28 48 8B F9 48 8B C2 48 8B B0 98 00 00 00");
+    emit_hex(m, "48 39 B0 98 00 00 00 74 0B 48 83 C3 08 48 3B DD 75 CF EB 10 4C 8B C6 BA 01 00 00 00 48 8B CF");
+    m->nd_acc_patch = m->pos;
+    emit_hex(m, "E8"); h = emit_rel_hole(m); fix_rel(m, h, m->nd_acc);
+    emit_hex(m, "48 83 C4 28 5F 5E 5D 5B C3");
+    /* fire: rbx = unit; [rbx+CE0h] is 0 (the first call is jumped over by the game's own je) */
+    align_to(m, 8, 6); m->nd_fire = m->pos;
+    emit_hex(m, "53 48 83 EC 20 48 8B D9");
+    emit_hex(m, "48 83 BB E0 0C 00 00 00 74 0A B2 01 48 8B CB E8"); h = emit_rel_hole(m); fix_rel(m, h, m->stub);
+    emit_hex(m, "48 8B CB");
+    m->nd_fire_patch = m->pos;
+    emit_hex(m, "E8"); h = emit_rel_hole(m); fix_rel(m, h, variant == 2 ? m->stub : m->nd_die);
+    emit_hex(m, "B0 01 48 83 C4 20 5B C3");
+    /* crush: rbp = frame, r13 = [rbp-31h] (so the first jne is not taken); "call [rip+..]" reaches the stub */
+    align_to(m, 16, 0); m->nd_crush = m->pos;
+    emit_hex(m, "53 55 41 55 48 8B E9 4C 8B 6D CF");
+    emit_hex(m, "4C 3B 6D CF 0F 85"); j1 = emit_rel_hole(m);
+    emit_hex(m, "8B 5D BF");
+    m->nd_crush_patch = m->pos;
+    emit_hex(m, "85 DB 0F 8E"); j2 = emit_rel_hole(m);
+    emit_hex(m, "FF 15"); slot = emit_rel_hole(m);
+    emit_hex(m, "25 FF 7F 00 00 66 0F 6E C3 B8 02 00 00 00 EB 05");
+    none = m->pos; emit_hex(m, "B8 01 00 00 00");
+    epi = m->pos; emit_hex(m, "41 5D 5D 5B C3");
+    fix_rel(m, j1, none); fix_rel(m, j2, none); (void)epi;
+    align_to(m, 8, 0); fix_rel(m, slot, m->pos); emit_imm64(m, (uint64_t)(uintptr_t)(m->text + m->stub));
+    /* animal: rbx = the list, rax = its count; the loop */
+    align_to(m, 8, 2); m->nd_animal = m->pos;
+    emit_hex(m, "53 57 48 83 EC 28 48 8B D9 48 8B C2");
+    emit_hex(m, "48 8D 3C C3 48 3B DF 74 16 90 48 8B 0B");
+    m->nd_animal_patch = m->pos;
+    emit_hex(m, "E8"); h = emit_rel_hole(m); fix_rel(m, h, m->nd_die);
+    emit_hex(m, "48 83 C3 08 48 3B DF 75 EF 0F 1F 40 00 48 83 C4 28 5F 5B C3");
+    /* bury(unit rcx): the unit's region at +328h, its corpse count at +500h: 2 = "a body to bury is looked for", 1 = none */
+    align_to(m, 8, 2); m->nd_bury = m->pos;
+    emit_hex(m, "48 8B 81 28 03 00 00 48 85 C0 0F 84"); j1 = emit_rel_hole(m);
+    emit_hex(m, "83 B8 00 05 00 00 00");
+    m->nd_bury_patch = m->pos;
+    emit_hex(m, "0F 84"); j2 = emit_rel_hole(m);
+    emit_hex(m, "48 8D 15 00 00 00 00 B8 02 00 00 00 C3");
+    none = m->pos; emit_hex(m, "B8 01 00 00 00 C3");
+    fix_rel(m, j1, none); fix_rel(m, j2, none);
+}
+
+/* lane 71: COLLAPSE. A collapseBuilding with the game's first bytes (COLLENT) that runs: its prologue, the building
+ * marked (+3A0h = 1), a call (to a ret), then an epilogue that undoes the prologue; and the death roll (CKILL) as dead
+ * code. Variant 2: the entry twice; 3: no death roll site. */
+static void emit_collapse(img_t *m, int variant)
+{
+    size_t r, h; int k;
+    align_to(m, 16, 0); r = m->pos; emit_hex(m, "C3");
+    for (k = 0; k < (variant == 2 ? 2 : 1); k++) {
+        align_to(m, 16, 0); if (k == 0) m->cl_ent = m->pos;
+        emit_hex(m, "48 89 5C 24 20 55 56 57 41 56 41 57 48 8D 6C 24 C9 48 81 EC D0 00 00 00 48 8B 05 00 00 00 00 48 33 C4 48 89 45 27 48 8B F1 C6 81 A0 03 00 00 01 8B 89 B8 03 00 00 E8");
+        h = emit_rel_hole(m); fix_rel(m, h, r);
+        emit_hex(m, "48 81 C4 D0 00 00 00 41 5F 41 5E 5F 5E 5D 48 8B 5C 24 20 C3");
+    }
+    align_to(m, 16, 0); m->cl_call = m->pos;                   /* a caller: sub rsp,28h; call collapseBuilding; add rsp,28h; ret */
+    emit_hex(m, "48 83 EC 28 E8"); h = emit_rel_hole(m); fix_rel(m, h, m->cl_ent); emit_hex(m, "48 83 C4 28 C3");
+    if (variant == 3) return;
+    align_to(m, 16, 0); m->cl_kill = m->pos;
+    emit_hex(m, "FF 15 00 00 00 00 4C 8B 65 A7 BA 64 00 00 00 25 FF 7F 00 00 4C 89 65 C7 66 0F 6E C8 0F B6 83 9C 02 00 00 0F 5B C9 F3 0F 59 0D 00 00 00 00 F3 0F 2C C9 3B CA 0F 4C D1 45 33 FF 3B D0 0F 8D 00 00 00 00 C3");
+}
+
+/* lane 71: SITEHP. getConstructionProgress's two sums over a building's parts (SPROG) as dead code */
+static void emit_sprog(img_t *m, int variant)
+{
+    int k;
+    for (k = 0; k < variant; k++) {
+        align_to(m, 16, 0);
+        emit_hex(m, "48 8B 8E F8 02 00 00 0F 57 C9 48 63 86 00 03 00 00 48 8B D1 66 0F 5A D6 4C 8D 04 C1 49 3B C8 74 3D 66 0F 1F 84 00 00 00 00 00 48 8B 02 48 83 C2 08 F3 0F 58 80 14 03 00 00 49 3B D0 75 EC 0F 1F 40 00 0F 1F 84 00 00 00 00 00 48 8B 01 48 83 C1 08 F3 0F 58 88 18 03 00 00 C3");
+    }
+}
+
+/* lane 71: MROLL. A daily maintenance roll with the game's first bytes (MRDAY) that marks its building (+FA0h = 1), and
+ * a work accident (MRACC) that sets its worker's dead byte (+30Ch) to the building's byte +10h; both run (prologue, a
+ * call to a ret, the mark, an epilogue that undoes the prologue). Variant 2: the roll twice. */
+static void emit_mroll(img_t *m, int variant)
+{
+    size_t r, h; int k;
+    align_to(m, 16, 0); r = m->pos; emit_hex(m, "C3");
+    for (k = 0; k < (variant == 2 ? 2 : 1); k++) {
+        align_to(m, 16, 0); if (k == 0) m->mr_day = m->pos;
+        emit_hex(m, "48 89 5C 24 18 48 89 74 24 20 57 48 83 EC 30 48 8B F1 48 8B 89 48 03 00 00 E8");
+        h = emit_rel_hole(m); fix_rel(m, h, r);
+        emit_hex(m, "0F B6 F8 8B CF 83 E9 01 0F 84 00 00 00 00 C6 86 A0 0F 00 00 01 48 83 C4 30 5F 48 8B 5C 24 18 48 8B 74 24 20 C3");
+    }
+    align_to(m, 16, 0); m->mr_acc = m->pos;
+    emit_hex(m, "48 89 5C 24 10 48 89 6C 24 20 57 48 83 EC 60 49 8B E8 8B DA 48 8B F9 4D 85 C0 74 17 48 8D 91 E8 04 00 00 49 8B C8 E8");
+    h = emit_rel_hole(m); fix_rel(m, h, r);
+    emit_hex(m, "48 85 ED 74 09 8A 45 10 88 87 0C 03 00 00 48 83 C4 60 5F 48 8B 5C 24 10 48 8B 6C 24 20 C3");   /* (with no building the pattern's je lands on the dead-byte write: the test reads only the note) */
+}
+
+/* lane 71: FAMROLL. A person maker with the game's first bytes (GROWMK) that marks its region (+100h = 1) and returns
+ * it, three callers of it (sub rsp,28h; call; add rsp,28h; ret), and the sickness roll (SICKROLL) as dead code.
+ * Variant 2: the maker twice; 3: no sickness roll. */
+static void emit_famroll(img_t *m, int variant)
+{
+    size_t h; int k;
+    for (k = 0; k < (variant == 2 ? 2 : 1); k++) {
+        align_to(m, 16, 0); if (k == 0) m->fr_mk = m->pos;
+        emit_hex(m, "48 89 5C 24 10 44 88 44 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 D0 48 81 EC 30 01 00 00 F3 0F 10 15 00 00 00 00 49 8D B1 F8 03 00 00");
+        emit_hex(m, "C6 81 00 01 00 00 01 48 8B C1 48 81 C4 30 01 00 00 41 5F 41 5E 41 5D 41 5C 5F 5E 5D 48 8B 5C 24 10 C3");
+    }
+    align_to(m, 16, 0); m->fr_a = m->pos; emit_hex(m, "48 83 EC 28 E8"); h = emit_rel_hole(m); fix_rel(m, h, m->fr_mk); emit_hex(m, "48 83 C4 28 C3");
+    align_to(m, 16, 0); m->fr_b = m->pos; emit_hex(m, "48 83 EC 28 E8"); h = emit_rel_hole(m); fix_rel(m, h, m->fr_mk); emit_hex(m, "48 83 C4 28 C3");
+    align_to(m, 16, 0); m->fr_c = m->pos; emit_hex(m, "48 83 EC 28 E8"); h = emit_rel_hole(m); fix_rel(m, h, m->fr_mk); emit_hex(m, "48 83 C4 28 C3");
+    if (variant == 3) return;
+    align_to(m, 16, 0); m->fr_sick = m->pos;
+    emit_hex(m, "FF 15 00 00 00 00 25 FF 7F 00 00 66 0F 6E C0 B8 1E 00 00 00 0F 5B C0 F3 41 0F 59 C4 F3 0F 2C C8 3B C8 0F 4C C1 85 C0 75 18 49 83 BE 60 01 00 00 1E C3");
 }
 
 static img_t *build_image(const opts_t *o)
@@ -1196,7 +1384,13 @@ static img_t *build_image(const opts_t *o)
         if (o->endtask) emit_endtask(m);                        /* lane 49, round four */
         if (o->guide) { emit_guide(m, o->guide); if (o->guide == 2) { size_t keep = m->guide; emit_guide(m, 1); m->guide = keep; } }   /* lane 49 */
         if (o->fell) emit_fell(m, o->fell);         /* lane 54 */
+        if (o->nodeath) emit_nodeath(m, o->nodeath);   /* lane 64 */
         if (o->maint) emit_maint(m, o->maint);      /* lane 67 */
+        if (o->hist) { emit_hadd(m); if (o->hist == 2) { size_t keep = m->hadd; emit_hadd(m); m->hadd = keep; } }   /* lane 72 */
+        if (o->collapse) emit_collapse(m, o->collapse);   /* lane 71 */
+        if (o->sprog) emit_sprog(m, o->sprog);              /* lane 71 */
+        if (o->mroll) emit_mroll(m, o->mroll);              /* lane 71 */
+        if (o->famroll) emit_famroll(m, o->famroll);        /* lane 71 */
         if (m->pos > TEXT_SIZE - 0x100) { printf("synthetic .text too small (%Iu bytes used)\n", m->pos); exit(3); }
     }
     memcpy(m->snapshot, m->text, TEXT_SIZE);
@@ -3124,6 +3318,11 @@ int main(void)
             *(float *)(pl + 1 * FL_PLANT + 0x24) = 0.5f;            /* a change that reaches no count */
             Sleep(2100); g_tick(NULL); cmd("STATUS");
             check(*(float *)(pl + 1 * FL_PLANT + 0x24) == 0.25f + stp && status_has(" leaks=1 "), "the audit finds a change that reached no count and puts it back");
+            check(status_has(" cachefix=0"), "lane 71: the counted numbers equal the host's: the audit writes none");
+            *(int32_t *)(fb + 0x4DC) = 2;                             /* lane 71: this copy's own field routine set the mode outside the count */
+            Sleep(600); g_tick(NULL); cmd("STATUS");
+            check(*(int32_t *)(fb + 0x4DC) == 0 && *(int32_t *)(fb + 0xBF4) == 5 && status_has(" cachefix=1"),
+                  "lane 71: the audit puts the host's counted numbers back (the operation mode written outside UpdateFieldCache)");
             cmd("FIELD SET 12345 4 0=1.0.0.0.0.0"); cmd("FIELD SET %llu 4 0=bad", (unsigned long long)(uintptr_t)fb); cmd("FIELD HOLD 8"); cmd("STATUS");
             check(status_has(" refused=3 "), "a field that is not held, a bad record and a bad address are refused");
             /* host side */
@@ -3481,6 +3680,48 @@ int main(void)
                     check(strcmp(out, line) == 0, "a way that is used up: the place alone");
                     *(uint8_t **)(mc + 0x7D0) = NULL; *(int32_t *)(mc + 0x7D8) = 0; *(int32_t *)(mc + 0x7E0) = 0; rp[1] = keep1; cmd("MEN POLL");
                 }
+                {   /* (lane 73) LEAD: with MEN LEAD <ms> a moving man's line also names the point of his own way he reaches
+                     * in that time (along the way's points, never past the last) and his speed; a man who stopped is written at once */
+                    static uint8_t way3[3 * 0x88]; double x0 = rp[0], y0 = rp[1], lx = 0, ly = 0, lz = 0, lv = 0; int le = -1, k; const char *L;
+                    memset(way3, 0, sizeof(way3));
+                    ((double *)(way3 + 8))[0] = x0 + 100; ((double *)(way3 + 8))[1] = y0; ((double *)(way3 + 8))[2] = 300;
+                    ((double *)(way3 + 0x88 + 8))[0] = x0 + 500; ((double *)(way3 + 0x88 + 8))[1] = y0; ((double *)(way3 + 0x88 + 8))[2] = 300;
+                    ((double *)(way3 + 2 * 0x88 + 8))[0] = x0 + 500; ((double *)(way3 + 2 * 0x88 + 8))[1] = y0 + 2000; ((double *)(way3 + 2 * 0x88 + 8))[2] = 400;
+                    *(uint8_t **)(mc + 0x7D0) = way3; *(int32_t *)(mc + 0x7D8) = 3; *(int32_t *)(mc + 0x7E0) = 1;
+                    cmd("MEN LEAD 9999"); cmd("MEN LEAD x"); cmd("STATUS");
+                    check(status_has(" lead=0 leads=0 stills=0 "), "MEN LEAD over 5000 ms, or no number: refused");
+                    cmd("MEN LEAD 2000"); cmd("STATUS");
+                    check(status_has(" lead=2000 "), "MEN LEAD 2000");
+                    rp[0] = x0 + 150; cmd("MEN POLL"); out = read_file(outp);
+                    _snprintf(line, sizeof(line), "H %IX %.0f %.0f %.0f %.0f %.0f\r\n", Cm, rp[0], rp[1], rp[2], x0 + 500, y0);
+                    check(strcmp(out, line) == 0, "LEAD: his speed is not known at the first look: the line of before");
+                    Sleep(250); rp[0] = x0 + 300; cmd("MEN POLL"); out = read_file(outp);
+                    L = strstr(out, " L "); k = L ? sscanf(L, " L %lf %lf %lf %lf %d", &lx, &ly, &lz, &lv, &le) : 0;
+                    /* 1.5 m in about 250 ms: about 600 cm/s, 12 m in 2 s: 2 m to the way's second point, the rest up the third leg */
+                    check(k == 5 && lv > 450 && lv < 650 && le == 0 && lx == x0 + 500 && fabs(ly - (y0 + lv * 2.0 - 200.0)) <= 2.0 && lz > 300 && lz < 400,
+                          "LEAD: the led point lies along his way's points, round the bend, his speed x 2 s ahead; his speed is on the line");
+                    Sleep(250); *(int32_t *)(mc + 0x7E0) = 2; rp[0] = x0 + 500; rp[1] = y0 + 1900; cmd("MEN POLL"); out = read_file(outp);
+                    L = strstr(out, " L "); k = L ? sscanf(L, " L %lf %lf %lf %lf %d", &lx, &ly, &lz, &lv, &le) : 0;
+                    check(k == 5 && le == 1 && lx == x0 + 500 && ly == y0 + 2000 && lz == 400, "LEAD: never past his way's last point (marked as its end)");
+                    Sleep(250); rp[1] = y0 + 1912; cmd("MEN POLL"); out = read_file(outp);
+                    check(out[0] == 0, "LEAD: moved 12 cm at 48 cm/s: he still walks, nothing written under a metre");
+                    Sleep(250); cmd("MEN POLL"); out = read_file(outp);
+                    check(out[0] == 0, "LEAD: still at one look (held up for a moment): not a stop yet");
+                    Sleep(250); cmd("MEN POLL"); out = read_file(outp);
+                    _snprintf(line, sizeof(line), "H %IX %.0f %.0f %.0f S\r\n", Cm, rp[0], rp[1], rp[2]);
+                    check(strcmp(out, line) == 0, "LEAD: still at two looks: he stopped: written at once, where he stands (S), though he moved under a metre");
+                    Sleep(250); cmd("MEN POLL"); out = read_file(outp); cmd("STATUS");
+                    check(out[0] == 0 && status_has(" lead=2000 leads=2 stills=1 "), "LEAD: his stop is written once");
+                    MV_CALL(Cm, 500, 600, 830); cmd("MEN POLL"); out = read_file(outp);
+                    _snprintf(line, sizeof(line), "%IX 500 600 830\r\n", Cm);
+                    check(strcmp(out, line) == 0, "LEAD: a man at rest: his asked place (his slot) is written when it moved 10 cm, not only after 50");
+                    MV_CALL(Cm, 500, 600, 833); cmd("MEN POLL"); out = read_file(outp);
+                    check(out[0] == 0, "LEAD: moved 3 cm: not written");
+                    cmd("MEN LEAD 0"); Sleep(250); rp[1] = y0 + 1500; cmd("MEN POLL"); out = read_file(outp);
+                    _snprintf(line, sizeof(line), "H %IX %.0f %.0f %.0f %.0f %.0f\r\n", Cm, rp[0], rp[1], rp[2], x0 + 500, y0 + 2000);
+                    check(strcmp(out, line) == 0, "MEN LEAD 0: the line of before");
+                    *(uint8_t **)(mc + 0x7D0) = NULL; *(int32_t *)(mc + 0x7D8) = 0; *(int32_t *)(mc + 0x7E0) = 0; rp[0] = x0; rp[1] = y0; cmd("MEN POLL");
+                }
                 { uint64_t qn = 0x7FF8000000000000ull; memcpy(&rp[0], &qn, 8); }   /* a quiet NaN */
                 rp[1] = 5000; cmd("MEN POLL"); out = read_file(outp); cmd("STATUS");
                 check(out[0] == 0 && status_has(" herebad=1 "), "a place that is no number is not written");
@@ -3686,7 +3927,7 @@ int main(void)
                 check(*fb == 1.0f, "MEN CATCH OFF: 1");
                 cmd("MEN CATCH ON"); cmd("MEN SET %IX=5,5,5", B); pace((void *)0x1234, 78);
                 check(*fb == 1.0f, "a SET without the mark: a place he asked for again");
-                cmd("MEN SET %IX=5,5,5,3;%IX=5,5,5,1,1", B, B); cmd("STATUS");
+                cmd("MEN SET %IX=5,5,5,4;%IX=5,5,5,1,1", B, B); cmd("STATUS");   /* (lane 73: ",3" is the far-held mark now) */
                 check(status_has(" refused=2 "), "a SET with another fourth value is refused");
                 /* MUSTER (",2"): his pace is this rule's alone, also over a 3 and over the rule's mark; up to 3 */
                 bp[0] = 5; cmd("MEN SET %IX=5,5,5,2", B); g_pc_give = 3.0f; pace((void *)0x1234, 78); cmd("STATUS");
@@ -3697,6 +3938,87 @@ int main(void)
                 check(*fb == 2.0f, "2.5 m from his place: 2");
                 bp[0] = 5 + 3000; pace((void *)0x1234, 78);
                 check(*fb == 3.0f, "30 m from it: 3, no more");
+                {   /* (lane 73) LEAD: SET <led point>,<1|2>,<the host's man's place x,y>,<his speed>. He walks to the led point;
+                     * his pace is held to the host's man's place; a new led point is given only near his way's end or at a bend */
+                    LONG c0;
+                    g_pc_give = 0.5f; bp[0] = 5; bp[1] = 5;
+                    c0 = g_mp_calls; cmd("MEN SET %IX=1005,5,5,1,205,5,0", B); cmd("STATUS");
+                    check(g_mp_calls == c0 + 1 && g_mp_man == mb && g_mp_pt[0] == 1005 && g_mp_pt[1] == 5 && status_has(" leadsets=1 leadgos=1 "),
+                          "LEAD SET: the man is given the LED point (10 m ahead), not the host's man's place");
+                    pace((void *)0x1234, 78);
+                    check(*fb == 1.375f, "LEAD pace: 2 m more way left than the host's man has: 1.375 (behind: faster)");
+                    bp[0] = 5 + 200; pace((void *)0x1234, 78);
+                    check(*fb == 1.0f, "LEAD pace: as far from the led point as the host's man: 1");
+                    bp[0] = 5 + 325; pace((void *)0x1234, 78); cmd("STATUS");
+                    check(*fb == 0.75f && status_has(" slowed=1"), "LEAD pace: 1.25 m AHEAD of the host's man: 0.75 (slower: he does not run to the point and stand)");
+                    bp[0] = 5 + 900; pace((void *)0x1234, 78);
+                    check(*fb == 0.5f, "LEAD pace: far ahead: 0.5, no less");
+                    bp[0] = 5 + 200;
+                    c0 = g_mp_calls; cmd("MEN SET %IX=1105,5,5,1,305,5,100", B); cmd("STATUS");
+                    check(g_mp_calls == c0 && status_has(" leadsets=2 leadgos=1 leadturns=0 leadkeeps=1 "),
+                          "LEAD SET: a led point further on the same straight way, 8 m of way left: not given again (his way is not emptied)");
+                    bp[0] = 5 + 850;
+                    c0 = g_mp_calls; cmd("MEN SET %IX=1205,5,5,1,405,5,100", B); cmd("STATUS");
+                    check(g_mp_calls == c0 + 1 && g_mp_pt[0] == 1205 && status_has(" leadgos=2 leadturns=0 leadkeeps=1 "),
+                          "LEAD SET: 1.5 m from the end of the way he has (under the host's man's 1 s and 1 m): the new point is given");
+                    bp[0] = 5 + 300;
+                    c0 = g_mp_calls; cmd("MEN SET %IX=1205,905,5,1,405,105,100", B); cmd("STATUS");
+                    check(g_mp_calls == c0 + 1 && g_mp_pt[0] == 1205 && g_mp_pt[1] == 905 && status_has(" leadgos=3 leadturns=1 "),
+                          "LEAD SET: the point he walks to is off the straight way to the new one (a bend): given at once");
+                    c0 = g_mp_calls; cmd("MEN SET %IX=1205,905,5,1,455,155,100", B);
+                    check(g_mp_calls == c0, "LEAD SET: the same led point again: nothing");
+                    c0 = g_mp_calls; cmd("MEN SET %IX=605,305,5,1,605,305,0", B);
+                    check(g_mp_calls == c0 + 1 && g_mp_pt[0] == 605 && g_mp_pt[1] == 305, "LEAD SET: the host's man halted short of the old point (the new one lies before it): given at once");
+                    {   /* HALTS: a held man of a walking squad who stands under a fresh host line is counted (the live fault's measure) */
+                        long h0, w0;
+                        bp[0] = 5; bp[1] = 5; *(float *)(mb + 0x594) = 0.0f;
+                        cmd("MEN SET %IX=1005,5,5,1,205,5,100", B); Sleep(300); g_tick(NULL);
+                        cmd("MEN SET %IX=1005,5,5,1,205,5,100", B); Sleep(300); g_tick(NULL); cmd("STATUS");
+                        check(status_has(" halts=1 ") && status_val(" haltms=") >= 250, "HALTS: he stands while the host's man walks: counted once, the time he stands adds up");
+                        *(float *)(mb + 0x594) = 15.0f; cmd("MEN SET %IX=1005,5,5,1,205,5,100", B); Sleep(300); bp[0] = 5 + 100; g_tick(NULL); cmd("STATUS");
+                        check(status_has(" halts=1 ") && status_val(" walkms=") >= 250, "HALTS: he walks (his speed 15, a metre on): the time he walks adds up");
+                        cmd("MEN SET %IX=1005,5,5,1,205,5,100", B); Sleep(300); g_tick(NULL); cmd("STATUS");
+                        check(status_has(" halts=2 "), "HALTS: his speed still reads 15 but he did not move: a stand, counted again");
+                        *(float *)(mb + 0x594) = 0.0f; bp[0] = 5;
+                        h0 = status_val(" haltms="); w0 = status_val(" walkms="); Sleep(1300); g_tick(NULL); cmd("STATUS");
+                        check(status_has(" halts=2 ") && status_val(" haltms=") == h0 && status_val(" walkms=") == w0, "HALTS: no host line for 1.2 s (the host's man stands): not counted");
+                    }
+                    cmd("MEN SET %IX=1005,5,5,2,205,5,0", B); bp[0] = 5 + 600; bp[1] = 5; g_pc_give = 3.0f; pace((void *)0x1234, 78);
+                    check(*fb == 0.5f, "LEAD pace, a muster's man (,2): 4 m ahead: 0.5, also where the rule said 3");
+                    bp[0] = 5 - 350; g_pc_give = 0.5f; pace((void *)0x1234, 78);
+                    check(*fb == 3.0f, "LEAD pace, a muster's man: 5.5 m behind: 3, no more");
+                    cmd("STATUS"); c0 = g_mp_calls;
+                    cmd("MEN SET %IX=7,7,7,1,1,2;%IX=7,7,7,1,1,2,x;%IX=7,7,7,1,1,2,-3;%IX=7,7,7,1,,2,3", B, B, B, B);
+                    check(g_mp_calls == c0, "LEAD SET: two values, a letter, a speed under 0, an empty value: refused, nothing given");
+                    bp[0] = 5 + 150; cmd("MEN SET %IX=5,5,5,1", B); pace((void *)0x1234, 78);
+                    check(*fb == 1.25f, "a SET without the host's man's place: the catch-up of before (1.5 m from his place: 1.25)");
+                    /* the rule learns the host's pace: a gap that lasts moves a bias on the factor */
+                    bp[0] = 5; cmd("MEN SET %IX=1005,5,5,1,205,5,0", B); pace((void *)0x1234, 78);
+                    check(*fb == 1.375f, "LEAD pace, a man led anew: no bias yet (2 m behind: 1.375)");
+                    Sleep(200); pace((void *)0x1234, 78);
+                    check(*fb > 1.40f && *fb < 1.45f, "LEAD pace: 2 m behind for 0.2 s: the factor has grown by about 0.05 (the bias)");
+                    bp[0] = 5 + 325; Sleep(200); pace((void *)0x1234, 78);
+                    check(*fb > 0.75f && *fb < 0.80f, "LEAD pace: then 1.25 m ahead: 0.75 and what is left of the bias, which unwinds");
+                }
+                {   /* (lane 73) FAR (",3"): a free merchant held to his path's end, far away: held like any man, but the pace rule,
+                     * the run-off check, REGO and the halt count leave him alone */
+                    LONG c0; long ro0, r60, rg0, h0;
+                    bp[0] = 5; bp[1] = 5; g_pc_give = 0.5f; cmd("MEN REGO ON");
+                    c0 = g_mp_calls; cmd("MEN SET %IX=90005,5,5,3", B); cmd("STATUS");
+                    check(g_mp_calls == c0 + 1 && g_mp_man == mb && g_mp_pt[0] == 90005 && status_has(" fars=1") && status_has("held=1 "), "FAR SET: held, and given the far place at once");
+                    pace((void *)0x1234, 78);
+                    check(*fb == 0.5f, "FAR: the pace rule's own value stands (not 1, no catch-up)");
+                    ro0 = status_val(" runoffs="); r60 = status_val(" ro6="); rg0 = status_val(" regos="); h0 = status_val(" halts=");
+                    g_tick(NULL); Sleep(1200); g_tick(NULL); Sleep(1200); c0 = g_mp_calls; g_tick(NULL); cmd("STATUS");
+                    check(status_val(" runoffs=") == ro0 && status_val(" ro6=") == r60 && status_val(" regos=") == rg0 && status_val(" halts=") == h0 && g_mp_calls == c0,
+                          "FAR: 900 m from his place, standing 2.4 s: no run-off, no REGO, no halt counted");
+                    mb[0xE3C] = 1; c0 = g_mp_calls; cmd("MEN SET %IX=80005,5,5,3", B);
+                    check(g_mp_calls == c0, "FAR: he is busy: the new place is not given yet");
+                    mb[0xE3C] = 0; g_tick(NULL);
+                    check(g_mp_calls == c0 + 1 && g_mp_pt[0] == 80005, "FAR: given the moment he is free (he is still in the table: before, a merchant was taken out a line later and that GO was lost)");
+                    c0 = g_mp_calls; cmd("MEN SET %IX=70005,5,5,3,1,2,3", B);
+                    check(g_mp_calls == c0, "FAR SET with a host's place after it: refused");
+                }
                 cmd("MEN SET %IX=5,5,5", B); g_pc_give = 0.5f;
                 bp[0] = 5; cmd("MEN HEREAT 0");
             }
@@ -4247,6 +4569,108 @@ int main(void)
         start("E3: ENDHOLD without setTask's signature", m, NULL, NULL, NULL);
         check(status_line("ENDHOLD unavailable SETTASK signature has 0 hits", 0), "ENDHOLD unavailable without setTask");
     }
+    /* ======================================================== ND: NODEATH, nobody dies by a friend's own game (lane 64) */
+    {
+        static __declspec(align(16)) uint8_t unit[0x1000], unit2[0x1000], fam[0x80], tm[0x200], reg[0x400], lord[0x1000], rec[0x100], frame[0x100], breg[0x600], bunit[0x400];
+        opts_t o = { 1 };
+        img_t *m;
+        typedef int (*hunger_fn)(void *fam, void *tm, void *reg);
+        typedef void (*acc_fn)(void *u, void *rec);
+        typedef unsigned char (*fire_fn)(void *u);
+        typedef int (*crush_fn)(void *frame);
+        typedef void (*animal_fn)(void **list, uint64_t n);
+        typedef void (*die_fn)(void *u);
+        typedef int (*bury_fn)(void *u);
+        bury_fn bury; void *bregp = breg;
+        hunger_fn hunger; acc_fn acc; fire_fn fire; crush_fn crush; animal_fn animal; die_fn die;
+        void *list[2]; void *lordp = lord; uint64_t ndb = 0x7FF00077000ull;
+        unsigned char al;
+        o.known = 1; o.nodeath = 1;
+        m = build_image(&o);
+        hunger = (hunger_fn)(void *)(m->text + m->nd_hunger); acc = (acc_fn)(void *)(m->text + m->nd_accsite);
+        fire = (fire_fn)(void *)(m->text + m->nd_fire); crush = (crush_fn)(void *)(m->text + m->nd_crush);
+        animal = (animal_fn)(void *)(m->text + m->nd_animal); die = (die_fn)(void *)(m->text + m->nd_die);
+        list[0] = unit; list[1] = unit2;
+        bury = (bury_fn)(void *)(m->text + m->nd_bury); memcpy(bunit + 0x328, &bregp, 8); *(int32_t *)(breg + 0x500) = 2;      /* two bodies in the unit's region */
+        fam[0x2F] = 7; *(int32_t *)(tm + 0x168) = 7; memcpy(reg + 0x350, &lordp, 8); lord[0xA09] = 0;      /* today is the family's day of the month */
+        memcpy(rec + 0x98, &ndb, 8);
+        *(int32_t *)(frame + 0x80 - 0x41) = 3;                                                              /* three units inside */
+#define ND_CLEAR() do { memset(unit, 0, sizeof(unit)); memset(unit2, 0, sizeof(unit2)); } while (0)
+        start("ND1: NODEATH (the six sites)", m, NULL, NULL, NULL);
+        check(status_line("NODEATH off hunger=off accident=off fire=off crush=off animal=off bury=off refused=0", 1), "NODEATH found: six sites, each once, its own bytes, the calls' targets, off");
+        ND_CLEAR();
+        check(hunger(fam, tm, reg) == 2, "(the game's own) on the family's day the death roll of hunger and cold is reached");
+        acc(unit, rec); check(*(int32_t *)unit == 1, "(the game's own) a building's accident roll calls the accident routine for its worker");
+        ND_CLEAR(); al = fire(unit); check(unit[0x30C] == 1 && al == 1, "(the game's own) a unit at health 0 in a fire dies");
+        check(crush(frame + 0x80) == 2, "(the game's own) a collapsing building picks one of the units inside");
+        ND_CLEAR(); animal(list, 2); check(unit[0x30C] == 1 && unit2[0x30C] == 1, "(the game's own) the animals' death list is carried out");
+        check(bury(bunit) == 2, "(the game's own) with bodies in the region a villager looks for one to bury");
+        cmd("NODEATH ON"); cmd("STATUS");
+        check(status_line("NODEATH on hunger=on accident=on fire=on crush=on animal=on bury=on refused=0", 1), "NODEATH ON: all six on");
+        check(bytes_are(m->text + m->nd_bury_patch, "90 E9") && bury(bunit) == 1, "on: a villager finds no body to bury (90 E9; the routine leaves by its own way out)");
+        check(bytes_are(m->text + m->nd_hunger_patch, "90 E9") && bytes_are(m->text + m->nd_acc_patch, "EB 03") && bytes_are(m->text + m->nd_fire_patch, "EB 03") &&
+              bytes_are(m->text + m->nd_crush_patch, "31") && bytes_are(m->text + m->nd_animal_patch, "EB 03"), "the five patches: 90 E9, EB 03, EB 03, 31, EB 03");
+        ND_CLEAR();
+        check(hunger(fam, tm, reg) == 1, "on: the death roll of hunger and cold is not reached on the family's day");
+        fam[0x2F] = 8; check(hunger(fam, tm, reg) == 1, "on: nor on another day"); fam[0x2F] = 7;
+        acc(unit, rec); check(*(int32_t *)unit == 0, "on: the accident routine is not called (no death, no injury, no notice)");
+        ND_CLEAR(); al = fire(unit); check(unit[0x30C] == 0 && al == 1, "on: a unit at health 0 in a fire lives; the routine still returns 1");
+        check(crush(frame + 0x80) == 1, "on: a collapsing building finds nobody inside");
+        ND_CLEAR(); animal(list, 2); check(unit[0x30C] == 0 && unit2[0x30C] == 0, "on: the animals' death list is walked, nobody dies");
+        die(unit); check(unit[0x30C] == 1, "on: just_die itself is untouched (the host's word reaches it through the reflected function)");
+        cmd("NODEATH ON"); cmd("STATUS");
+        check(status_line("NODEATH on hunger=on", 0) && status_has("refused=0"), "NODEATH ON twice: nothing changes");
+        cmd("NODEATH OFF"); cmd("STATUS");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0 && status_line("NODEATH off hunger=off", 0), "NODEATH OFF: .text byte-identical, all six off");
+        ND_CLEAR();
+        check(hunger(fam, tm, reg) == 2 && crush(frame + 0x80) == 2 && bury(bunit) == 2, "off: the game's own rolls and the burial are back");
+        al = fire(unit); check(unit[0x30C] == 1, "off: the fire kills again");
+        cmd("NODEATH MAYBE"); cmd("NODEATH"); cmd("STATUS");
+        check(status_has("refused=2"), "2 bad forms refused");
+        cmd("NODEATH ON"); cmd("ALLOFF"); cmd("STATUS");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0 && status_line("NODEATH off hunger=off", 0), "ALLOFF: .text byte-identical, NODEATH off");
+    }
+    {
+        static __declspec(align(16)) uint8_t unit[0x1000];
+        opts_t o = { 1 };
+        img_t *m;
+        typedef unsigned char (*fire_fn)(void *u);
+        o.nodeath = 2;                          /* not the known build: the signatures decide, as for P1 */
+        m = build_image(&o);
+        start("ND2: the fire routine's call reaches another routine (and another game build)", m, NULL, NULL, NULL);
+        check(status_line("NODEATH off hunger=off accident=off fire=na crush=off animal=off", 0), "five sites found on another build; the fire site is not taken");
+        cmd("NODEATH ON"); cmd("STATUS");
+        check(status_line("NODEATH part hunger=on accident=on fire=na crush=on animal=on", 0), "NODEATH ON: 'part', five on");
+        check(memcmp(m->text + m->nd_fire, m->snapshot + m->nd_fire, 0x30) == 0, "nothing written at the fire routine");
+        memset(unit, 0, sizeof(unit)); ((fire_fn)(void *)(m->text + m->nd_fire))(unit);
+        check(unit[0x30C] == 0, "(that routine's call goes elsewhere, as built)");
+        cmd("ALLOFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ALLOFF: .text byte-identical");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.nodeath = 3;
+        m = build_image(&o);
+        start("ND3: the hunger step's jump lies across an aligned 8-byte block", m, NULL, NULL, NULL);
+        check(status_line("NODEATH off hunger=na accident=off", 0), "the hunger site is not taken (a write there could not be one atomic store)");
+        check(strstr(read_file(g_log), "crosses an 8-byte block") != NULL, "the log says why");
+        cmd("NODEATH ON"); cmd("STATUS");
+        check(status_line("NODEATH part hunger=na accident=on fire=on crush=on animal=on", 0) && bytes_are(m->text + m->nd_hunger_patch, "0F 85"), "ON: the other four; the jump keeps its bytes");
+        cmd("NODEATH OFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "OFF: .text byte-identical");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1;
+        m = build_image(&o);
+        start("ND4: none of NODEATH's routines in the module", m, NULL, NULL, NULL);
+        check(status_line("NODEATH unavailable hunger=na accident=na fire=na crush=na animal=na", 0), "NODEATH unavailable");
+        cmd("NODEATH ON"); cmd("STATUS");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0 && status_has("refused=1"), "ON refused, nothing written");
+    }
+#undef ND_CLEAR
 
     /* ======================================================== MT: MAINT, a building's maintenance on the host's word (lane 67) */
     {
@@ -4352,6 +4776,577 @@ int main(void)
         m = build_image(&o);
         start("MT4: a wear that writes another offset", m, NULL, NULL, NULL);
         check(status_line("MAINT unavailable MDECSUB signature has 0 hits", 0), "MAINT unavailable: no subtraction site");
+    }
+
+    /* (lane 65) file opens in play: 5 s of ticks at about 60 a second; the mod sends 3 logged commands a second (a
+     * friend's live log: ENDHOLD SET, MEN DROP, GOODS AUDIT ...) and a quiet one every tick (MEN POLL) */
+    {
+        typedef void (__cdecl *opens_fn)(long *, long *);
+        opens_fn op = (opens_fn)(void *)GetProcAddress(h, "coop_patch_test_opens");
+        opts_t o = { 1 };
+        img_t *m = build_image(&o);
+        long o0 = 0, l0 = 0, o1 = 0, l1 = 0, w0, w1;
+        int k;
+        start("L65: file opens in play", m, NULL, NULL, NULL);
+        cmd("COST"); Sleep(1100); g_tick(NULL);
+        w0 = (long)strlen(read_file(g_log));
+        if (op) op(&o0, &l0);
+        for (k = 0; k < 300; k++) {
+            if (k % 20 == 0) append_raw(k % 40 == 0 ? "GOODS AUDIT\n" : "ENDHOLD SET 1 -\n");
+            append_raw("MEN POLL\n");
+            g_tick(NULL); if (g_snap) g_snap(NULL);
+            Sleep(16);
+        }
+        if (op) op(&o1, &l1);
+        w1 = (long)strlen(read_file(g_log));
+        printf("INFO  file opens a second by the native piece in play (5 s, 15 logged commands, 300 quiet): %.1f opens, %.1f attribute looks; log grew %ld bytes\n",
+               (o1 - o0) / 5.0, (l1 - l0) / 5.0, w1 - w0);
+        check(op != NULL, "(lane 65) the test build counts its file opens");
+        {   wchar_t old[MAX_PATH]; int inLog = strstr(read_file(g_log), "command: ENDHOLD SET 1 -") != NULL;
+            _snwprintf(old, MAX_PATH, L"%s.old", g_log);
+            if (!inLog) inLog = strstr(read_file(old), "command: ENDHOLD SET 1 -") != NULL;   /* (the log may have turned over) */
+            check(inLog, "(lane 65) the commands are still logged (through the kept log handle)"); }
+        {   double ops = (double)(o1 - o0) / 5.0; int okc = op != NULL && o1 - o0 <= 17;   /* (compared as integers: written as a double compare, 1.6 <= 3.5 once came out false in this test program; cause not found) */
+        check(okc, "(lane 65) at most a few opens a second in play: %.1f (status writes and quiet log; before: one a command and one a log line)", ops); }
+        for (k = 0; k < 14; k++) { Sleep(100); g_tick(NULL); }     /* (ticks under a second apart: no watchdog line) */
+        {   HANDLE x = CreateFileW(g_log, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);   /* no write share: fails while the DLL holds it */
+            check(x != INVALID_HANDLE_VALUE, "(lane 65) after a second without a line the log's handle is let go");
+            if (x != INVALID_HANDLE_VALUE) CloseHandle(x); }
+        /* the command file deleted and made again (a new run of the mod): the new commands are read */
+        append_raw("NOROUT OFF\n"); g_tick(NULL);                 /* (the command file's handle is held again) */
+        DeleteFileW(g_cmd); append_raw("NOKILL ON\n"); g_tick(NULL);
+        {   const char *t = read_file(g_log); const char *a = strstr(t, "command: NOROUT OFF");
+            check(a && strstr(a, "command: NOKILL ON") != NULL, "(lane 65) patch_cmd.txt deleted and made again while its handle was held: its command is read"); }
+        cmd("ALLOFF");
+    }
+
+    /* ======================================================== H: HIST, the first-run probes (lane 72) */
+    {
+        static __declspec(align(16)) uint8_t sub[0x200], novt[0x200], eng[0x1100], own[0x400], wm[0x200], trk[0x200];
+        static __declspec(align(16)) uint8_t regs[2 * 0x20], days[2 * 0x100], el[4 * 16], items[3 * 8];
+        float *grid = (float *)VirtualAlloc(NULL, 64 * 64 * 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);   /* (own pages: a static here sat on a page an earlier test left protected) */
+        opts_t o = { 1 };
+        img_t *m;
+        uint64_t vt;
+        wchar_t fp[MAX_PATH], dev[MAX_PATH];
+        const char *hf;
+        int32_t two = 2, one = 1, three = 3, four = 4, cells = 64 * 64, bad = 99;
+        uint32_t bits = 0xB;                    /* elements 0, 1 and 3 allocated, 2 free */
+        int i;
+        o.known = 1; o.hist = 1;
+        m = build_image(&o);
+        vt = (uint64_t)(uintptr_t)(m->text + 0x40);
+        memset(sub, 0, sizeof(sub)); memset(novt, 0, sizeof(novt)); memset(eng, 0, sizeof(eng)); memset(own, 0, sizeof(own)); memset(wm, 0, sizeof(wm)); memset(trk, 0, sizeof(trk));
+        memset(regs, 0, sizeof(regs)); memset(days, 0, sizeof(days)); memset(el, 0, sizeof(el));
+        memcpy(sub, &vt, 8); memcpy(eng, &vt, 8); memcpy(own, &vt, 8); memcpy(wm, &vt, 8); memcpy(trk, &vt, 8);
+        /* the subsystem: date 7/3/1, two regions; region 0 has two days, region 1 none */
+        *(int32_t *)(sub + 0x48) = 7; *(int32_t *)(sub + 0x4C) = 3; *(int32_t *)(sub + 0x50) = 1;
+        *(uint8_t **)(sub + 0x38) = regs; memcpy(sub + 0x40, &two, 4); memcpy(sub + 0x44, &two, 4);
+        *(uint64_t *)(regs + 8) = 0x7FF0000AAAAull; *(uint8_t **)(regs + 0x10) = days; memcpy(regs + 0x18, &two, 4); memcpy(regs + 0x1C, &two, 4);
+        *(uint64_t *)(regs + 0x28) = 0x7FF0000BBBBull;
+        *(int32_t *)(days + 0xF0) = 7; *(int32_t *)(days + 0xF4) = 3; *(int32_t *)(days + 0xF8) = 1;
+        for (i = 0; i < 4; i++) { *(int32_t *)(el + i * 16) = 10 + i; *(int32_t *)(el + i * 16 + 4) = 100 * (i + 1); }
+        *(uint8_t **)(days + 0xA0) = el; memcpy(days + 0xA8, &four, 4); memcpy(days + 0xAC, &four, 4);    /* map +A0h: 4 slots */
+        memcpy(days + 0xA0 + 0x10, &bits, 4); memcpy(days + 0xA0 + 0x28, &four, 4); memcpy(days + 0xA0 + 0x34, &one, 4);
+        start("H1: HIST (known build)", m, NULL, L"friend", NULL);
+        check(status_line("HIST available reads=0 files=0 tryadd=gated calls=0 refused=0 bad=0 faults=0 trkset=0/0 shrunk=0 short=0 nokey=0 grows=0 keyadds=0", 1), "HIST available, TRYADD gated (no switch file)");
+        cmd("HIST SUBDUMP %llX t1", (unsigned long long)(uintptr_t)sub); cmd("STATUS");
+        _snwprintf(fp, MAX_PATH, L"%shist_sub_t1.txt", g_io); hf = read_file(fp);
+        check(strstr(hf, "date 7/3/1") && strstr(hf, "regions 2") && strstr(hf, "region 0 7FF0000AAAA name 0 days 2") && strstr(hf, "region 1 7FF0000BBBB name 0 days 0") && strstr(hf, "END"),
+              "SUBDUMP: the date, both regions, their day counts");
+        check(strstr(hf, "day 0 date 7/3/1 m0[0/0] m50[0/0] mA0[3/4]:10=100,11=200,13=400") != NULL, "SUBDUMP: a map's allocated elements only (slot 2 is free)");
+        check(strstr(hf, "  day 1 date 0/0/0") != NULL && status_has("reads=1 files=1 "), "SUBDUMP: the second day; counted");
+        memcpy(days + 0xA8, &bad, 4); cmd("HIST SUBDUMP %llX t2 1", (unsigned long long)(uintptr_t)sub); cmd("STATUS");
+        _snwprintf(fp, MAX_PATH, L"%shist_sub_t2.txt", g_io); hf = read_file(fp);
+        check(strstr(hf, "mA0=BAD") != NULL && strstr(hf, "day 1") == NULL && status_has("bad=1 "), "a map whose count is above its capacity: not read (BAD); days limited to 1");
+        memcpy(days + 0xA8, &four, 4);
+        memcpy(sub + 0x40, &three, 4); cmd("HIST SUBDUMP %llX t3", (unsigned long long)(uintptr_t)sub); cmd("STATUS");
+        _snwprintf(fp, MAX_PATH, L"%shist_sub_t3.txt", g_io); hf = read_file(fp);
+        check(strstr(hf, "regions BAD") != NULL && strstr(hf, "region 0") == NULL, "a region list with 3 of a capacity of 2: not read");
+        memcpy(sub + 0x40, &two, 4);
+        cmd("HIST SUBDUMP %llX t4", (unsigned long long)(uintptr_t)novt); cmd("HIST SUBDUMP 0 t4"); cmd("HIST SUBDUMP %llX bad/tag", (unsigned long long)(uintptr_t)sub); cmd("STATUS");
+        check(status_has("files=3 ") && status_has("bad=5 "), "no vtable, a null address, a bad tag: refused, no file");
+        if (!status_has("bad=5 ")) printf("%s\n", read_file(g_status));
+        /* HSET: the region history written in place, by date; a good the map lacks is never added */
+        {
+            FILE *hfl;
+            _snwprintf(fp, MAX_PATH, L"%shist_hin_h1.txt", g_io);
+            hfl = _wfopen(fp, L"wb");
+            fprintf(hfl, "7FF0000AAAA 7/3/1 A0 10=5,12=9,13=400,x\r\n7FF0000AAAA 1/1/1 A0 10=1\r\nBBB 7/3/1 A0 10=1\r\n7FF0000AAAA 7/3/1 33 10=1\r\n");
+            fclose(hfl);
+            cmd("HIST HSET %llX h1", (unsigned long long)(uintptr_t)sub);
+            _snwprintf(fp, MAX_PATH, L"%shist_hset_h1.txt", g_io); hf = read_file(fp);
+            check(strstr(hf, "lines 3 written 1 same 1 missing 1 nodate 2 bad 2") != NULL && *(int32_t *)(el + 4) == 5 && *(int32_t *)(el + 16 + 4) == 200
+                  && *(int32_t *)(el + 32) == 12 && *(int32_t *)(el + 32 + 4) == 300 && *(int32_t *)(el + 48 + 4) == 400,
+                  "HSET: by region and date; a value written in place, an equal one left, a free slot's good not added, a wrong date or region and a bad item counted");
+            if (!strstr(hf, "lines 3 written 1")) printf("%s\n", hf);
+            /* ADD: the game's find-or-add is not at its RVA in this image (not verified): nothing is added, MAPADD refused */
+            cmd("HIST HSET %llX h1 ADD", (unsigned long long)(uintptr_t)sub);
+            _snwprintf(fp, MAX_PATH, L"%shist_hset_h1.txt", g_io); hf = read_file(fp);
+            check(strstr(hf, "missing 1 nodate 2 bad 2 added 0") != NULL && *(int32_t *)(el + 32) == 12, "HSET ADD with the routine not verified: the free slot's good still not added");
+            cmd("HIST MAPADD %llX 7FF0000AAAA 7/3/1 A0 12 5", (unsigned long long)(uintptr_t)sub); cmd("STATUS");
+            check(strstr(read_file(g_log), "HIST MAPADD refused: the routine is not verified") != NULL, "MAPADD refused when the routine is not verified");
+            *(int32_t *)(el + 4) = 100;
+        }
+        /* the grid: 64 x 64 cells, blocks of 32: four hashes */
+        for (i = 0; i < 64 * 64 * 4; i++) grid[i] = 0.5f;
+        *(float **)(eng + 0x8E0) = grid; memcpy(eng + 0x8E8, &cells, 4); memcpy(eng + 0x8EC, &cells, 4);
+        cmd("HIST GRIDHASH %llX g1", (unsigned long long)(uintptr_t)eng);
+        grid[(5 * 64 + 3) * 4] = 0.5f + 0.0005f;                     /* below a 255th: the same step */
+        cmd("HIST GRIDHASH %llX g2", (unsigned long long)(uintptr_t)eng);
+        grid[(40 * 64 + 50) * 4 + 2] = 0.9f;                         /* block (1,1) changes */
+        cmd("HIST GRIDHASH %llX g3", (unsigned long long)(uintptr_t)eng); cmd("STATUS");
+        {
+            char a1[200], a2[200], a3[200]; unsigned h1[4], h3[4];
+            _snwprintf(fp, MAX_PATH, L"%shist_grid_g1.txt", g_io); strncpy(a1, read_file(fp), sizeof(a1) - 1); a1[sizeof(a1) - 1] = 0;
+            _snwprintf(fp, MAX_PATH, L"%shist_grid_g2.txt", g_io); strncpy(a2, read_file(fp), sizeof(a2) - 1); a2[sizeof(a2) - 1] = 0;
+            _snwprintf(fp, MAX_PATH, L"%shist_grid_g3.txt", g_io); strncpy(a3, read_file(fp), sizeof(a3) - 1); a3[sizeof(a3) - 1] = 0;
+            check(strstr(a1, "grid 4096 cells side 64 block 32 steps 255") != NULL && strcmp(a1, a2) == 0, "GRIDHASH: 64 x 64 in four blocks; a change under one step does not change a hash");
+            check(strchr(a1, '\n') && strchr(a3, '\n')
+                  && sscanf(strchr(a1, '\n') + 1, "%x %x %x %x", &h1[0], &h1[1], &h1[2], &h1[3]) == 4 && sscanf(strchr(a3, '\n') + 1, "%x %x %x %x", &h3[0], &h3[1], &h3[2], &h3[3]) == 4
+                  && h1[0] == h3[0] && h1[1] == h3[1] && h1[2] == h3[2] && h1[3] != h3[3], "a change of one cell changes its block's hash only");
+        }
+        cells = 64 * 64 - 1; memcpy(eng + 0x8E8, &cells, 4); cmd("HIST GRIDHASH %llX g4", (unsigned long long)(uintptr_t)eng); cmd("STATUS");
+        _snwprintf(fp, MAX_PATH, L"%shist_grid_g4.txt", g_io);
+        check(strstr(read_file(fp), "not square") != NULL, "a cell count that is no square: no hashes");
+        cells = 64 * 64; memcpy(eng + 0x8E8, &cells, 4);
+        /* the grid carried: exact-bits hash, row hashes, a block's rows read, rows written with the redraw queue */
+        {
+            static int32_t q[4]; int32_t qn = 0, qm = 2; FILE *gf; char a5[200], a6[200]; int x; float quarter = 0.25f; uint32_t qb; char row[2048];
+            memset(q, 0, sizeof(q));
+            *(int32_t **)(eng + 0x1018) = q; memcpy(eng + 0x1020, &qn, 4); memcpy(eng + 0x1024, &qm, 4);
+            cmd("HIST GRIDHASH %llX g5 32 0", (unsigned long long)(uintptr_t)eng);
+            grid[(5 * 64 + 3) * 4] = 0.5f + 0.0006f;
+            cmd("HIST GRIDHASH %llX g6 32 0", (unsigned long long)(uintptr_t)eng);
+            _snwprintf(fp, MAX_PATH, L"%shist_grid_g5.txt", g_io); strncpy(a5, read_file(fp), sizeof(a5) - 1); a5[sizeof(a5) - 1] = 0;
+            _snwprintf(fp, MAX_PATH, L"%shist_grid_g6.txt", g_io); strncpy(a6, read_file(fp), sizeof(a6) - 1); a6[sizeof(a6) - 1] = 0;
+            check(strstr(a5, "steps 0") != NULL && strcmp(a5, a6) != 0, "GRIDHASH steps 0: exact bits (a change under one step changes the hash)");
+            cmd("HIST GRIDROWS %llX r1 0:0,1:1,9:9", (unsigned long long)(uintptr_t)eng);
+            _snwprintf(fp, MAX_PATH, L"%shist_grows_r1.txt", g_io); hf = read_file(fp);
+            check(strstr(hf, "0 0 ") == hf && strstr(hf, "\r\n1 1 ") != NULL && strstr(hf, "9:9 BAD") != NULL, "GRIDROWS: 32 row hashes a block; a block outside the grid: BAD");
+            cmd("HIST GRIDGET %llX r2 1 1 100", (unsigned long long)(uintptr_t)eng);
+            _snwprintf(fp, MAX_PATH, L"%shist_gget_r2.txt", g_io); hf = read_file(fp);
+            check(strncmp(hf, "40 32 ", 6) == 0 && strstr(hf, "3F000000" "3F000000" "3F666666" "3F000000") != NULL && strstr(hf, "\r\nEND") != NULL, "GRIDGET: row 8 of block (1,1) = row 40, with the 0.9 cell");
+            memcpy(&qb, &quarter, 4);
+            row[0] = 0; for (x = 0; x < 32 * 4; x++) sprintf(row + strlen(row), "%08X", qb);
+            _snwprintf(fp, MAX_PATH, L"%shist_gin_s1.txt", g_io);
+            gf = _wfopen(fp, L"wb"); fprintf(gf, "40 32 %s\r\n41 33 bad\r\n", row); fclose(gf);
+            cmd("HIST GRIDSET %llX s1", (unsigned long long)(uintptr_t)eng);
+            _snwprintf(fp, MAX_PATH, L"%shist_gset_s1.txt", g_io); hf = read_file(fp);
+            memcpy(&qn, eng + 0x1020, 4);
+            check(strstr(hf, "cells 32 changed 32 queued 2 deferred 30 bad 1 pending 30") != NULL && grid[(40 * 64 + 33) * 4 + 1] == 0.25f && grid[(40 * 64 + 34) * 4 + 1] == 0.25f
+                  && grid[(40 * 64 + 31) * 4] == 0.5f && qn == 2 && q[0] == 40 * 64 + 32 && q[1] == 40 * 64 + 33 && q[2] == 0,
+                  "GRIDSET: every changed cell written; the queue filled to its capacity, never past it; the rest pending in the native piece; a bad line counted");
+            cmd("HIST GRIDSET %llX s1", (unsigned long long)(uintptr_t)eng);
+            _snwprintf(fp, MAX_PATH, L"%shist_gset_s1.txt", g_io);
+            check(strstr(read_file(fp), "cells 32 changed 0 queued 0 deferred 0 bad 1 pending 30") != NULL, "GRIDSET again, the queue still full: nothing changed, 30 still pending");
+            qn = 1; memcpy(eng + 0x1020, &qn, 4);                         /* the game drew one: cell 32 stays queued at 0 */
+            cmd("HIST GRIDFLUSH %llX f1", (unsigned long long)(uintptr_t)eng);
+            _snwprintf(fp, MAX_PATH, L"%shist_gflush_f1.txt", g_io);
+            memcpy(&qn, eng + 0x1020, 4);
+            check(strstr(read_file(fp), "queued 1 pending 29") != NULL && qn == 2 && q[1] == 40 * 64 + 34, "GRIDFLUSH once the game drew from the queue: the next pending cell queued");
+            memset(eng + 0x1018, 0, 16);
+        }
+        /* DUMP and DUMPLIST */
+        cmd("HIST DUMP %llX 0x8E8 8 d1", (unsigned long long)(uintptr_t)eng);
+        _snwprintf(fp, MAX_PATH, L"%shist_dump_d1.txt", g_io);
+        check(strstr(read_file(fp), "offset 8E8 bytes 8\r\n00 10 00 00 00 10 00 00") != NULL, "DUMP: the grid's count and capacity (4096, 4096)");
+        memset(items, 0x11, sizeof(items));
+        *(uint8_t **)(trk + 0x120) = items; memcpy(trk + 0x128, &three, 4); memcpy(trk + 0x12C, &four, 4);
+        cmd("HIST DUMPLIST %llX 0x120 8 2 l1", (unsigned long long)(uintptr_t)trk);
+        _snwprintf(fp, MAX_PATH, L"%shist_list_l1.txt", g_io); hf = read_file(fp);
+        check(strstr(hf, "num 3 max 4 element 8 shown 2") && strstr(hf, "1: 11 11") && !strstr(hf, "2: "), "DUMPLIST: a list's first <max> elements, never past its count");
+        memcpy(trk + 0x128, &bad, 4); cmd("HIST DUMPLIST %llX 0x120 8 10 l2", (unsigned long long)(uintptr_t)trk);
+        _snwprintf(fp, MAX_PATH, L"%shist_list_l2.txt", g_io);
+        check(strstr(read_file(fp), "list BAD") != NULL, "DUMPLIST: a count above the capacity is not read");
+        memcpy(trk + 0x128, &three, 4);
+        /* TRKDUMP: a tracker's map at +0C8h, two slots, the second free; its first good's list of two entries */
+        {
+            static __declspec(align(16)) uint8_t mel[2 * 0x20], ent[2 * 0x10];
+            int32_t nb = 2; uint32_t mb = 1; long long d0 = 290, d1 = 291; int32_t q0 = 5, q1 = 7, k0 = 18;
+            memset(mel, 0, sizeof(mel)); memset(ent, 0, sizeof(ent));
+            memcpy(ent, &d0, 8); memcpy(ent + 8, &q0, 4); memcpy(ent + 16, &d1, 8); memcpy(ent + 24, &q1, 4);
+            memcpy(mel, &k0, 4); *(uint8_t **)(mel + 8) = ent; memcpy(mel + 0x10, &nb, 4); memcpy(mel + 0x14, &nb, 4);
+            *(uint32_t *)(mel + 0x20) = 77;                                      /* the free slot: never read */
+            *(uint8_t **)(trk + 0xC8) = mel; memcpy(trk + 0xD0, &nb, 4); memcpy(trk + 0xD4, &nb, 4);
+            memcpy(trk + 0xD8, &mb, 4); memcpy(trk + 0xF0, &nb, 4);
+            cmd("HIST TRKDUMP k1 %llX,%llX", (unsigned long long)(uintptr_t)trk, (unsigned long long)(uintptr_t)novt);
+            _snwprintf(fp, MAX_PATH, L"%shist_trk_k1.txt", g_io); hf = read_file(fp);
+            check(strstr(hf, " 1 | 18:2:290/5,291/7\r\n") != NULL && strstr(hf, "77") == NULL && strstr(hf, " BAD ") != NULL, "TRKDUMP: the allocated good's entries (the free slot not read); an object with no vtable: BAD");
+            /* TRKSET: in place from entry 1; a third entry past the capacity is refused ("short"); a good the map has
+             * not ("nokey"); cut to none; a hole refused */
+            cmd("HIST TRKSET %llX 18 1 291/9", (unsigned long long)(uintptr_t)trk); cmd("STATUS");
+            check(*(int32_t *)(mel + 0x10) == 2 && *(int32_t *)(ent + 24) == 9 && *(long long *)ent == 290 && status_has("trkset=1/1 shrunk=0 short=0 nokey=0"), "TRKSET: entry 1 written in place, entry 0 and the count kept");
+            cmd("HIST TRKSET %llX 18 1 291/9,292/4", (unsigned long long)(uintptr_t)trk); cmd("HIST TRKSET %llX 99 0 1/1", (unsigned long long)(uintptr_t)trk); cmd("STATUS");
+            check(*(int32_t *)(mel + 0x10) == 2 && status_has("trkset=1/1 shrunk=0 short=1 nokey=1"), "TRKSET: past the list's capacity: short (nothing written); a good the map has not: nokey");
+            cmd("HIST TRKSET %llX 18 3 1/1", (unsigned long long)(uintptr_t)trk); cmd("HIST TRKSET %llX 18 0 x/1", (unsigned long long)(uintptr_t)trk); cmd("STATUS");
+            check(*(int32_t *)(mel + 0x10) == 2 && *(int32_t *)(ent + 24) == 9, "TRKSET: a hole (from past the count) and a bad entry: refused");
+            cmd("HIST TRKSET %llX 18 1 -", (unsigned long long)(uintptr_t)trk); cmd("STATUS");
+            check(*(int32_t *)(mel + 0x10) == 1 && status_has("trkset=2/1 shrunk=1 "), "TRKSET: cut to one entry");
+            nb = 2; memcpy(mel + 0x10, &nb, 4);
+            nb = 3; memcpy(mel + 0x10, &nb, 4);                                 /* a list with 3 of a capacity of 2 */
+            cmd("HIST TRKDUMP k2 %llX", (unsigned long long)(uintptr_t)trk);
+            _snwprintf(fp, MAX_PATH, L"%shist_trk_k2.txt", g_io); hf = read_file(fp);
+            check(strstr(hf, "18:BAD") != NULL, "TRKDUMP: a list whose count is above its capacity is not read");
+            memset(trk + 0xC8, 0, 0x50);
+        }
+        /* EXP: an expertise component's float at +0B8h, written and read back; a value out of range and no vtable: BAD */
+        {
+            float ex = 3.25f; memcpy(wm + 0xB8, &ex, 4);
+            cmd("HIST EXP e1 %llX,%llX=12.5,%llX=-4,%llX=7", (unsigned long long)(uintptr_t)own, (unsigned long long)(uintptr_t)wm,
+                (unsigned long long)(uintptr_t)wm, (unsigned long long)(uintptr_t)novt);
+            _snwprintf(fp, MAX_PATH, L"%shist_exp_e1.txt", g_io); hf = read_file(fp);
+            memcpy(&ex, wm + 0xB8, 4);
+            check(ex == 12.5f && strstr(hf, " 12.5\r\n") != NULL && strstr(hf, " BAD value") != NULL && strstr(hf, " BAD object") != NULL, "EXP: the float written and read back; a negative value and an object with no vtable: BAD");
+        }
+        /* TRYADD: gated, then the dev switch file */
+        *(uint8_t **)(trk + 0x90) = own; *(uint8_t **)(trk + 0x118) = wm; *(uint8_t **)(own + 0x2E8) = eng;
+        g_hadd_calls = 0;
+        cmd("HIST TRYADD %llX 5 1", (unsigned long long)(uintptr_t)trk); cmd("STATUS");
+        check(g_hadd_calls == 0 && status_has("refused=2 "), "TRYADD without dev_hist_tryadd.txt: refused, the routine not called (the second refusal: MAPADD's above)");
+        _snwprintf(dev, MAX_PATH, L"%sdev_hist_tryadd.txt", g_io);
+        { HANDLE hh = CreateFileW(dev, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL); if (hh != INVALID_HANDLE_VALUE) CloseHandle(hh); }
+        cmd("STATUS"); check(status_has("tryadd=ready "), "with the switch file and COOP_ROLE: ready");
+        cmd("HIST TRYADD %llX 5 1", (unsigned long long)(uintptr_t)trk); cmd("STATUS");
+        check(g_hadd_calls == 1 && g_hadd_t == (void *)trk && g_hadd_good == 5 && g_hadd_amt == 1 && g_hadd_w == NULL && status_has("calls=1 "), "TRYADD: the game's routine called once (tracker, good 5, amount 1, no worker)");
+        *(uint8_t **)(trk + 0x90) = NULL; cmd("HIST TRYADD %llX 6 1", (unsigned long long)(uintptr_t)trk);
+        *(uint8_t **)(trk + 0x90) = own; *(uint8_t **)(trk + 0x118) = novt; cmd("HIST TRYADD %llX 6 1", (unsigned long long)(uintptr_t)trk);
+        *(uint8_t **)(trk + 0x118) = wm; cmd("HIST TRYADD %llX 2000 1", (unsigned long long)(uintptr_t)trk); cmd("STATUS");
+        check(g_hadd_calls == 1, "no owner, a weather master with no vtable, a good out of range: refused, not called");
+        /* TRKSET with the game's add: a good the map has not -> one add (the recorder makes no key here: then nokey);
+         * a list too small -> adds until it fits (the recorder never grows it: 64 adds, then short) */
+        {
+            static __declspec(align(16)) uint8_t mel2[0x20], ent2[2 * 0x10];
+            int32_t two2 = 2; uint32_t mb2 = 1; int32_t k2 = 18;
+            memset(mel2, 0, sizeof(mel2)); memset(ent2, 0, sizeof(ent2));
+            memcpy(mel2, &k2, 4); *(uint8_t **)(mel2 + 8) = ent2; memcpy(mel2 + 0x10, &two2, 4); memcpy(mel2 + 0x14, &two2, 4);
+            *(uint8_t **)(trk + 0xC8) = mel2; memcpy(trk + 0xD0, &one, 4); memcpy(trk + 0xD4, &one, 4); memcpy(trk + 0xD8, &mb2, 4); memcpy(trk + 0xF0, &one, 4);
+            g_hadd_calls = 0;
+            cmd("HIST TRKSET %llX 99 0 1/1", (unsigned long long)(uintptr_t)trk); cmd("STATUS");
+            check(g_hadd_calls == 1 && g_hadd_good == 99 && g_hadd_amt == 0 && status_has("keyadds=1"), "TRKSET: a good the map has not: the game's add called once (good 99, amount 0)");
+            g_hadd_calls = 0;
+            cmd("HIST TRKSET %llX 18 0 1/1,2/2,3/3", (unsigned long long)(uintptr_t)trk); cmd("STATUS");
+            check(g_hadd_calls == 64 && status_has("grows=64 ") && *(long long *)(ent2 + 16) == 0, "TRKSET: a list too small: the game's add asked to grow it (its last day made not today for the call, then put back), at most 64 times");
+            memset(trk + 0xC8, 0, 0x50);
+        }
+        check(status_has("faults=0") && memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "no fault; .text never written");
+        DeleteFileW(dev);
+    }
+    {
+        static __declspec(align(16)) uint8_t trk[0x200];
+        opts_t o = { 1 };
+        img_t *m;
+        wchar_t dev[MAX_PATH]; HANDLE hh;
+        o.known = 1; o.hist = 1;
+        m = build_image(&o);
+        memset(trk, 0, sizeof(trk));
+        start("H2: HIST TRYADD with the switch file but no COOP_ROLE", m, NULL, NULL, NULL);
+        _snwprintf(dev, MAX_PATH, L"%sdev_hist_tryadd.txt", g_io);
+        hh = CreateFileW(dev, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL); if (hh != INVALID_HANDLE_VALUE) CloseHandle(hh);
+        g_hadd_calls = 0; cmd("HIST TRYADD %llX 5 1", (unsigned long long)(uintptr_t)trk); cmd("STATUS");
+        check(g_hadd_calls == 0 && status_has("tryadd=gated ") && status_has("refused=1 "), "no COOP_ROLE (a player's game): refused although the file is there");
+        DeleteFileW(dev);
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.hist = 1;
+        m = build_image(&o);
+        start("H3: HIST on another game build", m, NULL, L"friend", NULL);
+        check(status_line("HIST unavailable another game build", 0), "HIST unavailable: another build");
+        cmd("HIST SUBDUMP 1000 x"); cmd("STATUS"); check(status_has("HIST unavailable"), "a command is refused");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.hist = 2;
+        m = build_image(&o);
+        start("H4: HADD twice", m, NULL, L"friend", NULL);
+        check(status_line("HIST available reads=0 files=0 tryadd=unavailable", 0), "two HADD hits: the probes stay, TRYADD unavailable");
+    }
+
+    /* ======================================================== C: COLLAPSE, a building collapses on the host's word (lane 71) */
+    {
+        static __declspec(align(16)) uint8_t cbld[0x1000], novt[0x1000];
+        opts_t o = { 1 };
+        img_t *m;
+        typedef void (*callfn)(void *b);
+        callfn coll;
+        wchar_t outp[MAX_PATH];
+        char want[40];
+        const char *out;
+        o.known = 1; o.collapse = 1;
+        m = build_image(&o);
+        coll = (callfn)(void *)(m->text + m->cl_ent);
+        memset(cbld, 0, sizeof(cbld)); memset(novt, 0, sizeof(novt));
+        *(uint8_t **)cbld = m->base + 0x100;                      /* a "vtable" in the module */
+        start("C1: COLLAPSE (known build)", m, NULL, NULL, NULL);
+        _snwprintf(outp, MAX_PATH, L"%scollapse_out.txt", g_io); DeleteFileW(outp);   /* (after start: g_io is this scenario's folder) */
+        check(status_line("COLLAPSE off blocked=0 seen=0 done=0", 0), "COLLAPSE found: collapseBuilding's entry and its death roll once each");
+        coll(cbld);
+        check(cbld[0x3A0] == 1, "the game's collapseBuilding runs (the building marked)");
+        cbld[0x3A0] = 0;
+        cmd("COLLAPSE WATCH"); cmd("STATUS");
+        check(status_line("COLLAPSE watch ", 0) && m->text[m->cl_ent] == 0xE9 && memcmp(m->text + m->cl_ent + 5, m->snapshot + m->cl_ent + 5, TEXT_SIZE - m->cl_ent - 5) == 0
+              && memcmp(m->text, m->snapshot, m->cl_ent) == 0, "WATCH (host): only the entry's first 5 bytes changed (the jump), the death roll untouched");
+        *(int32_t *)(cbld + 0x3B8) = 52;                          /* the building's type (Data.bType), noted before the call */
+        coll(cbld); g_tick(NULL); out = read_file(outp); DeleteFileW(outp);
+        _snprintf(want, sizeof(want), "%IX 52\r\n", (uintptr_t)cbld);
+        { int hit = strstr(out, want) != NULL;                    /* (read_file's buffer is the next read's too) */
+          cmd("STATUS");
+          check(cbld[0x3A0] == 1 && status_has("seen=1 ") && hit, "WATCH: the collapse runs as before and its building is written to collapse_out.txt at the tick"); }
+        cbld[0x3A0] = 0;
+        cmd("COLLAPSE ON"); cmd("STATUS");
+        check(status_line("COLLAPSE on ", 0) && m->text[m->cl_kill + 59] == 0xD2 && status_has("kill=1"), "ON (friend): the death roll's compare is cmp edx,edx (the jump over the death always taken)");
+        coll(cbld); cmd("STATUS");
+        check(cbld[0x3A0] == 0 && status_has("blocked=1 "), "ON: a call the game makes returns at once (no roll, no cheat, no unit collapses a building here)");
+        cmd("COLLAPSE DO %llu", (unsigned long long)(uintptr_t)cbld); cmd("STATUS");
+        check(cbld[0x3A0] == 1 && status_has("done=1 "), "DO: the host's collapse here, the game's own routine");
+        cmd("COLLAPSE DO 0"); cmd("COLLAPSE DO %llu", (unsigned long long)(uintptr_t)novt); cmd("COLLAPSE DO %llu", (unsigned long long)(uintptr_t)(cbld + 4)); cmd("COLLAPSE MAYBE"); cmd("STATUS");
+        check(status_has("done=1 ") && status_has("bad=4"), "DO refused for 0, an object with no vtable in the module, an unaligned address; a bad form refused");
+        cmd("COLLAPSE DO %llu", (unsigned long long)(uintptr_t)cbld); cmd("STATUS");
+        check(status_has("done=1 ") && status_has("already=1 "), "DO on a building already marked (+3A0h): left");
+        {   typedef void (*callfn2)(void *b);
+            callfn2 caller = (callfn2)(void *)(m->text + m->cl_call);
+            cbld[0x3A0] = 0; caller(cbld); cmd("STATUS");
+            check(cbld[0x3A0] == 0 && status_has("blocked=2 ") && status_has("pass=0"), "ON: another caller (no PASS site in this image) is stopped");
+            cmd("COLLAPSE PASS %llX", (unsigned long long)(uintptr_t)(m->text + m->cl_call + 9));
+            caller(cbld); cmd("STATUS");
+            check(cbld[0x3A0] == 1 && status_has("passed=1 ") && status_has("blocked=2 "), "ON: the caller named by PASS (the soldier's dismantling) is let through");
+            cbld[0x3A0] = 0; coll(cbld); cmd("STATUS");
+            check(cbld[0x3A0] == 0 && status_has("blocked=3 "), "ON: a call from anywhere else is still stopped");
+            cmd("COLLAPSE PASS 0"); }
+        cmd("COLLAPSE OFF"); cmd("STATUS");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0 && status_line("COLLAPSE off ", 0), "OFF: .text byte-identical");
+        cbld[0x3A0] = 0; coll(cbld);
+        check(cbld[0x3A0] == 1, "after OFF the game's collapse runs again");
+        cmd("COLLAPSE DO %llu", (unsigned long long)(uintptr_t)cbld); cmd("STATUS");
+        check(status_has("done=1 ") && status_has("bad=5"), "DO refused while off");
+        cmd("COLLAPSE ON"); cmd("ALLOFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ALLOFF: .text byte-identical (entry and death roll)");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.collapse = 1;
+        m = build_image(&o);
+        start("C2: COLLAPSE on another game build", m, NULL, NULL, NULL);
+        check(status_line("COLLAPSE unavailable another game build", 0), "COLLAPSE unavailable: another build");
+        cmd("COLLAPSE ON"); cmd("STATUS"); check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ON refused, nothing written");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.collapse = 2;
+        m = build_image(&o);
+        start("C3: collapseBuilding's entry twice", m, NULL, NULL, NULL);
+        check(status_line("COLLAPSE unavailable COLLENT signature has 2 hits", 0), "COLLAPSE unavailable: two hits");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.collapse = 3;
+        m = build_image(&o);
+        start("C4: no death roll site", m, NULL, NULL, NULL);
+        check(status_line("COLLAPSE unavailable CKILL signature has 0 hits", 0), "COLLAPSE unavailable without its death roll");
+    }
+
+    /* ======================================================== SH: SITEHP, a site's work done is the host's (lane 71) */
+    {
+        static __declspec(align(16)) uint8_t site[0x1000], p0[0x400], p1[0x400], p2[0x400], reg[0x100];
+        static uint8_t *parts[3];
+        opts_t o = { 1 };
+        img_t *m;
+        wchar_t outp[MAX_PATH];
+        char want[48];
+        const char *out;
+        float half = 0.5f, two = 2.0f, f04 = 10.0f / 250.0f; uint32_t hb, tb, fb;
+        int hit;
+        o.known = 1; o.sprog = 1;
+        m = build_image(&o);
+        memset(site, 0, sizeof(site)); memset(p0, 0, sizeof(p0)); memset(p1, 0, sizeof(p1)); memset(p2, 0, sizeof(p2));
+        *(uint8_t **)site = m->base + 0x100; *(uint8_t **)p0 = m->base + 0x100; *(uint8_t **)p1 = m->base + 0x100; *(uint8_t **)p2 = m->base + 0x100;
+        *(uint32_t *)(site + 0x0C) = 71; *(uint64_t *)(site + 0x18) = 0x7171;
+        *(uint8_t **)(site + 0x2C8) = reg;                                   /* a region: in the game */
+        parts[0] = p0; parts[1] = p1; parts[2] = p2;
+        *(uint8_t ***)(site + 0x2F8) = parts; *(int32_t *)(site + 0x300) = 3; *(int32_t *)(site + 0x304) = 3;
+        *(float *)(p0 + 0x318) = 100.0f; *(float *)(p1 + 0x318) = 100.0f; *(float *)(p2 + 0x318) = 50.0f;
+        *(float *)(p0 + 0x314) = 10.0f;
+        memcpy(&hb, &half, 4); memcpy(&tb, &two, 4); memcpy(&fb, &f04, 4);
+        start("SH1: SITEHP (known build)", m, NULL, NULL, NULL);
+        _snwprintf(outp, MAX_PATH, L"%ssitehp_out.txt", g_io); DeleteFileW(outp);   /* (after start: g_io is this scenario's folder) */
+        check(status_line("SITEHP available held=0 watched=0", 0), "SITEHP found: the parts' sums once (+2F8h, +314h, +318h)");
+        cmd("SITEHP WATCH %llu", (unsigned long long)(uintptr_t)site); cmd("SITEHP POLL");
+        out = read_file(outp); _snprintf(want, sizeof(want), "%IX %08X\r\n", (uintptr_t)site, fb); hit = strstr(out, want) != NULL; DeleteFileW(outp);
+        check(hit, "POLL (host): the site's work fraction, sum hp / sum max (10 / 250), as float bits");
+        cmd("SITEHP POLL"); out = read_file(outp); hit = out[0] == 0; DeleteFileW(outp);
+        check(hit, "POLL again: nothing changed, nothing written");
+        cmd("SITEHP DROP %llu", (unsigned long long)(uintptr_t)site);
+        cmd("SITEHP HOLD %llu %08X", (unsigned long long)(uintptr_t)site, hb); g_tick(NULL); cmd("STATUS");
+        check(*(float *)(p0 + 0x314) == 100.0f && *(float *)(p1 + 0x314) == 25.0f && *(float *)(p2 + 0x314) == 0.0f && status_has("held=1 ") && status_has("writes=1 "),
+              "HOLD (friend) 0.5: the hp scaled to half of the max (125 of 250: each part in proportion, never above its max, the rest in list order)");
+        *(float *)(p2 + 0x314) = 5.0f;                                       /* this copy's builder hammered part 2 */
+        g_tick(NULL);
+        { float s = *(float *)(p0 + 0x314) + *(float *)(p1 + 0x314) + *(float *)(p2 + 0x314);
+          check(s > 124.99f && s < 125.01f && *(float *)(p0 + 0x314) <= 100.0f, "this copy's own work is taken back at the next tick: the sum is the host's again"); }
+        g_tick(NULL); cmd("STATUS");
+        check(status_has("writes=2 "), "nothing differs: nothing written");
+        cmd("SITEHP HOLD %llu %08X", (unsigned long long)(uintptr_t)site, tb); cmd("SITEHP HOLD %llu zz", (unsigned long long)(uintptr_t)site);
+        cmd("SITEHP HOLD 0 %08X", hb); cmd("SITEHP MAYBE"); cmd("STATUS");
+        check(status_has("bad=4 ") && status_has("held=1 "), "refused: a fraction above 1, bits that are no number, address 0, a bad form");
+        *(uint64_t *)(site + 0x18) = 0x9999;                                 /* another object at the address */
+        g_tick(NULL); cmd("STATUS");
+        check(status_has("held=0 ") && status_has("gone=1 "), "an object that is not the named one any more is dropped, not written");
+        *(uint64_t *)(site + 0x18) = 0x7171; *(int32_t *)(site + 0x300) = 999;
+        cmd("SITEHP HOLD %llu %08X", (unsigned long long)(uintptr_t)site, hb); g_tick(NULL); cmd("STATUS");
+        check(status_has("held=0 ") && status_has("gone=2 "), "a part list that is not sane: dropped, nothing read past it");
+        *(int32_t *)(site + 0x300) = 3;
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "SITEHP never writes to .text");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.sprog = 1;
+        m = build_image(&o);
+        start("SH2: SITEHP on another game build", m, NULL, NULL, NULL);
+        check(status_line("SITEHP unavailable another game build", 0), "SITEHP unavailable: another build");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.sprog = 2;
+        m = build_image(&o);
+        start("SH3: SITEHP's pattern twice", m, NULL, NULL, NULL);
+        check(status_line("SITEHP unavailable SPROG signature has 2 hits", 0), "SITEHP unavailable: two hits");
+    }
+
+    /* ======================================================== M: MROLL, the daily maintenance roll on the host's word (lane 71) */
+    {
+        static __declspec(align(16)) uint8_t mb[0x1000], mu[0x1000];
+        opts_t o = { 1 };
+        img_t *m;
+        typedef void (*dayfn)(void *b);
+        typedef void (*accfn)(void *u, int a2, void *b);
+        dayfn day; accfn acc;
+        wchar_t outp[MAX_PATH];
+        char want[64];
+        const char *out;
+        int hit;
+        o.known = 1; o.mroll = 1;
+        m = build_image(&o);
+        day = (dayfn)(void *)(m->text + m->mr_day); acc = (accfn)(void *)(m->text + m->mr_acc);
+        memset(mb, 0, sizeof(mb)); memset(mu, 0, sizeof(mu));
+        *(uint8_t **)mb = m->base + 0x100; *(uint8_t **)(mb + 0x348) = mb;
+        start("M1: MROLL (known build)", m, NULL, NULL, NULL);
+        _snwprintf(outp, MAX_PATH, L"%saccident_out.txt", g_io); DeleteFileW(outp);   /* (after start: g_io is this scenario's folder) */
+        check(status_line("MROLL off blocked=0 seen=0", 0), "MROLL found: the daily roll's entry and the accident's entry once each");
+        day(mb); check(mb[0xFA0] == 1, "the game's daily roll runs (its building marked)");
+        mb[0xFA0] = 0;
+        cmd("MROLL ON"); cmd("STATUS");
+        check(status_line("MROLL on ", 0) && m->text[m->mr_day] == 0xE9 && memcmp(m->text + m->mr_acc, m->snapshot + m->mr_acc, 5) == 0,
+              "ON (friend): the daily roll's entry is the jump; the accident untouched");
+        day(mb); cmd("STATUS");
+        check(mb[0xFA0] == 0 && status_has("blocked=1 "), "ON: the roll returns at once (no roll, no accident, no influence change of this copy)");
+        cmd("MROLL WATCH"); cmd("STATUS");
+        check(status_line("MROLL watch ", 0) && memcmp(m->text + m->mr_day, m->snapshot + m->mr_day, 5) == 0 && m->text[m->mr_acc] == 0xE9,
+              "WATCH (host): the daily roll as it was, the accident's entry the jump");
+        day(mb); check(mb[0xFA0] == 1, "WATCH: the host's own roll runs");
+        mb[0x10] = 0; acc(mu, 1, mb); g_tick(NULL); out = read_file(outp); DeleteFileW(outp);
+        _snprintf(want, sizeof(want), "%IX %IX 0\r\n", (uintptr_t)mb, (uintptr_t)mu); hit = strstr(out, want) != NULL;
+        check(hit && mu[0x30C] == 0, "WATCH: an injury (the worker lives): its building and worker written at the tick, died 0");
+        mb[0x10] = 1; acc(mu, 1, mb); g_tick(NULL); out = read_file(outp); DeleteFileW(outp);
+        _snprintf(want, sizeof(want), "%IX %IX 1\r\n", (uintptr_t)mb, (uintptr_t)mu); hit = strstr(out, want) != NULL;
+        cmd("STATUS");
+        check(hit && mu[0x30C] == 1 && status_has("seen=2 "), "WATCH: a death: written with died 1 (lane 64's line carries it)");
+        *(uint8_t **)mu = m->base + 0x100; mb[0x10] = 0;
+        cmd("MROLL ACC %llu %llu", (unsigned long long)(uintptr_t)mu, (unsigned long long)(uintptr_t)mb); g_tick(NULL); out = read_file(outp); DeleteFileW(outp);
+        _snprintf(want, sizeof(want), "%IX %IX ", (uintptr_t)mb, (uintptr_t)mu); hit = strstr(out, want) != NULL;
+        cmd("STATUS");
+        check(hit && status_has("seen=3 ") && status_has("faults=0"), "WATCH: ACC (test) runs the game's accident through the hooked entry with no building (its roll, not its place test); noted with the building named");
+        cmd("MROLL MAYBE"); cmd("STATUS"); check(status_has("bad=1"), "a bad form refused");
+        cmd("MROLL OFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "OFF: .text byte-identical");
+        cmd("MROLL ON"); cmd("ALLOFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ALLOFF: .text byte-identical");
+        mb[0xFA0] = 0; day(mb); check(mb[0xFA0] == 1, "after ALLOFF the game's roll runs again");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.mroll = 1;
+        m = build_image(&o);
+        start("M2: MROLL on another game build", m, NULL, NULL, NULL);
+        check(status_line("MROLL unavailable another game build", 0), "MROLL unavailable: another build");
+        cmd("MROLL ON"); cmd("STATUS"); check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ON refused, nothing written");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.mroll = 2;
+        m = build_image(&o);
+        start("M3: the daily roll twice", m, NULL, NULL, NULL);
+        check(status_line("MROLL unavailable MRDAY signature has 2 hits", 0), "MROLL unavailable: two hits");
+    }
+
+    /* ======================================================== FR: FAMROLL, births, families and sickness on the host's word (lane 71) */
+    {
+        static __declspec(align(16)) uint8_t reg[0x1000];
+        opts_t o = { 1 };
+        img_t *m;
+        typedef void *(*mkfn)(void *r, int fam, int role, void *home);
+        mkfn ca, cb, cc;
+        void *res;
+        o.known = 1; o.famroll = 1;
+        m = build_image(&o);
+        ca = (mkfn)(void *)(m->text + m->fr_a); cb = (mkfn)(void *)(m->text + m->fr_b); cc = (mkfn)(void *)(m->text + m->fr_c);
+        memset(reg, 0, sizeof(reg));
+        start("FR1: FAMROLL (known build)", m, NULL, NULL, NULL);
+        check(status_line("FAMROLL off births=0 families=0", 0), "FAMROLL found: the maker's entry and the sickness roll once each");
+        res = ca(reg, 3, 1, NULL);
+        check(res == (void *)reg && reg[0x100] == 1, "the game's maker runs (its region marked, a result)");
+        reg[0x100] = 0;
+        cmd("FAMROLL ON"); cmd("STATUS");
+        check(status_line("FAMROLL on ", 0) && m->text[m->fr_mk] == 0xE9 && m->text[m->fr_sick + 39] == 0xEB && status_has("sick=1"),
+              "ON (friend): the maker's entry is the jump; the sickness roll's jne is jmp");
+        check(status_has("sites=0"), "this image has no growPopulation: no site held by default");
+        cmd("FAMROLL SITES %llX %llX", (unsigned long long)(uintptr_t)(m->text + m->fr_a + 9), (unsigned long long)(uintptr_t)(m->text + m->fr_b + 9));
+        res = ca(reg, 3, 1, NULL); cmd("STATUS");
+        check(res == NULL && reg[0x100] == 0 && status_has("births=1 "), "ON: growPopulation's person call returns 0 at once (counted: births)");
+        res = cb(reg, -1, 0, NULL); cmd("STATUS");
+        check(res == NULL && reg[0x100] == 0 && status_has("families=1 "), "ON: growPopulation's new-family call returns 0 at once (counted: families)");
+        res = cc(reg, 2, 2, NULL); cmd("STATUS");
+        check(res == (void *)reg && reg[0x100] == 1 && status_has("passed=1 "), "ON: another caller (a letter) runs as the game's own");
+        cmd("FAMROLL MAYBE"); cmd("STATUS"); check(status_has("bad=1"), "a bad form refused");
+        cmd("FAMROLL OFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "OFF: .text byte-identical (entry and sickness roll)");
+        reg[0x100] = 0; res = ca(reg, 3, 1, NULL); check(res == (void *)reg && reg[0x100] == 1, "after OFF the game's growth runs again");
+        cmd("FAMROLL ON"); cmd("ALLOFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ALLOFF: .text byte-identical");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.famroll = 1;
+        m = build_image(&o);
+        start("FR2: FAMROLL on another game build", m, NULL, NULL, NULL);
+        check(status_line("FAMROLL unavailable another game build", 0), "FAMROLL unavailable: another build");
+        cmd("FAMROLL ON"); cmd("STATUS"); check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ON refused, nothing written");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.famroll = 2;
+        m = build_image(&o);
+        start("FR3: the maker twice", m, NULL, NULL, NULL);
+        check(status_line("FAMROLL unavailable GROWMK signature has 2 hits", 0), "FAMROLL unavailable: two hits");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.famroll = 3;
+        m = build_image(&o);
+        start("FR4: no sickness roll", m, NULL, NULL, NULL);
+        check(status_line("FAMROLL unavailable SICKROLL signature has 0 hits", 0), "FAMROLL unavailable without the sickness roll");
     }
 
     test_report();                              /* lane 61 */

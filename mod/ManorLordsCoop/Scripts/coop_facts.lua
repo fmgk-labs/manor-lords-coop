@@ -162,14 +162,24 @@ local RULES = {
   { c = "rf", p = "refueled",       k = "b", margin = 1, settle = 3.0 },
   { c = "nr", p = "needsRefueling", k = "b", margin = 1, settle = 3.0 },
   { c = "ws", p = "waterSupply",    k = "i", margin = 1, settle = 3.0 },
-  { c = "md", p = "marketDaysLeft", k = "i", margin = 1, settle = 3.0 },
-  { c = "mp", p = "mourningPeriod", k = "i", margin = 1, settle = 3.0 },
+  -- (lane 64, game run v5e) daily = true: a count of days that each copy's own game takes one off at its day change.
+  -- In exact mode (lane 42) the host's new value was written here the moment its line came. When that line beat this
+  -- copy's own day change, this copy's game then took one off the host's NEW value: one day ahead. Seen: three homes
+  -- in mourning at 1 on the host and 0 on the friend on day 322; the friend's families had their next person one day
+  -- before the host's (days 323 to 326) and its three old bodies went one day before the host's. So for these the
+  -- margin of 1 and the settle time stay in exact mode too: a difference of one day is this copy's own day change
+  -- about to come (or just gone), and is written only when it has lasted 3 s.
+  { c = "md", p = "marketDaysLeft", k = "i", margin = 1, settle = 3.0, daily = true },
+  { c = "mp", p = "mourningPeriod", k = "i", margin = 1, settle = 3.0, daily = true },
   -- lane 39: a rival lord's own setting (its AI decides on the host only): read and written on a rival's building only
   { c = "sf", p = "stockFuelFor",   k = "i", margin = 0, settle = 0.0, rival = true },
   { c = "bp", p = "buildPriority",  k = "i", margin = 0, settle = 0.0, rival = true },
   -- lane 42: how many oxen a rival's building keeps at work (his AI sets it on the host only; measured: the rival's
   -- trading post 3 / 2, its oxen list 3 / 2). Set with the game's own changeActiveLivestockWorkers (see setAO).
   { c = "ao", p = "activeOxen",     k = "i", margin = 0, settle = 0.0, rival = true, set = "ao" },
+  -- lane 71: a rival's paused workplace or site (his AI pauses it on the host only; live r5/r9: 4@-7660,5660 sleep 0/1
+  -- for days). Set with the game's own setSleep (the panel's pause button), quietly (see setRule).
+  { c = "sl", p = "sleep",          k = "b", margin = 0, settle = 0.0, rival = true, set = "sleep" },
 }
 F.rules = F.rules or RULES
 local RULE = {}; for _, R in ipairs(F.rules) do RULE[R.c] = R end
@@ -184,6 +194,15 @@ local function setRule(b, R, want)
     b:changeActiveLivestockWorkers(want - cur)
     local now = b[R.p]
     if now ~= want and now == want - cur then b:changeActiveLivestockWorkers(want) end
+    return
+  end
+  -- lane 71: sleep through the game's own setSleep inside the town module's quiet wrapper (its SLEEP hook must not
+  -- report the write as this player's action); the flag itself only when the call did not take
+  if R.set == "sleep" then
+    local v = (want == 1)
+    local T = C.town
+    if T and T.quiet then T.quiet(function() b:setSleep(v) end) else b:setSleep(v) end
+    if (b.sleep and true or false) ~= v then b.sleep = v end
     return
   end
   if R.k == "b" then b[R.p] = (want == 1) else b[R.p] = want end
@@ -356,7 +375,7 @@ local function fresh(S)
   F.hostW = {}; F.wSince = {}                             -- friend: the host's workers of rival buildings (lane 39)
   F.hostD = {}; F.dDirty = {}; F.dGen = nil               -- friend: the host's market goods of houses (lane 42)
   F.host = { b = {}, a = {}, m = {} }; F.dirty = {}       -- friend: the host's values; stale after a load, dropped
-  F.holds = {}; F.holdR = {}; F.heldSaid = {}; F.last = {}; F.made = {}; F.liveSince = {}; F.famSince = {}; F.refused = {}
+  F.holds = {}; F.holdR = {}; F.heldSaid = {}; F.last = {}; F.made = {}; F.liveSince = {}; F.famSince = {}; F.famDay = {}; F.refused = {}
   F.liveTot = {}; F.liveFull = {}; F.passNo = 0
   F.t = { pass = 0, apply = 0, quick = 0, index = -1e9, live = 0, fam = 0, log = os.clock(), miss = 0, prune = 0 }
   F.wasHold = nil
@@ -753,6 +772,13 @@ local function due(since, id, d, margin, settle, clock, paused)
   if clock - s >= settle then since[id] = nil; return true end
   return false
 end
+-- (lane 64) THE RULE FOR A VALUE THAT THIS COPY'S OWN DAY STEP ALSO CHANGES (a count of days, a family's mark): a
+-- difference of ONE is this copy's own day step about to come or just gone, and is written only when it has lasted
+-- 3 s; more than one, or a paused copy, at once. Written at once (exact mode), the host's new value could land here
+-- ahead of this copy's own day step, which then worked on it and went a day further (game run v5e; desk test
+-- lanes/lane_s21_64/probes/offline_facts_day_test.lua).
+function F.dayRule(since, id, d, clock, paused) return due(since, id, d, 1, 3.0, clock, paused) end
+F.famDay = F.famDay or {}
 -- what this copy's value was when a new host value arrived: the difference a player would have seen
 local function seen(kind, d, margin)
   bump(kind .. "_in")
@@ -787,18 +813,23 @@ end
 -- arrows write buildPriority the same way, coop_town.lua PRIO). Only a building that is still in this copy's building
 -- list (byKey found it there), still that building (same) and still in a region is touched: a demolished building
 -- stays a valid object for a while on a friend, without a region (the crash of 2026-11-13).
+-- lane 71: a site the sites module paused itself on this copy (its fallback without the native switch: coop_sites.lua
+-- B.mine) keeps its pause: the sleep rule must not undo it
+local function sitesPaused(k) local B = rawget(C, "sites"); return B ~= nil and type(B.mine) == "table" and B.mine[k] ~= nil end
 local function rivalSiteRules(st, k, H, e)
   if not (F.on.values and next(H.v) ~= nil and same(e)) then return end
   local b = e.b
   local okR, inGame = pcall(function() return valid(b.Region) end)
   if not (okR and inGame) then return end
+  local paused = sitesPaused(k)
   for code, want in pairs(H.v) do
     local R = RULE[code]
-    if R and R.rival and R.on ~= false then
-      local cur = b[R.p]
+    if R and R.rival and R.on ~= false and not (paused and R.set == "sleep") then
+      local cur = b[R.p]; if R.k == "b" then cur = cur and 1 or 0 end      -- (lane 71: a switch rule, sleep, on a site too)
       if type(cur) == "number" and cur ~= want then
         local ok = pcall(setRule, b, R, want)
-        if ok and b[R.p] == want then bump("valFix"); bump("fix_" .. code .. "_site") else bump("err") end
+        local back = b[R.p]; if R.k == "b" then back = back and 1 or 0 end
+        if ok and back == want then bump("valFix"); bump("fix_" .. code .. "_site") else bump("err") end
       end
     end
   end
@@ -854,14 +885,17 @@ local function evalBuilding(st, k)
   if F.on.values and next(H.v) ~= nil and (fresh or paused or next(H.sinceV) ~= nil or st.n % 3 == 0) then
     for code, want in pairs(H.v) do
       local R = RULE[code]
-      if R and R.on ~= false then
+      if R and R.on ~= false and not (R.set == "sleep" and sitesPaused(k)) then
         local cur = b[R.p]; if R.k == "b" then cur = cur and 1 or 0 end
         if type(cur) == "number" then
           local d = want - cur
           if d ~= 0 then differs = true end
           if H.new[code] then H.new[code] = nil; seen("val", d, R.margin) end
           -- lane 42: in exact mode the host's value is written at once (no margin, no settle time)
-          local mg, stl = R.margin, R.settle; if st.exact then mg, stl = 0, 0.0 end
+          local mg, stl = R.margin, R.settle; if st.exact and not R.daily then mg, stl = 0, 0.0 end
+          -- counted once per value the host sent: its lower value came before this copy's own day change (the case
+          -- that ran a day ahead), or its higher one after it (harmless)
+          if st.exact and R.daily and d ~= 0 and math.abs(d) <= mg and H.sinceV[code] == nil then bump(d < 0 and "val_dayHeldLower" or "val_dayHeldHigher") end
           if due(H.sinceV, code, d, mg, stl, clock, paused) then
             -- (lane 42: a house being upgraded gets its house values too; a rival's own settings then go by rivalSiteRules)
             e.live = liveNow(e); local can = e.live or (e.upg and not R.rival and upgNow(e))
@@ -1174,14 +1208,20 @@ local function friendFamJob(st)
       local cur = cs[p]; local isB = type(cur) == "boolean"; if isB then cur = cur and 1 or 0 end
       local id = R.k .. ":" .. i .. ":" .. p
       if type(cur) == "number" and cur ~= w then
-        if st.paused or F.famSince[id] or F.exact then   -- lane 42: exact mode: on the first look
+        -- lane 42: exact mode: on the first look. (lane 64) ... but a difference of one waits 3 s for this copy's
+        -- own day step (F.dayRule): the marks are counted by each copy's daily step too (hunger and cold go down a
+        -- day without food or fuel, sickness and an injury run out by days).
+        local go
+        if F.exact then go = F.dayRule(F.famDay, id, w - cur, os.clock(), st.paused); if not go then bump("fam_dayHeld") end
+        else go = st.paused or F.famSince[id] end
+        if go then
           F.famSince[id] = nil
           if isB then cs[p] = (w == 1) else cs[p] = w end
           local back = f.ConsumptionStatus[p]; if type(back) == "boolean" then back = back and 1 or 0 end
           if back == w then bump("famFix"); if F.cfg.verbose then log("family %s %d %s %s -> %s", R.k, i, p, tostring(cur), tostring(w)) end
           else F.on.families = false; bump("err"); log("item families switched off: %s of family %d did not take %s (%s)", p, i, tostring(w), tostring(back)) end
         else F.famSince[id] = st.clock end
-      else F.famSince[id] = nil end
+      else F.famSince[id] = nil; F.famDay[id] = nil end
     end
   end
   return false

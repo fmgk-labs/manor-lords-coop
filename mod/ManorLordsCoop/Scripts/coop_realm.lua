@@ -17,6 +17,7 @@ local un, valid, log = A.un, A.valid, A.log
 C.realm = C.realm or {}
 local R = C.realm
 R.on = R.on or { perk = true, tax = true, policy = true, name = true, fams = true, mercs = true, lords = true, notices = true }
+if R.on.logAll == nil then R.on.logAll = true end   -- (lane 66) a joining or reloading friend gets the host's whole notice list once (needs NOLOG on)
 R.stats = R.stats or { set = 0, is = 0, applied = 0, failed = 0, repairs = 0 }
 R.gHost = R.gHost or {}; R.claimSent = R.claimSent or {}; R.famHost = R.famHost or {}; R.known = R.known or {}; R.want = R.want or {}
 local POLL, KEYFRAME, VERIFY = 0.5, 30.0, 3.0
@@ -129,6 +130,15 @@ local function famCheck(S, rk, r, mineStr, clock)
   local H = R.famHost and R.famHost[rk]; if not H then return end
   if mineStr == H.v then H.since = nil; return end
   H.since = H.since or clock
+  -- (lane 64, lane 66's run 4) while the events module is putting a home of this region right (a family put out by
+  -- this copy's own burn-down, a house that is not a building here yet, a family that just arrived or left), the
+  -- repair waits: 3 s after the last such move, for 30 s at most.
+  local Ev = rawget(C, "events")
+  if Ev and Ev.homeBusy and clock - H.since < 30.0 then
+    local okB, busy = pcall(Ev.homeBusy, rk, clock)
+    if okB and busy then if not H.busy then H.busy = true; R.stats.famWaits = (R.stats.famWaits or 0) + 1 end; return end
+  end
+  H.busy = nil
   if clock - H.since < FAM_WAIT then return end
   H.since = clock                                           -- one attempt per wait
   local host, mine = {}, famKeys(r)
@@ -211,6 +221,7 @@ local function take(S, key, rk, item, value, why)
   if cur == value then R.want[key] = nil; return end
   local ok, done, err = pcall(apply, S, r, item, value)
   if ok and done then R.stats.applied = R.stats.applied + 1 else R.stats.failed = R.stats.failed + 1 end
+  if ok and done and C.panels and C.panels.touched then pcall(C.panels.touched, "R:" .. (item:match("^(%a+)") or item), nil) end   -- (lane 69) open panels redraw
   log("realm: %s %s %s -> %s (%s)%s", why, rk, item, value, tostring(cur), (ok and done) and "" or (" FAILED " .. tostring(ok and err or done)))
   R.want[key] = { v = value, t = os.clock() }       -- the next reads check that it took
 end
@@ -522,6 +533,65 @@ end
 -- finished sites at its own moment, so waiting for it can never be exact.
 -- This copy's own "enemy_squad_spotted" also drops its game speed (updateSquadVisibility calls SetGameSpeed): the speed
 -- watcher in coop.lua is told (S.spotT) before the line is taken out, so the drop is never sent as the player's.
+-- (lane 66, real-click re-check of 0.2.4) the drawn line. Taking an entry out of the lord's list and updateLogUI did not
+-- take its line off the screen (two lines for 2 to 6 s): each drawn notice is its own widget, LogEntry_C (in the HUD's
+-- notice box), which holds a copy of its entry and has its own Remove / RemoveWithAnimation. So the widget that shows
+-- the taken-out entry is removed too, with its own Remove, in the same tick. The widget's entry is found by the type of
+-- its field (a struct property of the struct LogEntry), read once per class.
+local LOGW_FIELD
+local function logWidgetField(w)
+  if LOGW_FIELD ~= nil then return LOGW_FIELD or nil end
+  LOGW_FIELD = false
+  pcall(function()
+    local cls = w:GetClass()
+    while cls and cls:IsValid() and not LOGW_FIELD do
+      cls:ForEachProperty(function(p)
+        if LOGW_FIELD then return end
+        local okS, sn = pcall(function() return p:GetStruct():GetFName():ToString() end)
+        if okS and sn == "LogEntry" then LOGW_FIELD = p:GetFName():ToString() end
+      end)
+      local ok, sup = pcall(function() return cls:GetSuperStruct() end)
+      if not ok or not sup or not sup:IsValid() then break end
+      cls = sup
+    end
+  end)
+  log("realm: the notice widget's entry field is %s", tostring(LOGW_FIELD))
+  return LOGW_FIELD or nil
+end
+-- the drawn notice widgets (on screen: a parent) as { w = widget, e = its entry }
+local function drawnLines()
+  local t = {}
+  for _, w in ipairs(FindAllOf("LogEntry_C") or {}) do
+    if valid(w) then
+      local okP, on = pcall(function() local p = w:GetParent(); return p ~= nil and p:IsValid() end)
+      if okP and on then
+        local f = logWidgetField(w)
+        local e; if f then pcall(function() e = w[f] end) end
+        t[#t + 1] = { w = w, e = e }
+      end
+    end
+  end
+  return t
+end
+R.drawnLines = drawnLines
+local function sameLine(a, b)
+  local ok, r = pcall(function()
+    if a.LogText:ToString() ~= b.LogText:ToString() then return false end
+    return math.abs(a.Location.X - b.Location.X) < 1 and math.abs(a.Location.Y - b.Location.Y) < 1
+  end)
+  return ok and r == true
+end
+-- take the drawn line of entry e off the screen with the widget's own Remove; returns how many
+local function removeDrawn(e)
+  local n = 0
+  for _, d in ipairs(drawnLines()) do
+    if d.e and sameLine(d.e, e) then
+      local ok = pcall(function() d.w:Remove() end)
+      if ok then n = n + 1 end
+    end
+  end
+  return n
+end
 local function ownLocalPrune(S, clock)
   local P = rawget(C, "patch")
   if not (P and P.nlOn == true and R.on.notices) then return end
@@ -539,9 +609,17 @@ local function ownLocalPrune(S, clock)
       if ok and not R.relayed[k] then
         local text = e.LogText:ToString()
         if text:find("enemy_squad_spotted", 1, true) then S.spotT = os.clock(); S.spGameWhy = "enemy squad spotted" end
-        local okR, eR = pcall(function() S.p1:removeLogEntry(e) end)
-        out = out + 1; R.stats.ownOut = (R.stats.ownOut or 0) + 1
-        log("realm: notice %s of this copy's own game taken out (%s); the host's line is the one shown", text, okR and "ok" or ("FAILED " .. tostring(eR)))
+        -- the drawn line first (the widget's own Remove), then the entry: found again by its key, because the widget's
+        -- removal may already have changed the list (an entry read before is then another one)
+        local drawn = removeDrawn(e)
+        local okR, eR = true, "gone with its line"
+        local la2 = S.p1.log; local n2 = #la2
+        for j = n2, math.max(1, n2 - 29), -1 do
+          local okK, k2 = pcall(logKey, la2[j])
+          if okK and k2 == k then local e2 = la2[j]; okR, eR = pcall(function() S.p1:removeLogEntry(e2) end); break end
+        end
+        out = out + 1; R.stats.ownOut = (R.stats.ownOut or 0) + 1; R.stats.ownDrawnOut = (R.stats.ownDrawnOut or 0) + drawn
+        log("realm: notice %s of this copy's own game taken out (%s; %d drawn line(s) removed); the host's line is the one shown", text, okR and "ok" or ("FAILED " .. tostring(eR)), drawn)
         break                                           -- the list changed: one at a time, the next one at the next look
       end
     end
@@ -575,6 +653,72 @@ local function logPoll(S)
   R.logN = n; R.logLast = last
 end
 
+-- ---- (lane 66, after 0.2.5) the host's whole notice list, once after each join or reload of a friend
+-- A load keeps none of the lord's notices (a copy that has just loaded holds only what came after: lane 64 a1, lane 66
+-- run 1), so a friend that joined or reloaded lacked every notice the host had before (lane 64: host 23, friend 19).
+-- The friend asks (R LOGASK) once per world while NOLOG is on; the host first sends what its poll has not sent yet, then
+-- its whole list in order: R LOGALL <serial> <i> <n> <tag> <text> <descr> <opens> <x> <y> <z> <actor> <time> <day>,
+-- ended by R LOGEND <serial> <n>. The friend applies it all or nothing when every line has come: its own list is
+-- emptied (every entry and its drawn line), then the host's entries are added in order, each through the mod's mark,
+-- with the alert sound held (the lord's DT_Alerts, the table playAlertFromTag reads, is empty for those calls only:
+-- with no table the routine plays nothing), its time, day and "displayed" written to the host's (by index, under the
+-- list's length), and its drawn line taken off in the same tick, so no old banner shows and no sound plays.
+local function hostLogAll(S, serial)
+  pcall(logPoll, S)                                     -- what the poll has not sent goes first (never twice)
+  local arr = S.p1.log; local n = #arr
+  for i = 1, n do
+    local e = arr[i]
+    local x, y, z = 0, 0, 0; pcall(function() x, y, z = e.Location.X, e.Location.Y, e.Location.Z end)
+    local okD, day = pcall(function() return e.DayOfTheYear end)
+    A.send(string.format("R LOGALL %s %d %d %s %s %s %d %.0f %.0f %.0f %s %.3f %d", serial, i, n, enc(e.Tag:ToString()), enc(e.LogText:ToString()),
+      enc(e.fullDescr:ToString()) .. "-", e.opensMenu, x, y, z, actorKey(e), e.Timestamp, okD and tonumber(day) or -1))
+  end
+  A.send(string.format("R LOGEND %s %d", serial, n))
+  log("realm: the whole notice list (%d entries) sent for a friend's join or reload (%s)", n, serial)
+end
+local function friendLogApply(S, L)
+  local P = rawget(C, "patch")
+  if not (P and P.nlOn == true) then log("realm: the host's whole notice list came but NOLOG is not on here: not applied"); return end
+  for i = 1, L.n do if not L.items[i] then log("realm: the host's whole notice list came incomplete (%d of %d): not applied", L.got, L.n); return end end
+  local p1 = S.p1
+  -- empty this copy's list: every entry with its drawn line (newest first; the length is read again each time)
+  local guard = 0
+  while #p1.log > 0 and guard < 200 do
+    guard = guard + 1
+    local la = p1.log; local e = la[#la]
+    removeDrawn(e)
+    local before = #la
+    pcall(function() p1:removeLogEntry(e) end)
+    if #p1.log >= before then break end                 -- nothing went (the entry did not match itself): stop, never loop
+  end
+  local left = #p1.log
+  -- the host's entries in order, with the alert table held empty for these calls only
+  local alerts = p1.DT_Alerts
+  local added, timed = 0, 0
+  local okAll, eAll = pcall(function()
+    p1.DT_Alerts = nil
+    for i = 1, L.n do
+      local h = L.items[i]
+      local actor = buildingByKey(S, h.actor)
+      P.markLog(); p1:addLog(FName(h.tag), h.text, h.descr, h.opens, h.pos, actor)
+      local la = p1.log; local n = #la
+      if n > 0 then
+        local e = la[n]
+        removeDrawn(e)                                    -- the line the game just drew for it: off, same tick
+        local okT = pcall(function() e.Timestamp = h.time; if h.day >= 0 then e.DayOfTheYear = h.day end; e.IsDisplayed = true end)
+        if okT then timed = timed + 1 end
+        R.relayed[logKey(e)] = true
+        added = added + 1
+      end
+    end
+  end)
+  p1.DT_Alerts = alerts                                  -- the alert table back, whatever happened above
+  pcall(function() p1:updateLogUI() end)
+  log("realm: the host's whole notice list applied: %d of %d added (%d with the host's time and day), %d of this copy's own left before (%s)",
+    added, L.n, timed, left, okAll and "ok" or ("FAILED " .. tostring(eAll)))
+  R.stats.logAll = (R.stats.logAll or 0) + 1
+end
+
 -- did the town module replay an action on this region a moment ago? (its echo table, keyed by the object's address)
 townReplayed = function(r)
   local Tn = C.town; local a = addr(r)
@@ -584,7 +728,7 @@ end
 
 local function fresh(S)
   if R.S == S and R.world == S.worlds then return end
-  R.S = S; R.world = S.worlds; R.logN = nil; R.logLast = nil; R.relayed = {}; R.pruneBase = nil; R.bCache = {}
+  R.S = S; R.world = S.worlds; R.logN = nil; R.logLast = nil; R.relayed = {}; R.pruneBase = nil; R.bCache = {}; R.logAll = nil
   R.known = {}; R.want = {}; R.famHost = {}; R.gHost = {}; R.claimSent = {}; R.regions = nil; R.tPoll = 0; R.tKey = -1e9
 end
 
@@ -637,12 +781,45 @@ function M.tick(S, clock)
   if C.hold then return end                                -- a join or repair is running
   if clock - R.tPoll >= POLL then R.tPoll = clock; poll(S, clock) end
   if S.role == "host" and R.on.notices and clock - (R.tLog or 0) >= 0.1 then R.tLog = clock; local okL, eL = pcall(logPoll, S); if not okL then R.lastErr = tostring(eL) end end
+  -- (lane 66) a friend asks once per world for the host's whole notice list, once NOLOG is on here
+  if S.role == "friend" and R.on.notices and R.on.logAll and R.askWorld ~= S.worlds then
+    local P = rawget(C, "patch")
+    if P and P.nlOn == true then
+      R.askWorld = S.worlds
+      local serial = tostring(S.name) .. "." .. tostring(S.worlds) .. "." .. tostring(math.floor(os.clock() * 1000))
+      R.logAll = { serial = serial, items = {}, n = -1, got = 0 }
+      A.send("R LOGASK " .. serial)
+      log("realm: the host's whole notice list asked for (%s)", serial)
+    end
+  end
   if S.role == "friend" and clock - (R.tPrune or 0) >= 0.1 then R.tPrune = clock; local okP, eP = pcall(ownLocalPrune, S, clock); if not okP then R.lastErr = tostring(eP) end end   -- (lane 66)
 end
 function M.onMessage(S, from, kind, w, line)
   if kind ~= "R" then return false end
   fresh(S)
   local verb, rk, item, value = w[4], w[5], w[6], w[7]
+  if verb == "LOGASK" then                                  -- (lane 66) a friend's join or reload: the whole list once
+    if S.role == "host" and R.on.notices and w[5] then local ok, e = pcall(hostLogAll, S, w[5]); if not ok then log("realm: whole notice list not sent: %s", tostring(e)) end end
+    return true
+  elseif verb == "LOGALL" or verb == "LOGEND" then
+    local L = R.logAll
+    if S.role ~= "friend" or not L or w[5] ~= L.serial then return true end   -- another friend's list
+    if verb == "LOGALL" then
+      local i, n = tonumber(w[6]), tonumber(w[7])
+      if i and n and i >= 1 and i <= n and n <= 200 and not L.items[i] then
+        L.n = n; L.got = L.got + 1
+        L.items[i] = { tag = dec(w[8] or ""), text = dec(w[9] or ""), descr = dec(((w[10] or "-"):gsub("%-$", ""))), opens = tonumber(w[11]) or 0,
+          pos = { X = (tonumber(w[12]) or 0) + 0.0, Y = (tonumber(w[13]) or 0) + 0.0, Z = (tonumber(w[14]) or 0) + 0.0 },
+          actor = w[15] or "-", time = tonumber(w[16]) or 0, day = tonumber(w[17]) or -1 }
+      end
+    else
+      L.n = tonumber(w[6]) or L.n
+      R.logAll = nil
+      local ok, e = pcall(friendLogApply, S, L)
+      if not ok then log("realm: the host's whole notice list not applied: %s", tostring(e)) end
+    end
+    return true
+  end
   if verb == "LOG" then
     if S.role == "friend" and R.on.notices and w[5] and w[6] and w[7] then
       local tag, text, descr = dec(w[5]), dec(w[6]), dec((w[7]:gsub("%-$", "")))
@@ -682,6 +859,7 @@ function M.onMessage(S, from, kind, w, line)
       elseif reg and not claimTags(claimsStr(S.p1))[tag] then
         local ok, e = pcall(function() S.p1:layClaim(reg, how == "f", true) end)
         log("realm: %s lays a claim on %s with %s%s", tostring(from), tag, how == "f" and "king's favour" or "influence", ok and "" or (" FAILED " .. tostring(e)))
+        if ok and C.panels and C.panels.touched then pcall(C.panels.touched, "R:claim", nil) end   -- (lane 69) open panels redraw
       end
     end
     return true

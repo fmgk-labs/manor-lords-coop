@@ -110,15 +110,15 @@ end
 -- console: put every patched byte back and stop sending (the DLL stays loaded)
 function P.disable()
   if P.fn then P.send("ALLOFF"); P.tick() end
-  P.wanted = false
+  P.wanted = false; P.ndOn = false                 -- (lane 64) NODEATH went off with ALLOFF: sent again when enabled
   return "patch module off, ALLOFF sent"
 end
 
--- ---- status file, parsed at most twice a second
+-- ---- status file, read at most once a second (lane 65: was twice; each read is an open, see coop_steam.lua status)
 local MT = { __tostring = function(t) return t.text or ("patch status: " .. tostring(t.state)) end }
 function P.status()
   local t = os.clock()
-  if P.st and t - (P.stT or -1) < 0.5 then return P.st end
+  if P.st and t - (P.stT or -1) < 1.0 then return P.st end
   P.stT = t
   local f = io.open(P.statusPath, "rb")
   -- lane 45: the file read again, but parsed only when its text changed (the parse was 0.4 ms a frame on a friend)
@@ -673,7 +673,7 @@ local function step(S, inWorld)
       -- each time (sitting n1: MEN HOOK ON, ALLOFF 50 ms later, every 2 s; 53 table empties in a minute)
       for name, it in pairs(P.status().items) do if it.state == "on" and name ~= "SNAP" and name ~= "GUARD" and not (keep and name == "GOODS") then again = true end end
     end
-    if not P.hostOff or again then P.hostOff = true; P.hostT = os.clock(); P.send("ALLOFF"); P.gOn = false; P.tOn = false; P.hOn = false; log("host copy: ALLOFF (TOTALS: recount)") end
+    if not P.hostOff or again then P.hostOff = true; P.hostT = os.clock(); P.send("ALLOFF"); P.gOn = false; P.tOn = false; P.hOn = false; P.ndOn = false; log("host copy: ALLOFF (TOTALS: recount)") end
     if keep then goodsStep(S, inWorld and not C.hold) end
   elseif S.role == "friend" then
     if inWorld and P.sentWorld ~= S.worlds then
@@ -705,6 +705,36 @@ local function step(S, inWorld)
       P.send(want and "NOFINISH ON" or "NOFINISH OFF")
       log("friend copy: NOFINISH %s", want and "ON" or "OFF")
     end
+    -- NODEATH (lane 64): on a friend's copy nobody dies by this copy's own game (hunger and cold, a work accident, a
+    -- fire, a collapsing building, the animals' hunger); a death comes on the host's word (the events module's E PD:
+    -- the game's own SMUnit:just_die through the reflected function, which the item leaves alone). In battles the same
+    -- rule is NOKILL. On while this copy plays in the host's world, off while a save loads and when it is no friend.
+    -- (live session of 2026-11-17: a villager starved on two friends' copies and not on the host.)
+    -- (test only: Coop.patch.test = { nodeathOff = true } keeps it off on a friend: the control run that must show a
+    -- death on the friend alone again)
+    local wantND = want and not (P.test and P.test.nodeathOff)
+    if wantND ~= (P.ndOn or false) then
+      P.ndOn = wantND
+      P.send(wantND and "NODEATH ON" or "NODEATH OFF"); P.ndT = os.clock(); P.ndState = nil
+      log("friend copy: NODEATH %s%s", wantND and "ON" or "OFF", (want and not wantND) and " (the test switch nodeathOff)" or "")
+    end
+    if P.ndOn and os.clock() - (P.ndT or 0) > 2.0 then
+      P.ndT = os.clock() + 8.0                                    -- looked at every 10 s
+      local it = P.status().items.NODEATH
+      -- wanted on and found off (an ALLOFF of another module took it out with everything else): on again
+      if it and it.state == "off" and (P.ndAgain or 0) < 5 then
+        P.ndAgain = (P.ndAgain or 0) + 1; P.send("NODEATH ON"); P.ndT = os.clock(); log("friend copy: NODEATH was off: ON sent again")
+      else
+        local why = it and tostring(it.why or ""):gsub("%s*refused=%d+", "") or ""
+        local s = it and (tostring(it.state) .. " " .. why) or "not in this native piece (an older one)"
+        if it and it.state ~= "off" then P.ndAgain = 0 end
+        if s ~= P.ndState then
+          P.ndState = s
+          if it and it.state == "on" then log("NODEATH on: this copy's own game kills nobody (%s)", why)
+          else log("NODEATH is NOT fully on: %s. A villager can still die on this copy alone by the causes named 'na' or 'off'", s) end
+        end
+      end
+    end
     -- GOODS: the stock of this copy's buildings changes only on the host's word. On while this copy plays in the
     -- host's world AND the host has said that it sends every building's stock (P.hostExact, set by coop_facts.lua when
     -- the host's "F X 1" arrives: without those values a frozen building would simply be wrong); off while a save
@@ -732,6 +762,7 @@ local function step(S, inWorld)
     end
   else
     if P.nfOn then P.nfOn = false end
+    if P.ndOn then P.ndOn = false; P.send("NODEATH OFF"); log("NODEATH OFF: this copy is no longer a friend") end   -- lane 64
     if P.gOn then P.gOn = false end
     -- neither host nor friend (a copy that left the session): the recount, so its totals are its own game's again
     if P.tOn then P.tOn = false; P.send("TOTALS OFF"); P.tick(); log("TOTALS OFF (recount): this copy is no longer a friend") end
@@ -827,14 +858,29 @@ end
 P.decPoints = decP
 -- the hook's lines: read from where the last call stopped; a file that shrank (the DLL starts it again above 256 KB)
 -- is read from its start; what was there before this session's first call is skipped (old addresses)
+-- (lane 65) called every frame (C.preOrders): the file's handle is kept, a call is a seek (an open after the DLL's
+-- write cost about 2 ms on the developer's PC, more on a friend's: core:preOrders 1.1 ms a frame live). The C
+-- runtime's handle does not share delete, and the DLL deletes the file above 256 KB (coop_patch.c l28_event): above
+-- that size the handle is let go after every read, as before, until the DLL has started the file again.
+local EV_CAP = 256 * 1024
 function P.orderEvents()
-  local f = io.open(P.dir .. "patch_events.txt", "rb"); if not f then P.evOff = P.evOff or 0; return {} end
+  local path = P.dir .. "patch_events.txt"
+  local f = P.evF
+  if f and P.evP ~= path then pcall(io.close, f); f = nil; P.evF = nil end
+  if not f then
+    f = io.open(path, "rb"); if not f then P.evOff = P.evOff or 0; return {} end
+    f:setvbuf("no")
+  end
   local size = f:seek("end")
-  if P.evOff == nil then P.evOff = size; f:close(); return {} end
+  if not size then pcall(io.close, f); P.evF = nil; return {} end
+  local keep = size <= EV_CAP
+  if keep then P.evF, P.evP = f, path else P.evF = nil end
+  local function done() if not keep then f:close() end end
+  if P.evOff == nil then P.evOff = size; done(); return {} end
   if size < P.evOff then P.evOff = 0 end
-  if size == P.evOff then f:close(); return {} end
+  if size == P.evOff then done(); return {} end
   f:seek("set", P.evOff)
-  local text = f:read(size - P.evOff) or ""; f:close()
+  local text = f:read(size - P.evOff) or ""; done()
   local last = text:match(".*()\n"); if not last then return {} end        -- only whole lines
   P.evOff = P.evOff + last
   local t = {}

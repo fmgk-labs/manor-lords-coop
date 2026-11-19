@@ -40,7 +40,11 @@
 #include <limits.h>
 #include "coop_scan.h"
 
-#define COOP_PATCH_VERSION "0.9.3"    /* 0.9.2 (lane 62): a bug report takes the Steam piece's log and status; 0.9.3 (lane 66, provisional): NOTHEFT, NOLOG */
+#define COOP_PATCH_VERSION "0.9.7"    /* 0.9.7 (lane 71): COLLAPSE, SITEHP, MROLL, FAMROLL (coop_rolls.h); FIELD's audit puts the counted numbers back; status buffers 16 KB
+                                       * 0.9.6 (lane 72; lane 66 adds the NOLOG site LOGPOP, the event window): HIST items, TRYADD/MAPADD (test copies) */
+/* 0.9.5 (lane 64): NODEATH */
+/* 0.9.4 and before: 0.9.2 (lane 62): a bug report takes the Steam piece's log and status; 0.9.3 (lane 66, provisional): NOTHEFT, NOLOG
+                                       * 0.9.4 (lane 65): log and command file handles kept (no open a line or a command); counter-only commands do not force a status write */
 #define LOG_CAP            (256u * 1024u)
 #define MAX_LINE           4096       /* lane 22: a TOTALS SET line names every good of a region (512 was too short live) */
 #define READ_CHUNK         65536
@@ -89,6 +93,10 @@ static void join_path(wchar_t *out, const wchar_t *dir, const wchar_t *name);
 #include "coop_scrub.h"                     /* lane 61: no user name, Steam name or whole Steam id in what is written */
 
 /* ------------------------------------------------------------------ log */
+static HANDLE    g_log_h;                   /* (lane 65) the kept log handle, or NULL */
+static wchar_t   g_log_hpath[MAX_PATH];     /* the path it was opened for */
+static ULONGLONG g_log_ms;                  /* the last line */
+static SRWLOCK   g_log_lock = SRWLOCK_INIT;
 static void log_line(const char *fmt, ...)
 {
     char msg[700], line[800];
@@ -114,19 +122,38 @@ static void log_line(const char *fmt, ...)
                   t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, msg);
     if (n < 0) n = (int)strlen(line);
     line[n++] = '\r'; line[n++] = '\n';
-    h = CreateFileW(g_log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
+    /* (lane 65) the handle is kept while lines come (an open and close cost milliseconds a line on a PC whose
+     * real-time scan checks a file opened after a write); let go when the folder changes, at the move to .old, on a
+     * failed write and after a second without a line (log_idle, at the end of each tick) */
+    AcquireSRWLockExclusive(&g_log_lock);
+    if (g_log_h && wcscmp(g_log_hpath, g_log_path) != 0) { CloseHandle(g_log_h); g_log_h = NULL; }
+    h = g_log_h;
+    if (!h) {
+        h = CreateFileW(g_log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) { ReleaseSRWLockExclusive(&g_log_lock); return; }
+        g_log_h = h; wcscpy(g_log_hpath, g_log_path);
+    }
     if (GetFileSizeEx(h, &sz) && sz.QuadPart > (LONGLONG)LOG_CAP) {
-        CloseHandle(h);
+        CloseHandle(h); g_log_h = NULL;
         MoveFileExW(g_log_path, g_log_old, MOVEFILE_REPLACE_EXISTING);
         h = CreateFileW(g_log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
                         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (h == INVALID_HANDLE_VALUE) return;
+        if (h == INVALID_HANDLE_VALUE) { ReleaseSRWLockExclusive(&g_log_lock); return; }
+        g_log_h = h; wcscpy(g_log_hpath, g_log_path);
     }
-    WriteFile(h, line, (DWORD)n, &wr, NULL);
-    CloseHandle(h);
+    if (!WriteFile(h, line, (DWORD)n, &wr, NULL)) { CloseHandle(h); g_log_h = NULL; }
+    g_log_ms = GetTickCount64();
+    ReleaseSRWLockExclusive(&g_log_lock);
     co_add(CO_LOG, co0);                                  /* lane 45 */
+}
+/* (lane 65) a log without a line for a second: its handle is let go (another program may then move or delete it) */
+static void log_idle(void)
+{
+    if (!g_log_h || GetTickCount64() - g_log_ms < 1000) return;
+    AcquireSRWLockExclusive(&g_log_lock);
+    if (g_log_h) { CloseHandle(g_log_h); g_log_h = NULL; }
+    ReleaseSRWLockExclusive(&g_log_lock);
 }
 #include "coop_wd.h"                        /* lane 51: the frame watchdog (after log_line, before the hooks) */
 
@@ -266,11 +293,30 @@ static void endhold_off(const char *why);
 static int nolog_status(char *buf, size_t len);      /* lane 66: the NOLOG line */
 static int nolog_scan(void);
 static void nolog_off(const char *why);
+static int collapse_status(char *buf, size_t len);   /* lane 71: the COLLAPSE line (coop_rolls.h) */
+static int collapse_scan(void);
+static void collapse_off(const char *why);
+static void collapse_tick(void);
+static int sitehp_status(char *buf, size_t len);     /* lane 71: the SITEHP line (coop_rolls.h) */
+static int sitehp_scan(void);
+static void sitehp_tick(void);
+static int mroll_status(char *buf, size_t len);      /* lane 71: the MROLL line (coop_rolls.h) */
+static int mroll_scan(void);
+static void mroll_off(const char *why);
+static void mroll_tick(void);
+static int famroll_status(char *buf, size_t len);    /* lane 71: the FAMROLL line (coop_rolls.h) */
+static int famroll_scan(void);
+static void famroll_off(const char *why);
 static int report_status(char *buf, size_t len);     /* lane 61: the REPORT line (coop_report.h) */
+static int nodeath_status(char *buf, size_t len);    /* lane 64: the NODEATH line (coop_die.h) */
+static int nodeath_scan(void);
+static void nodeath_off(const char *why);
+static int hist_status(char *buf, size_t len);       /* lane 72: the HIST line (coop_hist.h) */
+static int hist_scan(void);
 
 static int write_status(void)              /* lane 45: 0 = not written yet (only counters changed): stays dirty */
 {
-    char buf[8192];                             /* lane 43: was 4096; the items' lines came near it */
+    char buf[16384];                            /* lane 43: was 4096; the items' lines came near it. lane 71: 16384 (0.2.5's items) */
     int n = 0, k;
     HANDLE h;
     DWORD wr;
@@ -311,9 +357,15 @@ static int write_status(void)              /* lane 45: 0 = not written yet (only
     n += guide_status(buf + n, sizeof(buf) - (size_t)n);    /* lane 49 */
     n += fell_status(buf + n, sizeof(buf) - (size_t)n);     /* lane 54 */
     n += endhold_status(buf + n, sizeof(buf) - (size_t)n);  /* lane 49, round four */
+    n += nodeath_status(buf + n, sizeof(buf) - (size_t)n);  /* lane 64 */
     n += nolog_status(buf + n, sizeof(buf) - (size_t)n);    /* lane 66 */
     n += maint_status(buf + n, sizeof(buf) - (size_t)n);    /* lane 67 */
+    n += collapse_status(buf + n, sizeof(buf) - (size_t)n); /* lane 71 */
+    n += sitehp_status(buf + n, sizeof(buf) - (size_t)n);   /* lane 71 */
+    n += mroll_status(buf + n, sizeof(buf) - (size_t)n);    /* lane 71 */
+    n += famroll_status(buf + n, sizeof(buf) - (size_t)n);  /* lane 71 */
     n += report_status(buf + n, sizeof(buf) - (size_t)n);   /* lane 61 */
+    n += hist_status(buf + n, sizeof(buf) - (size_t)n);     /* lane 72 */
     n += _snprintf(buf + n, sizeof(buf) - (size_t)n, "process %lu version %s\r\n", GetCurrentProcessId(), COOP_PATCH_VERSION);
 have_text:
     if (n < 0 || n > (int)sizeof(buf)) n = (int)strlen(buf);
@@ -514,8 +566,14 @@ static void scan_end(void)
     if (guide_scan()) any = 1;     /* lane 49 */
     if (fell_scan()) any = 1;      /* lane 54 */
     if (endhold_scan()) any = 1;   /* lane 49, round four */
+    if (nodeath_scan()) any = 1;   /* lane 64 */
     if (nolog_scan()) any = 1;     /* lane 66 */
     if (maint_scan()) any = 1;     /* lane 67 */
+    hist_scan();                   /* lane 72 (HIST: probes; does not count as a patch) */
+    if (collapse_scan()) any = 1;  /* lane 71 */
+    if (sitehp_scan()) any = 1;    /* lane 71 */
+    if (mroll_scan()) any = 1;     /* lane 71 */
+    if (famroll_scan()) any = 1;   /* lane 71 */
     if (!any) {
         g_off = 1;
         _snprintf(g_off_reason, sizeof(g_off_reason), "nothing matches this game build (timestamp %X)", g_stamp);
@@ -617,9 +675,16 @@ static void restore_all(void)
     __except (EXCEPTION_EXECUTE_HANDLER) { log_line("MEN restore raised exception %08lX", GetExceptionCode()); }
     __try { endhold_off("all patches off"); }   /* lane 49, round four */
     __except (EXCEPTION_EXECUTE_HANDLER) { log_line("ENDHOLD restore raised exception %08lX", GetExceptionCode()); }
+    nodeath_off("all patches off");             /* lane 64 (each site in its own __try) */
     __try { nolog_off("all patches off"); }      /* lane 66 */
     __except (EXCEPTION_EXECUTE_HANDLER) { log_line("NOLOG restore raised exception %08lX", GetExceptionCode()); }
     maint_forget();                             /* lane 67: data only; the held entries are dropped */
+    __try { collapse_off("all patches off"); }  /* lane 71 */
+    __except (EXCEPTION_EXECUTE_HANDLER) { log_line("COLLAPSE restore raised exception %08lX", GetExceptionCode()); }
+    __try { mroll_off("all patches off"); }     /* lane 71 */
+    __except (EXCEPTION_EXECUTE_HANDLER) { log_line("MROLL restore raised exception %08lX", GetExceptionCode()); }
+    __try { famroll_off("all patches off"); }   /* lane 71 */
+    __except (EXCEPTION_EXECUTE_HANDLER) { log_line("FAMROLL restore raised exception %08lX", GetExceptionCode()); }
     for (k = S_P1; k <= S_PATCH_LAST; k++) {
         site_eval *e = &g_site[k];
         if (e->len == 0 || e->patch_rva == 0 || e->orig[0] == 0 || !g_base) continue;   /* never evaluated: nothing to restore */
@@ -4128,10 +4193,18 @@ static void regset_cmd(int argc, char **argv)
 
 /* ------------------------------------------------------------------ ENDHOLD (lane 49, round four): its own file */
 #include "coop_endhold.h"
+/* ------------------------------------------------------------------ NODEATH (lane 64): its own file */
+#include "coop_die.h"
 #include "coop_nolog.h"                     /* lane 66: NOLOG */
+
+/* ------------------------------------------------------------------ COLLAPSE (lane 71): its own file */
+#include "coop_rolls.h"
 
 /* ------------------------------------------------------------------ REPORT (lane 61): the bug report, its own file */
 #include "coop_report.h"
+
+/* ------------------------------------------------------------------ HIST (lane 72): the first-run probes, its own file */
+#include "coop_hist.h"
 
 /* ------------------------------------------------------------------ DIST (lane 42): a house's market goods on the host's word
  * (research/2026-11-10-game-probe/lanes/lane_s21_42/report.txt)
@@ -4412,7 +4485,8 @@ static void command(char *line)
     /* lane 40: FIELD POLL / SET / CHECK come several times a second: counted in the status, not logged one by one */
     if (!(_strnicmp(line, "FIELD POLL", 10) == 0 || _strnicmp(line, "FIELD SET ", 10) == 0 || _strnicmp(line, "FIELD CHECK ", 12) == 0 ||
           _strnicmp(line, "MEN POLL", 8) == 0 || _strnicmp(line, "MEN SET ", 8) == 0 || _strnicmp(line, "MEN WAYS ", 9) == 0 ||   /* lane 43: several times a second */
-          _strnicmp(line, "MAINT READ ", 11) == 0 || _strnicmp(line, "MAINT SET ", 10) == 0)                                      /* lane 67: every second */
+          _strnicmp(line, "MAINT READ ", 11) == 0 || _strnicmp(line, "MAINT SET ", 10) == 0 ||                                    /* lane 67: every second */
+          _strnicmp(line, "SITEHP POLL", 11) == 0 || _strnicmp(line, "SITEHP HOLD ", 12) == 0)                                   /* lane 71 */
         && !snap_quiet_cmd(line) && !co_quiet_cmd(line))                                          /* lane 45: TOTALS SET, DIST SET, REGSET LIST */
         log_line("command: %.160s%s", line, strlen(line) > 160 ? " ..." : "");     /* a TOTALS SET line is long */
     argc = split(line, argv, 8);
@@ -4482,8 +4556,20 @@ static void command(char *line)
     if (_stricmp(argv[0], "MAINT") == 0) { maint_cmd(argc, argv); return; }
     /* lane 49, round four: ENDHOLD ON|OFF | SET <ceiling ms> <unit>:<type>:<building>,... | RANGE <lo> <hi> */
     if (_stricmp(argv[0], "ENDHOLD") == 0) { endhold_cmd(argc, argv); return; }
+    /* lane 64: NODEATH ON|OFF (nobody dies by this copy's own game: hunger and cold, work accident, fire, collapse, animals' hunger) */
+    if (_stricmp(argv[0], "NODEATH") == 0) { nodeath_cmd(argc, argv); return; }
     /* lane 66: NOLOG ON|OFF (a friend's game adds no notice of its own; the mod's, through the script layer, go in) */
     if (_stricmp(argv[0], "NOLOG") == 0) { nolog_cmd(argc, argv); return; }
+    /* lane 72: HIST SUBDUMP | GRIDHASH | DUMP | DUMPLIST (read only) | TRYADD (a test copy only) */
+    if (_stricmp(argv[0], "HIST") == 0) { hist_cmd(argc, argv); return; }
+    /* lane 71: COLLAPSE ON|OFF|WATCH | DO <building> (a building collapses on the host's word) */
+    if (_stricmp(argv[0], "COLLAPSE") == 0) { collapse_cmd(argc, argv); return; }
+    /* lane 71: SITEHP WATCH|HOLD|DROP|FORGET|POLL (a site's work done is the host's) */
+    if (_stricmp(argv[0], "SITEHP") == 0) { sitehp_cmd(argc, argv); return; }
+    /* lane 71: MROLL ON|OFF|WATCH (the daily maintenance roll on the host's word) */
+    if (_stricmp(argv[0], "MROLL") == 0) { mroll_cmd(argc, argv); return; }
+    /* lane 71: FAMROLL ON|OFF | SITES <ret1> <ret2> (births, new families and sickness on the host's word) */
+    if (_stricmp(argv[0], "FAMROLL") == 0) { famroll_cmd(argc, argv); return; }
     if (_stricmp(argv[0], "ROUT") == 0) { do_call(0, argc, argv); return; }
     if (_stricmp(argv[0], "REFORM") == 0) { do_call(1, argc, argv); return; }
     if (_stricmp(argv[0], "FINISH") == 0) { do_call(2, argc, argv); return; }
@@ -4549,6 +4635,9 @@ static void command(char *line)
 }
 
 /* tail patch_cmd.txt by byte offset; only complete lines are consumed; a shrunk file is read again from 0 */
+static HANDLE    g_cmd_h;                   /* (lane 65) the kept read handle of patch_cmd.txt, or NULL */
+static wchar_t   g_cmd_hpath[MAX_PATH];
+static ULONGLONG g_cmd_ms;                  /* the last time commands were read */
 static void poll_commands(void)
 {
     WIN32_FILE_ATTRIBUTE_DATA fa;
@@ -4557,16 +4646,36 @@ static void poll_commands(void)
     LARGE_INTEGER pos;
     static char buf[READ_CHUNK + 1];
     DWORD got = 0, want, i, start = 0;
-    if (!GetFileAttributesExW(g_cmd_path, GetFileExInfoStandard, &fa)) { if (g_cmd_off) g_cmd_off = 0; return; }
+    /* (lane 65) the file is looked at by its attributes every tick, as before (no open); while commands come, its read
+     * handle is kept and read from, so a tick with commands opens nothing either. The handle shares delete: when the
+     * name no longer shows the size the handle has (the file was deleted and made again), the handle is let go and
+     * the file is taken as the attributes show it, as before. After a second without a command it is let go too. */
+    if (g_cmd_h && wcscmp(g_cmd_hpath, g_cmd_path) != 0) { CloseHandle(g_cmd_h); g_cmd_h = NULL; }
+    if (!GetFileAttributesExW(g_cmd_path, GetFileExInfoStandard, &fa)) {
+        if (g_cmd_h) { CloseHandle(g_cmd_h); g_cmd_h = NULL; }
+        if (g_cmd_off) g_cmd_off = 0;
+        return;
+    }
     size = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+    if (g_cmd_h) {
+        LARGE_INTEGER sz;
+        if (!GetFileSizeEx(g_cmd_h, &sz) || (ULONGLONG)sz.QuadPart != size) { CloseHandle(g_cmd_h); g_cmd_h = NULL; }
+    }
     if (size < g_cmd_off) { log_line("patch_cmd.txt shrank (%llu < %llu): reading from the start", size, g_cmd_off); g_cmd_off = 0; }
-    if (size == g_cmd_off) return;
-    h = CreateFileW(g_cmd_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
+    if (size == g_cmd_off) {
+        if (g_cmd_h && GetTickCount64() - g_cmd_ms >= 1000) { CloseHandle(g_cmd_h); g_cmd_h = NULL; }
+        return;
+    }
+    h = g_cmd_h;
+    if (!h) {
+        h = CreateFileW(g_cmd_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) return;
+        g_cmd_h = h; wcscpy(g_cmd_hpath, g_cmd_path);
+    }
+    g_cmd_ms = GetTickCount64();
     pos.QuadPart = (LONGLONG)g_cmd_off;
     want = (DWORD)((size - g_cmd_off) > READ_CHUNK ? READ_CHUNK : (size - g_cmd_off));
-    if (!SetFilePointerEx(h, pos, NULL, FILE_BEGIN) || !ReadFile(h, buf, want, &got, NULL)) { CloseHandle(h); return; }
-    CloseHandle(h);
+    if (!SetFilePointerEx(h, pos, NULL, FILE_BEGIN) || !ReadFile(h, buf, want, &got, NULL)) { CloseHandle(h); g_cmd_h = NULL; return; }
     for (i = 0; i < got; i++) {
         if (buf[i] == '\n') {
             char line[MAX_LINE];
@@ -4622,6 +4731,9 @@ static void tick_body(void)
     field_tick();           /* lane 40: queued plant drawings, audits */
     men_tick();             /* lane 43: a faulted hook taken out */
     maint_tick();           /* lane 67: the host's maintenance back where this copy's own day wore it */
+    collapse_tick();        /* lane 71: the host's collapses of this tick to collapse_out.txt */
+    sitehp_tick();          /* lane 71: the held sites' work as the host's */
+    mroll_tick();           /* lane 71: the host's work accidents of this tick to accident_out.txt */
     goods_tick();           /* and what an audit or a command of this tick left */
     totals_tick();
     hold_tick();
@@ -4653,6 +4765,7 @@ __declspec(dllexport) int __cdecl coop_patch_tick(void *L)
         __try { done = write_status(); } __except (EXCEPTION_EXECUTE_HANDLER) { (void)0; }
         if (done) g_dirty = 0;               /* lane 45: a status with only new counters waits (at most a second) */
     }
+    log_idle();                                 /* lane 65 */
     co_add(CO_TICK, co0);
     wd_out(WD_TICK);
     g_in_tick = 0;

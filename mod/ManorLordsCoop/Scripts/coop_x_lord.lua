@@ -47,6 +47,7 @@ local function setWar(S, code, on)
   -- inside the town module's quiet wrapper: the hook below ("this player declared war") must not see the mod's own call
   T.quiet(function() if on then S.p1:declareWar(pw) else S.p1:declarePeace(pw) end end)
   pcall(function() S.p1:updateCommandedAndEnemySquads(false) end)
+  if C.panels and C.panels.touched then pcall(C.panels.touched, "WAR", nil) end   -- (lane 69) another player's war or peace: open panels redraw
   return true
 end
 

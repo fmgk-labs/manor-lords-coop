@@ -63,10 +63,13 @@ if not load("coop.lua") then return end
 -- optional modules: present in a full install, absent in a core-only test
 -- coop_x_*.lua: actions added per area in their own files (they use the town module's api and load after it)
 for _, m in ipairs({ "coop_town.lua", "coop_world.lua", "coop_join.lua", "coop_realm.lua", "coop_patch.lua", "coop_snap.lua", "coop_sites.lua", "coop_ui.lua", "coop_steam.lua", "coop_session.lua", "coop_focus.lua",
-                     "coop_x_town.lua", "coop_x_build.lua", "coop_x_lord.lua", "coop_x_army.lua", "coop_x_men.lua", "coop_x_merch.lua", "coop_x_maint.lua", "coop_x_events.lua", "coop_x_people.lua", "coop_x_jobs.lua", "coop_facts.lua", "coop_x_scene.lua", "coop_dev.lua" }) do
+                     "coop_x_town.lua", "coop_x_build.lua", "coop_x_lord.lua", "coop_x_army.lua", "coop_x_men.lua", "coop_x_merch.lua", "coop_x_maint.lua", "coop_x_events.lua", "coop_x_people.lua", "coop_x_jobs.lua", "coop_facts.lua", "coop_x_scene.lua", "coop_x_panels.lua", "coop_dev.lua" }) do
   local t = io.open(scripts .. "/" .. m, "r")
   if t then t:close(); load(m) end
 end
+-- lane 72: the histories and per-copy values on the host's word (production tracker, time pie, expertise, prices,
+-- squads' men); after the list above, as it uses coop_world.lua's keys and coop.lua's army functions
+do local t = io.open(scripts .. "/coop_x_stats.lua", "r"); if t then t:close(); load("coop_x_stats.lua") end end
 
 local peers = {}
 if cfg.role ~= "friend" then for n in cfg.friends:gmatch("[^,%s]+") do peers[#peers + 1] = n end end

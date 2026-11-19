@@ -610,13 +610,93 @@ function W.compareFp(a, b)
   return bad
 end
 
+-- (lane 71) the families part of the fingerprint as it is now, for the regions the host's part names (same text as the
+-- sample's step 2 builds)
+function W.famNow(S, hostF)
+  local t = {}
+  for part in tostring(hostF):gmatch("[^|]+") do
+    local tag = part:match("^([^:]+):")
+    local r = tag and W.regionByKey(tag)
+    if r and valid(r) then
+      local k = W.rkey(r)
+      local okF, f = pcall(function()
+        return k .. ":" .. #r.workerFamilies .. "/" .. r:getNumHomelessFamilies() .. "/" .. r:getNumTotalPopulation() .. "/L" .. r.settlementLevel
+          .. "/" .. r:getNumFamiliesOfLv(1) .. "," .. r:getNumFamiliesOfLv(2) .. "," .. r:getNumFamiliesOfLv(3) .. "," .. r:getNumFamiliesOfLv(4)
+      end)
+      t[#t + 1] = okF and f or (k .. ":ERR")
+    end
+  end
+  table.sort(t)
+  return (table.concat(t, "|"):gsub("%s", "_"))
+end
+
+local judgeFp
 local function tryCompare(S, day)
   local a, b = W.fp.host[day], W.fp.mine[day]
   if not (a and b) then return end
   W.fp.host[day] = nil; W.fp.mine[day] = nil
   for d in pairs(W.fp.host) do if d < day - 3 then W.fp.host[d] = nil end end
   for d in pairs(W.fp.mine) do if d < day - 3 then W.fp.mine[d] = nil end end
+  judgeFp(S, day, a, b, false)
+end
+-- (lane 71) a pair whose families part waits for the host's growth of the day (see below): judged again later
+function W.fpLaterStep(S)
+  local L = W.fpLater; if not (L and #L > 0) then return end
+  local now = os.clock()
+  for i = #L, 1, -1 do
+    local x = L[i]
+    if now >= x.t then
+      table.remove(L, i)
+      local b2 = {}; for k, v in pairs(x.b) do b2[k] = v end
+      local okF, f = pcall(W.famNow, S, x.a.F); if okF and f and x.a.F then b2.F = f end
+      local okR, rr = pcall(W.regNow, S, x.a.R); if okR and rr and x.a.R then b2.R = rr end
+      local before = table.concat(W.compareFp(x.a, x.b), " ")
+      local after = W.compareFp(x.a, b2)
+      if #after == 0 then bump("w_fpTimingOk"); log("fingerprint day %d: %s at the sample, the host's 2 s later (the host's word came after the sample): not a difference", x.day, before) end
+      judgeFp(S, x.day, x.a, b2, true)
+    end
+  end
+end
+-- (lane 71) a day's differences are all timing parts (see judgeFp): the families part, a region's wealth
+function W.onlyTiming(bad)
+  if #bad == 0 then return false end
+  for _, x in ipairs(bad) do if x ~= "F" and not tostring(x):find("^wealth@") then return false end end
+  return true
+end
+-- (lane 71) the region part of the fingerprint as it is now, for the regions the host's part names (same text as the
+-- sample's step 2 builds: wealth / approval / public order)
+function W.regNow(S, hostR)
+  local t = {}
+  for part in tostring(hostR):gmatch("[^|]+") do
+    local tag = part:match("^([^:]+):")
+    local r = tag and W.regionByKey(tag)
+    if r and valid(r) then
+      local k = W.rkey(r)
+      local okR, x = pcall(function() return string.format("%s:%d/%d/%d", k, r.regionalWealth, r.Approval, r.publicOrder) end)
+      t[#t + 1] = okR and x or (k .. ":ERR")
+    end
+  end
+  table.sort(t)
+  return #t > 0 and table.concat(t, "|") or "-"
+end
+judgeFp = function(S, day, a, b, again)
   local bad = W.compareFp(a, b)
+  -- (lane 71) TIMING PARTS. Two parts of this copy's sample can be a step behind the host's at the day change itself,
+  -- by how the host's word reaches this copy, not by a real difference:
+  --   families: with FAMROLL on this copy's game makes no person or family; the host's growth of the day comes as the
+  --             people module's V G lines and is made here half a second after this copy's own day change (sessions
+  --             l71a, l71b: "families differ", one person or family behind, up to 3 days in a row);
+  --   wealth:   the host's day change consumes and adds regional wealth in its own updateDay; this copy's wealth is
+  --             held (HOLD) and written from the host's push, which goes out when the host's value has settled (lane
+  --             51: "waits like a total", up to a second). So this copy's sample at its own day change holds the
+  --             wealth of before the host's day (every lane's checks: wealth@hof 99/93, 428/412, 545/539, 233/227: the
+  --             host a day's net income ahead; lane 74: two days in a row, a repair).
+  -- A day whose only differences are such parts is judged once more 2 s later, with those two parts of this copy taken
+  -- again then (W.famNow, W.regNow); every other part keeps its sample.
+  if #bad > 0 and not again and W.onlyTiming(bad) then
+    W.fpLater = W.fpLater or {}; W.fpLater[#W.fpLater + 1] = { day = day, a = a, b = b, t = os.clock() + 2.0 }
+    bump("w_fpTimingWait"); return
+  end
   -- (lane 63) the last differing pair, for the join module's breaker (W.diffText)
   if #bad > 0 then W.lastBad = { day = day, text = table.concat(bad, " "), host = fpEncode(a), here = fpEncode(b), t = os.clock() } end
   -- (join, lane 15) A copy that loaded the host's save ALONE starts at the beginning of the save's day, and the
@@ -708,7 +788,10 @@ local WIDE = {
   -- crops (S055). In the test saves these are the vegetable gardens behind houses (8 of 110 buildings); no save has a
   -- crop field proper. An entry that is the game's default (crop rotation on, nothing else) is not stored.
   { "fd", { "bRotateCrops", "fieldOperationMode", "forceHarvest", "field_ploughingPerc", "field_sowingPerc", "field_growingPerc",
-            "field_harvestingPerc", "field_numReadyToHarvest", "field_numUnplowed", "field_numSown", "yield", "plannedHarvest_PredictedYield" }, sparse = true },
+            "field_harvestingPerc", "field_numReadyToHarvest", "field_numUnplowed", "field_numSown", "yield", "plannedHarvest_PredictedYield",
+            "plannedHarvest_DaysLeft", "cropType2", "cropType3", "fieldWorkersNeeded" }, sparse = true },   -- (lane 71: the last four)
+  -- (lane 71) a site's construction bar (one decimal) and a ruin (type 75: burnt, or a collapse); only sites and ruins
+  { "cs", { "progress", "ruin" }, sparse = true },
   -- (lane 67) maintenance, for every building that has a MaintenanceComponent: the game's GetMaintenanceStatus (0 none
   -- needed, 1 maintained, 2 pending, 3 unmaintained), GetSliderValue (0 half, 1 normal, 2 double),
   -- DoesBuildingNeedMaintaining, and each tracker as <goods joined by +>=<what is left> (read by the native piece
@@ -740,12 +823,26 @@ local WIDE = {
   -- the player's lord: numbers and the lengths of his lists (S035 to S041)
   { "lo", { "silver", "influence", "kingsFavour", "numTimesInDebt", "claims", "quests", "proposedQuests", "questOpportunities", "InBox", "outbox",
             "letterHistory", "diplomaticTags", "enemies", "recruitmentPool_Militia", "recruitmentPool_Mercs", "traits", "availablePolicies" } },
+  -- (lane 71) what work areas hold: the world's Resource actors per class (berries, mushrooms, fish, stone, felled
+  -- trees ...), the engine's deposits and deer lairs (keys: the class name, "deposits", "lairs")
+  { "rr", { "count" } },
+  -- lane 72 (coop_x_stats.lua fills these): a building's production tracker (goods in its log | entries | hash of every
+  -- entry | the time pie's per cents) and its expertise; prices and supply per region and of the foreign market
+  -- (count | hash); the player's squads by the host's squad number (men | sums of morale, stamina, experience | gear hash)
+  { "pt", { "nGoods", "entries", "hash", "timePct" }, sparse = true },
+  { "ex", { "expertise" }, sparse = true },
+  { "mk", { "count", "hash" } },
+  { "uv", { "men", "morale", "stamina", "experience", "gear" } },
 }
 local WIDE_LOLEN = 5                                                          -- "lo": lists from the fifth field on
 local WIDE_BY = {}
 for _, s in ipairs(WIDE) do WIDE_BY[s[1]] = s; if s.sparse then s.zero = string.rep("0", #s[2], "|") end end
 WIDE_BY.hv.zero = "-1|0|0|0|0|0"      -- a building that is not a house: fuel day -1 (79 of the test save's 110 buildings)
 WIDE_BY.fd.zero = "1|0|0|0|0|0|0|0|0|0|0|0"   -- no crops: crop rotation on (the game's default), nothing else
+-- (lane 71) the four fields added after these twelve are stored only with an entry of the twelve (a building that is
+-- no field keeps no entry, whatever the game's defaults of the four are); a missing entry reads as this
+local WIDE_FD_BASE = WIDE_BY.fd.zero
+WIDE_BY.fd.zero = WIDE_FD_BASE .. "|-|-|-|-"
 -- The sections and fields as one word. It goes out with every sample: a friend whose build has other sections or
 -- fields would set the host's values beside the wrong names, so it does not compare such a sample.
 local WIDE_SPEC
@@ -797,6 +894,21 @@ local function wideWorld(P, S)
   P.en.ENGINE = table.concat(t, "|")
   t = {}; for i, f in ipairs(WIDE_BY.lo[2]) do t[i] = (i >= WIDE_LOLEN) and wl(S.p1, f) or wv(S.p1, f) end
   P.lo.LORD = table.concat(t, "|")
+  -- (lane 71) Resource actors per class, deposits, deer lairs: a difference here is a work area that holds other things
+  pcall(function()
+    local cls = {}
+    for _, r in ipairs(FindAllOf("Resource") or {}) do
+      if valid(r) then
+        local okN, n = pcall(function() return r:GetClass():GetFName():ToString() end)
+        n = (okN and type(n) == "string") and n:gsub("[%s;|]", "_") or "?"
+        cls[n] = (cls[n] or 0) + 1
+      end
+    end
+    for n, c in pairs(cls) do P.rr[n] = tostring(c) end
+  end)
+  P.rr.deposits = wl(eng, "deposits")
+  pcall(function() P.rr.lairs = tostring(#eng:getDeerLairLocations()) end)
+  local X = rawget(C, "stats"); if X and X.wideWorld then pcall(X.wideWorld, P, S) end      -- lane 72: sections mk, uv
 end
 
 local function wideRegion(P, r)
@@ -827,6 +939,7 @@ local function wideRegion(P, r)
     for i, role in ipairs(WIDE_LIVE) do t[i + 1] = "?"; pcall(function() t[i + 1] = wFmt(r:GetTotalLivestockCountOfType(role)) end) end
     local s = table.concat(t, "|"); if s ~= WIDE_BY.li.zero then P.li[k] = s end
   end
+  local X = rawget(C, "stats"); if X and X.wideRegion then pcall(X.wideRegion, P, r, k) end     -- lane 72: section mk
 end
 
 -- a family is its place in the region's list (the realm module keeps the lists equal); its people are not touched
@@ -871,7 +984,18 @@ local function wideBuilding(P, b)
   s = wv(b, "bRotateCrops") .. "|" .. wv(b, "fieldOperationMode") .. "|" .. wv(b, "forceHarvest") .. "|" .. wv(b, "field_ploughingPerc") .. "|" .. wv(b, "field_sowingPerc")
     .. "|" .. wv(b, "field_growingPerc") .. "|" .. wv(b, "field_harvestingPerc") .. "|" .. wv(b, "field_numReadyToHarvest") .. "|" .. wv(b, "field_numUnplowed")
     .. "|" .. wv(b, "field_numSown") .. "|" .. wv(b, "yield") .. "|" .. wv(b, "plannedHarvest_PredictedYield")
-  if s ~= WIDE_BY.fd.zero then P.fd[k] = s end
+  if s ~= WIDE_FD_BASE then                                            -- (lane 71) planned days, crop of the next years, workers
+    P.fd[k] = s .. "|" .. wv(b, "plannedHarvest_DaysLeft") .. "|" .. wv(b, "cropType2") .. "|" .. wv(b, "cropType3") .. "|" .. wv(b, "fieldWorkersNeeded")
+  end
+  -- (lane 71) a site's bar (the game's own getConstructionProgress, only on a site) and a ruin
+  local okR, raw = pcall(function() return b:GetType() end)
+  local ruin = (okR and raw == 75) and "1" or "0"
+  if (okB and built == false) or ruin == "1" then
+    local pr = "-"
+    if okB and built == false then local okP, v = pcall(function() return b:getConstructionProgress() end); pr = okP and wFmt(v) or "?" end
+    s = pr .. "|" .. ruin
+    if s ~= WIDE_BY.cs.zero then P.cs[k] = s end
+  end
   local okm, mc = pcall(gField, b, "MaintenanceComponent")
   if okm and mc and valid(mc) then
     local st, sl, nd = "?", "?", "?"
@@ -881,6 +1005,7 @@ local function wideBuilding(P, b)
     local M = rawget(C, "maint"); local trk = (M and M.trkOf) and M.trkOf(k) or "-"
     P.mt[k] = st .. "|" .. sl .. "|" .. nd .. "|" .. trk
   end
+  local X = rawget(C, "stats"); if X and X.wideBuilding then pcall(X.wideBuilding, P, b, k) end -- lane 72: sections pt, ex
 end
 
 local function wideNew(tag, day, done)
@@ -933,7 +1058,7 @@ local function wideStep(S, st)
     if st.i > 0 and st.lastB and (st.i > #arr or addr(arr[st.i]) ~= st.lastB) then
       st.redo = (st.redo or 0) + 1; bump("w_wideRedo")
       if st.redo <= 2 then
-        for _, s in ipairs({ "bl", "bw", "bs", "hv", "an", "bd", "bx", "fd", "mt" }) do P[s] = {} end
+        for _, s in ipairs({ "bl", "bw", "bs", "hv", "an", "bd", "bx", "fd", "mt", "cs", "pt", "ex" }) do P[s] = {} end   -- (lane 67: mt; lane 71: cs; lane 72: pt, ex)
         P.keyOf = {}; P.dup = 0; st.i = 0; st.lastB = nil
         return 0.5
       end
@@ -1068,7 +1193,8 @@ end
 
 -- friend: whose is the thing a difference is about? A building's owner (section bl), a region's owner (section ro; a
 -- family is its region's). P = the player's own town: that is what a later resync rule would look at first.
-local WIDE_KIND = { bl = "b", bw = "b", bs = "b", hv = "b", an = "b", bd = "b", bx = "b", fd = "b", mt = "b", ro = "r", rp = "r", ap = "r", rw = "r", li = "r", rs = "r", fa = "f", fc = "f" }
+local WIDE_KIND = { bl = "b", bw = "b", bs = "b", hv = "b", an = "b", bd = "b", bx = "b", fd = "b", mt = "b", cs = "b", ro = "r", rp = "r", ap = "r", rw = "r", li = "r", rs = "r", fa = "f", fc = "f",
+                    pt = "b", ex = "b", mk = "r" }   -- (lane 72)
 local function wideOwner(sec, key, Hs, Ms)
   local kind = WIDE_KIND[sec]; if not kind then return nil end
   if kind == "b" then
@@ -1672,9 +1798,18 @@ local function hostFireJob(st)
     end
     return false
   end
+  -- (lane 64) the word that a fire ended goes out AFTER a look at the families (as before a DEMOLISH line, lane 39): the
+  -- host's game houses the family of a burnt house in the frame of the burn-down, so a friend reads the new homes
+  -- first and its own burn-down finds the house empty. (A friend does not depend on this order: E.homesNow.)
+  local flushed = false
+  local function familiesFirst()
+    if flushed then return end
+    flushed = true
+    local Pp = rawget(C, "people"); if Pp and Pp.flushGrow then pcall(Pp.flushGrow) end
+  end
   if W.ruins then
     for k in pairs(st.ruins) do
-      if not W.ruins[k] and not W.fires[k] then send("W E FIREOUT " .. k .. " BURNT"); bump("w_ruinTold"); log("a building fell to ruin on the host with no fire seen: %s", k) end
+      if not W.ruins[k] and not W.fires[k] then familiesFirst(); send("W E FIREOUT " .. k .. " BURNT"); bump("w_ruinTold"); log("a building fell to ruin on the host with no fire seen: %s", k) end
     end
   end
   W.ruins = st.ruins
@@ -1684,6 +1819,7 @@ local function hostFireJob(st)
       -- how it ended: a ruin (burnt down) or the old building as an unfinished site (put out) (lane_f Q2)
       local how = "OUT"
       if type(b) ~= "boolean" and valid(b) then pcall(function() if b:IsRubble() then how = "BURNT" end end) else how = "GONE" end
+      familiesFirst()
       send("W E FIREOUT " .. k .. " " .. how); log("fire ended on the host: %s (%s)", k, how)
     end
   end
@@ -2100,6 +2236,11 @@ local function friendFireJob(st)
   if not (Pt and Pt.fn and Pt.burn) then log("fire %s ended on the host (%s) but the native piece is not loaded: it keeps burning here", k, P.what); return false end
   local ok, done, msg = pcall(P.what == "burnt" and Pt.burn or Pt.fireout, b)
   if ok and done then bump("w_fireEnded"); log("fire %s ended here as on the host: %s", k, P.what == "burnt" and "burnt down" or "put out")
+    -- (lane 64, lane 66's run 4) the game's burn-down puts every family of the house out (progressFire, READ) and this
+    -- copy houses nobody by itself: the families get the host's homes now, in this tick (coop_x_events.lua, E.homesNow).
+    -- The host's word of the burn-down can come seconds after the growth line that moved a family INTO the house.
+    local Ev = rawget(C, "events")
+    if Ev and Ev.homesNow then pcall(Ev.homesNow, (P.what == "burnt" and "the burn-down of " or "the put-out of ") .. k) end
   else
     log("fire %s could not be ended here (%s): %s", k, P.what, tostring(ok and msg or done))
     if P.what == "out" then F.ownStop = true end   -- the native put-out failed: no more put-outs of this copy's own fires in this world
@@ -2512,6 +2653,7 @@ local function tick(S, clock)
   W.me = addr(S.p1)
   if not W.me then return end
   if S.role == "host" then hostTick(S, clock) elseif S.role == "friend" then friendTick(S, clock) end
+  if S.role == "friend" and W.fpLater then pcall(W.fpLaterStep, S) end      -- (lane 71)
   runJobs(W.cfg.budgetMs / 1000)
   -- the wide sample has its own stepper (not the job queue above: it must never delay a push); not while a save loads
   W.wd.tickN = W.wd.tickN + 1

@@ -10,7 +10,7 @@
 --
 -- Use:  Coop.steam.host()   Coop.steam.invite()   Coop.steam.join(lobbyId)   Coop.steam.leave()   Coop.steam.kick(steamId)
 --       Coop.steam.status() -> { state, me, lobby, slot, reason, note, lost, lostFriends, reconnecting, hostLost, back, info = {appid=..., overlay=..., relay=...},
---                                players = { { slot, id, state, ping, name }, ... } }      (re-read at most 4 times a second)
+--                                players = { { slot, id, state, ping, name }, ... } }      (re-read at most twice a second; lane 65)
 --       Coop.steam.setPlayerState(slot, "loading" | "playing" | nil)   game facts the mod knows; status() shows them
 -- On a friend's copy the DLL's slot decides the file name: when the status says "slot 2", this module switches the mod's
 -- own file to friend2.txt (Coop.steam.followSlot = false turns that off).
@@ -191,7 +191,10 @@ end
 
 function ST.status()
   local t = os.clock()
-  if ST.last and ST.readT and t - ST.readT < 0.25 then return ST.last end
+  -- (lane 65) twice a second (was four times): every read is an open, and on a PC whose real-time scan checks a
+  -- file opened after a write that costs milliseconds; the DLL now writes the file only when it changed (pings at
+  -- most every 5 s). The DLL replaces the file whole (temp file and replace): a kept handle would block that.
+  if ST.last and ST.readT and t - ST.readT < 0.5 then return ST.last end
   ST.readT = t
   if not ST.on then ST.last = { state = "off", reason = ST.why, players = {}, info = {} }; return ST.last end
   local f = io.open(ST.link .. "steam_status.txt", "rb")
@@ -238,8 +241,25 @@ function ST.tick()
   followSlot()
 end
 
-local M = {}
-function M.tick(S, clock) ST.tick() end
-function M.idle(S, clock) ST.tick() end
+-- (lane 65, round three) the core's driver (coop.lua C.tick) calls ST.pump first in each frame and ST.flush last: a
+-- line received this frame is read this frame, and a line the mod writes this frame leaves this frame. Before, the
+-- tick ran among the modules (after the core had read the link files, and before some modules wrote): one frame later
+-- each way, about 60 ms a hop at 16 fps. The flush is the DLL's second export (0.5); an older DLL has none, and its
+-- one tick then sends at the next frame's start, as before.
+ST.flushFn = package.loadlib(dllPath, "coop_steam_flush")
+function ST.pump()
+  local t0 = os.clock()
+  ST.tick()
+  if C.costAdd then C.costAdd("steam", (os.clock() - t0) * 1000) end
+end
+function ST.flush()
+  if not ST.flushFn then return end
+  local t0 = os.clock()
+  local ok, e = pcall(ST.flushFn)
+  if not ok then ST.err = tostring(e) end
+  if C.costAdd then C.costAdd("steam", (os.clock() - t0) * 1000) end
+end
+
+local M = {}                    -- (no tick of its own any more: the driver pumps it, see above)
 C.register("steam", M)
 return "coop steam module loaded (" .. ST.dll .. ", link " .. ST.link .. ")"

@@ -275,17 +275,24 @@ local function onceOnly(h, name)
     if not rec or rec.k ~= name or not rec.addr or not rec.args then return rec end
     local now = os.clock()
     local tt = T.touched[rec.addr]
-    if tt and now - tt < 0.8 then return rec end            -- the town module drops these as echoes itself
+    -- the town module drops these as echoes itself; (lane 69) not for FERTILIZE, whose replay updates the memory below:
+    -- a repeat at 0.75 to 0.8 s after another copy's change on that field slipped through and was sent (game run, 3 of 3)
+    if tt and now - tt < 0.8 and name ~= "FERTILIZE" then return rec end
     local t = {}; for i, v in ipairs(rec.args) do t[i] = tostring(v) end
     local key = name .. ":" .. table.concat(t, ",")
     local L = T.xlast[rec.addr]
-    if L and L.key == key and now - L.t < 5.0 and not (tt and tt > L.t) then
+    -- (lane 69, game run 2026-11-18) for FERTILIZE a replay updates this memory itself (below), so the value seen last
+    -- is known after another copy's change too: a repeat of it is never the player, however long the pause between
+    -- repeats (measured with nobody acting: a field panel left open sent FERTILIZE twice in 90 s after pauses of more
+    -- than 5 s, and after a field priority replay on that field two more; each made the other copies redraw)
+    local long = (name == "FERTILIZE")
+    if L and L.key == key and (long and now - L.t < 600.0 or (now - L.t < 5.0 and not (tt and tt > L.t))) then
       L.t = now; T.xdropped = T.xdropped + 1
       return nil
     end
     T.xlast[rec.addr] = { key = key, t = now }
     T.xn = (T.xn or 0) + 1
-    if T.xn % 400 == 0 then for a, e in pairs(T.xlast) do if now - e.t > 60 then T.xlast[a] = nil end end end
+    if T.xn % 400 == 0 then for a, e in pairs(T.xlast) do if now - e.t > 600 then T.xlast[a] = nil end end end
     return rec
   end
 end
@@ -300,6 +307,32 @@ for _, h in pairs(T.hooks) do
   if #h.defs == 1 and not h.x1once then
     local d = T.defs[h.defs[1]]
     if d and ONCE[d.name] and d.argt and d.argt ~= "" and not d.rel then h.x1once = true; onceOnly(h, d.name) end
+  end
+end
+-- (lane 69, game run 2026-11-18) FAULT: with the field's panel open on the host AND on a friend, FERTILIZE went back
+-- and forth for as long as both stayed open (a line from each copy every 1.8 s, measured with and without the panel
+-- redraws: 6 and 6 in 10 s, 5 and 6). Each copy's panel repeats SetAllowFertilization(false) every frame; the repeat
+-- after a replay was let through once the replay's echo window (0.75 s) had passed, as "something else happened to
+-- that target", so every replay made the next send. Worse, the host's own field priority click on that field was then
+-- dropped as an echo of the last FERTILIZE replay (host 4, friend 3). A replay now counts as the last value seen on
+-- that target: a repeat of the value just replayed is the panel repeating, not the player.
+for _, name in pairs({ "FERTILIZE" }) do
+  local d = T.defs[name]
+  if d and d.apply and not d.x69once then
+    d.x69once = true
+    local apply0 = d.apply
+    d.apply = function(S, job)
+      local r, f, e = apply0(S, job)
+      if r == "ok" then
+        local b = X.findBkey(job.f[1]); local a = b and addrOf(b)
+        if a then
+          local vals = X.decArgs(d.argt, job.f[2]); local t = {}
+          for i, v in ipairs(vals) do t[i] = tostring(v) end
+          T.xlast[a] = { key = name .. ":" .. table.concat(t, ","), t = os.clock() + 0.01 }   -- after the replay's touch
+        end
+      end
+      return r, f, e
+    end
   end
 end
 
@@ -403,6 +436,25 @@ X.hook(X.P .. "PawnCPP:changeActiveRTSTool", { "TRAINCON" }, function(self, a1, 
   if valid(b) then local okT, isB = pcall(function() return b:IsA(StaticFindObject("/Script/ManorLords.SMBuildingMaster")) end); if okT and isB then T.trainTool[addrOf(b)] = os.clock() end end
   return nil
 end)
+-- (lane 69) the planner's two "clear" buttons (Button_121, Button) set the station's source or target to none in the
+-- blueprint (byte code: one object field := None each), with no tool and no game call: before, the change was sent only
+-- within 60 s of this player's route tool on that station. A press now counts as this player's tool on its station.
+-- The widget's own name for its station is not in the dumps: "building" (as fuelStocks_C and storageFilterGood_C call
+-- it) is tried first; when no station is found that way, every pack station gets a 5 s window instead of 60 s.
+local PTC = "/Game/UI/Inventory/packTrainPlanner_connection.packTrainPlanner_connection_C:BndEvt__packTrainPlanner_"
+local function trainClearSee(self)
+  local w = self:get(); if not valid(w) then return nil end
+  local b
+  for _, k in ipairs({ "building", "Building", "station", "trainStation" }) do
+    local okB, x = pcall(function() return w[k] end)
+    if okB and valid(x) then b = x; break end
+  end
+  if b then T.trainTool[addrOf(b)] = os.clock()
+  else for _, s in ipairs(T.trainList or {}) do if valid(s) then T.trainTool[addrOf(s)] = os.clock() - 55.0 end end end
+  return nil
+end
+X.hook(PTC .. "Button_121_K2Node_ComponentBoundEvent_2_OnButtonReleasedEvent__DelegateSignature", { "TRAINCON" }, trainClearSee)
+X.hook(PTC .. "Button_K2Node_ComponentBoundEvent_3_OnButtonReleasedEvent__DelegateSignature", { "TRAINCON" }, trainClearSee)
 local function bk(b) if not valid(b) then return "-" end; return X.bkeyOf(X.bident(b)) end
 local function trainPair(b) local s, t; pcall(function() s = b.trainConnectionSource; t = b.trainConnectionTarget end); return bk(s) .. "|" .. bk(t) end
 local function trainPoll(S)

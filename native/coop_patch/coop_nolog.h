@@ -21,12 +21,13 @@
  * settleRegion, updateSquadVisibility. Each follows an outcome the host already decides on a friend's copy (goods and
  * silver by the facts module, construction by FINISH, settling by the town module, enemy squads seen on this copy's
  * own map), and the host's same notice is folded into it by addLogIfNew. */
-#define NOLOG_SITES 2
-static const int NL_SIG[NOLOG_SITES]  = { S_LOGADD, S_LOGNEW };
-static const int NL_BACK[NOLOG_SITES] = { 5, 8 };             /* the pattern starts this far after the entry */
+#define NOLOG_SITES 3
+static const int NL_SIG[NOLOG_SITES]  = { S_LOGADD, S_LOGNEW, S_LOGPOP };
+static const int NL_BACK[NOLOG_SITES] = { 5, 8, 5 };             /* the pattern starts this far after the entry */
 static const uint8_t NL_ORIG[NOLOG_SITES][8] = {
     { 0x48, 0x89, 0x5C, 0x24, 0x08 },                          /* mov [rsp+8],rbx */
-    { 0x4C, 0x8B, 0xDC, 0x55, 0x49, 0x8D, 0x6B, 0xB9 } };      /* mov r11,rsp; push rbp; lea rbp,[r11-47h] */
+    { 0x4C, 0x8B, 0xDC, 0x55, 0x49, 0x8D, 0x6B, 0xB9 },        /* mov r11,rsp; push rbp; lea rbp,[r11-47h] */
+    { 0x48, 0x89, 0x5C, 0x24, 0x08 } };                        /* lane 66: playPopupMessageGUI's stub: mov [rsp+8],rbx */
 static volatile LONG g_nl_drop[NOLOG_SITES], g_nl_pass[NOLOG_SITES], g_nl_faults, g_nl_marks;
 static struct {
     int avail; char why[160];
@@ -42,8 +43,8 @@ static int nolog_status(char *buf, size_t len)
 {
     if (g_off) return _snprintf(buf, len, "NOLOG unavailable dll is off\r\n");
     if (!NL.avail) return _snprintf(buf, len, "NOLOG unavailable %s\r\n", NL.why);
-    return _snprintf(buf, len, "NOLOG %s dropped=%ld passed=%ld marks=%ld refused=%u faults=%ld\r\n", nolog_bytes_on() ? "on" : "off",
-                     g_nl_drop[0] + g_nl_drop[1], g_nl_pass[0] + g_nl_pass[1], g_nl_marks, NL.refused, g_nl_faults);
+    return _snprintf(buf, len, "NOLOG %s dropped=%ld passed=%ld marks=%ld refused=%u faults=%ld popups=%ld\r\n", nolog_bytes_on() ? "on" : "off",
+                     g_nl_drop[0] + g_nl_drop[1], g_nl_pass[0] + g_nl_pass[1], g_nl_marks, NL.refused, g_nl_faults, g_nl_drop[2]);
 }
 
 static int nolog_scan(void)

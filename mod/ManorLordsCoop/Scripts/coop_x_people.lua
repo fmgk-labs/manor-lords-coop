@@ -461,7 +461,16 @@ local function friendGrowOne(S, clock, ev)
   elseif ev.kind == "X" then
     if ev.place > n then return true, nil end                    -- gone here as well
     local hk = "-"; pcall(function() local b = fams[ev.place].familyHome; if valid(b) then hk = bkey(b) end end)
-    if hk ~= ev.home then return true, "the family at that place lives in " .. hk .. " here: left to the realm module" end
+    if hk ~= ev.home then
+      -- (lane 64) the place is the host's; the home is only the check that this copy's list is in step. A family that
+      -- merely lives elsewhere here (put out by this copy's own burn-down a moment ago) is still that family: the
+      -- host's list, as the events module keeps it, has the line's home at this place. Only while that list is as
+      -- long as this copy's (the list of BEFORE the departure: a newer, shorter one has other families at the places).
+      local Ev = rawget(C, "events"); local hh, hn = nil, nil
+      if Ev and Ev.hostHomeOf then local okE, v, cnt = pcall(Ev.hostHomeOf, ev.rk, ev.place); if okE then hh, hn = v, cnt end end
+      if hh ~= ev.home or hn ~= n then return true, "the family at that place lives in " .. hk .. " here: left to the realm module" end
+      bump("g_xOtherHome")
+    end
     local people = {}
     pcall(function() local m = fams[ev.place].familyMembers; for i = 1, #m do local u = un(m[i]); if valid(u) then people[#people + 1] = u end end end)
     -- the game's own departure (4c66e20, READ): unassignFamily, SetFamilyHome none, then removeWorkerFamilyAt; its
@@ -1060,13 +1069,10 @@ end
 -- lane 42 round two: the trade screen's log (RTSMultiEngineCPP.tradeLog: fromBuilding, toBuilding, fromRegionIndex,
 -- toRegionIndex, goodType, goodAmt, priceTotal, daysTotal, traderName, isImport; t_ext.lua). Measured: each copy logs its
 -- own merchants' trades (host 48 records, friend 49, the last ones other trades on other days). The host sends its
--- log, the last LOG_MAX records, when it changed (looked at every 2 s):
+-- whole log when it changes (looked at every 2 s). The screen filters by region after the log is rebuilt.
 --   V T <records> <first in this line> <from>,<to>,<fromIdx>,<toIdx>,<good>,<amt>,<price>,<day>,<trader>,<import 1|0>;...
 --   from / to = a building key (its comma written "/") or "-"; trader = the name, "-" for none
--- A friend whose log differs from the host's rebuilds it: emptied with the list's own Empty, then each record appended
--- (a read one past the end adds an empty record: the UE4SS rule, used on purpose here) and its fields written; a
--- building is this copy's building with that key, else none.
-local LOG_MAX = 60
+-- A friend whose log differs from the host's rebuilds it with its own buildings for the host's building keys.
 local function bkeyOrDash(o) if not valid(o) then return "-" end; local ok, k = pcall(bkey, o); return ok and (k:gsub(",", "/")) or "-" end   -- (a key's comma as "/": the record is comma-separated)
 local function logRec(r)
   local tn = "-"; pcall(function() tn = r.traderName:ToString() end); if tn == "" or tn == "None" then tn = "-" end
@@ -1075,7 +1081,7 @@ local function logRec(r)
 end
 local function logList(S)
   local t = {}; local arr = S.eng.tradeLog; local n = #arr
-  for i = math.max(1, n - LOG_MAX + 1), n do local ok, x = pcall(logRec, arr[i]); t[#t + 1] = ok and x or "?" end
+  for i = 1, n do local ok, x = pcall(logRec, arr[i]); t[i] = ok and x or "?" end
   return t
 end
 local function hostLog(S, clock)
@@ -1118,23 +1124,23 @@ local function friendLog(S)
   -- the same host list and this copy's log unchanged since that rebuild = nothing to do (measured in a6: rebuilt
   -- every 2 s without this)
   if hs == P.logHost and ms == P.logMine then return end
-  local byKey = {}
-  for _, b in ipairs((function() local t = {}; local arr = S.eng.buildingArr; for i = 1, #arr do local x = un(arr[i]); if valid(x) then t[#t + 1] = x end end; return t end)()) do
-    local ok, k = pcall(bkey, b); if ok then byKey[k] = b end
+  local byKey, buildings = {}, S.eng.buildingArr
+  for i = 1, #buildings do
+    local b = un(buildings[i])
+    if valid(b) then local ok, k = pcall(bkey, b); if ok then byKey[k] = b end end
   end
   local arr = S.eng.tradeLog
   arr:Empty()
-  for i, x in ipairs(L.list) do
+  for _, x in ipairs(L.list) do
     local f, t, fi, ti, g, a, pr, d, tn, imp = x:match("^([^,]+),([^,]+),(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+),([^,]+),([01])$")
     if f then
-      -- one past the end: the list grows by one empty record (lane 55: #arr + 1, not i: a host record that does not
-      -- match the pattern above would otherwise leave an empty record in the middle of the game's list)
-      local r = arr[#arr + 1]
-      pcall(function() local b = byKey[(f:gsub("/", ","))]; if b then r.fromBuilding = b end end)
-      pcall(function() local b = byKey[(t:gsub("/", ","))]; if b then r.toBuilding = b end end)
-      r.fromRegionIndex = tonumber(fi); r.toRegionIndex = tonumber(ti); r.goodType = tonumber(g); r.goodAmt = tonumber(a)
-      r.priceTotal = tonumber(pr); r.daysTotal = tonumber(d); r.isImport = imp == "1"
+      local r = { fromRegionIndex = tonumber(fi), toRegionIndex = tonumber(ti), goodType = tonumber(g),
+        goodAmt = tonumber(a), priceTotal = tonumber(pr), daysTotal = tonumber(d), isImport = imp == "1" }
+      local from, to = byKey[(f:gsub("/", ","))], byKey[(t:gsub("/", ","))]
+      if valid(from) then r.fromBuilding = from end
+      if valid(to) then r.toBuilding = to end
       if tn ~= "-" then pcall(function() r.traderName = FName(tn) end) end
+      arr[#arr + 1] = r
     end
   end
   P.logHost = hs; P.logMine = table.concat(logList(S), ";")
@@ -1241,6 +1247,8 @@ function M.onMessage(S, from, kind, w, line)
         local ev = { rk = rk, day = day, kind = kind, place = place, t = os.clock() }
         if kind == "M" then ev.n = tonumber(w[9]) or 0; ev.home = w[10] or "-" else ev.home = w[9] or "-" end
         P.gq = P.gq or {}; P.gq[#P.gq + 1] = ev; bump("g_got")
+        -- (lane 64) the events module keeps the host's homes, the newest word first: this line is one
+        local Ev = rawget(C, "events"); if Ev and Ev.noteGrow then pcall(Ev.noteGrow, rk, kind, place, ev.home) end
         -- lane 39: taken now, in the line's order (a departure or a new home does not wait; see wrapTownOut)
         if not rawget(C, "hold") and valid(S.p1) and valid(S.eng) then guarded("growth", friendGrow, S, os.clock()) end
       end

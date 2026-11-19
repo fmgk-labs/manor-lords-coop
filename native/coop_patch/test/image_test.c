@@ -25,6 +25,15 @@ __declspec(allocate(".ptext")) __declspec(align(16)) const unsigned char g_p1_bl
     0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC
 };
 
+/* lane 64: NODEATH's hunger site (the pattern NDHUNGER) at offset 7 of a 16-aligned block: its two patched bytes
+ * (offset 7 + 12 = 19) are bytes 3 and 4 of an aligned qword, like the game's (4d8fed3) */
+__declspec(allocate(".ptext")) __declspec(align(16)) const unsigned char g_nd_blob[64] = {
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    0x41, 0x0F, 0xB6, 0x47, 0x2F, 0x41, 0x39, 0x86, 0x68, 0x01, 0x00, 0x00, 0x0F, 0x85, 0xE2, 0x02, 0x00, 0x00,
+    0x49, 0x8B, 0x85, 0x50, 0x03, 0x00, 0x00, 0x80, 0xB8, 0x09, 0x0A, 0x00, 0x00, 0x00, 0x0F, 0x85, 0xCE, 0x02, 0x00, 0x00,
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC
+};
+
 typedef int (__cdecl *tick_fn)(void *);
 static int g_pass, g_fail;
 static wchar_t g_dir[MAX_PATH];
@@ -110,6 +119,22 @@ int main(int argc, char **argv)
     check(patch[0] == 0x74 && patch[1] == 0x1C, "NOKILL OFF restored 74 1C");
     send("ALLOFF"); send("STATUS"); tick(NULL);
     check(strstr(status(), "P1 off\r\n") != NULL, "ALLOFF + STATUS: P1 off");
+
+    /* lane 64: NODEATH. Only its hunger site is in this image: "part" when on, the other four "na" */
+    {
+        const volatile unsigned char *nd = g_nd_blob + 19;
+        check(((uintptr_t)nd & 7) == 3 && nd[0] == 0x0F && nd[1] == 0x85, "(setup) NODEATH's hunger jump 0F 85 at byte 3 of an aligned qword");
+        check(strstr(status(), "NODEATH off hunger=off accident=na fire=na crush=na animal=na") != NULL, "NODEATH: the hunger site found exactly once, off; the others not here");
+        send("NODEATH ON"); tick(NULL);
+        check(nd[0] == 0x90 && nd[1] == 0xE9 && nd[2] == 0xE2, "NODEATH ON wrote 90 E9 into the image-backed .text (the jump's distance untouched)");
+        VirtualQuery((const void *)nd, &mi, sizeof(mi));
+        check(mi.Protect == PAGE_EXECUTE_READ, "page protection restored to PAGE_EXECUTE_READ after the write");
+        check(strstr(status(), "NODEATH part hunger=on") != NULL, "status NODEATH part hunger=on");
+        send("NODEATH OFF"); tick(NULL);
+        check(nd[0] == 0x0F && nd[1] == 0x85, "NODEATH OFF restored 0F 85");
+        send("NODEATH ON"); send("ALLOFF"); send("STATUS"); tick(NULL);
+        check(nd[0] == 0x0F && nd[1] == 0x85 && strstr(status(), "NODEATH off hunger=off") != NULL, "NODEATH ON, ALLOFF: 0F 85 back, off");
+    }
 
     printf("\nRESULT: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

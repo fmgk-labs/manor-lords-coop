@@ -78,7 +78,8 @@ static struct {
     int n; fent e[FLD_MAX];
     ULONGLONG last_audit;
     unsigned long long dumps, refused, hookcalls, heldcalls, restored, drawn, painted, queued, nodraw, sets, setpts, grows, beyond, unknown,
-                       polls, lines, outbytes, checkok, checkbad, audits, leaks, cuts, otherthread, faults, gone, countdiff, scaled, sizes, followed, sizeleaks, notlive;
+                       polls, lines, outbytes, checkok, checkbad, audits, leaks, cuts, otherthread, faults, gone, countdiff, scaled, sizes, followed, sizeleaks, notlive,
+                       cachefix;   /* lane 71: counted numbers put back by the audit (written outside UpdateFieldCache) */
     LONGLONG qpf, qhook, qset, qpoll;                    /* time inside the hook, SET and POLL (QueryPerformanceCounter units) */
 } FL;
 
@@ -113,10 +114,10 @@ static int field_status(char *buf, size_t len)
     n += _snprintf(buf + n, len - (size_t)n,
                    "fields held=%d watched=%d hookcalls=%llu heldcalls=%llu restored=%llu drawn=%llu painted=%llu queued=%llu nodraw=%llu sets=%llu setpts=%llu grows=%llu beyond=%llu unknown=%llu "
                    "polls=%llu lines=%llu outbytes=%llu checkok=%llu checkbad=%llu audits=%llu leaks=%llu cuts=%llu countdiff=%llu gone=%llu otherthread=%llu dumps=%llu refused=%llu faults=%llu "
-                   "ushook=%lld usset=%lld uspoll=%lld scaled=%llu sizes=%llu followed=%llu sizeleaks=%llu notlive=%llu\r\n",
+                   "ushook=%lld usset=%lld uspoll=%lld scaled=%llu sizes=%llu followed=%llu sizeleaks=%llu notlive=%llu cachefix=%llu\r\n",
                    held, watched, FL.hookcalls, FL.heldcalls, FL.restored, FL.drawn, FL.painted, FL.queued, FL.nodraw, FL.sets, FL.setpts, FL.grows, FL.beyond, FL.unknown,
                    FL.polls, FL.lines, FL.outbytes, FL.checkok, FL.checkbad, FL.audits, FL.leaks, FL.cuts, FL.countdiff, FL.gone, FL.otherthread, FL.dumps, FL.refused, FL.faults,
-                   FL.qpf ? FL.qhook * 1000000 / FL.qpf : 0, FL.qpf ? FL.qset * 1000000 / FL.qpf : 0, FL.qpf ? FL.qpoll * 1000000 / FL.qpf : 0, FL.scaled, FL.sizes, FL.followed, FL.sizeleaks, FL.notlive);
+                   FL.qpf ? FL.qhook * 1000000 / FL.qpf : 0, FL.qpf ? FL.qset * 1000000 / FL.qpf : 0, FL.qpf ? FL.qpoll * 1000000 / FL.qpf : 0, FL.scaled, FL.sizes, FL.followed, FL.sizeleaks, FL.notlive, FL.cachefix);
     return n < 0 ? 0 : n;
 }
 
@@ -834,6 +835,13 @@ static void field_tick(void)
                 FL.audits++;
                 FL.sizeleaks += g_fld_sizefix; k -= (int)g_fld_sizefix;
                 if (k) { FL.leaks += (unsigned long long)k; log_line("FIELD AUDIT %p: %d plants differed from the host's without a count (put back)", (void *)e->b, k); }
+                /* lane 71: the counted numbers (operation mode, planned harvest, yield ...) as the host's too: this copy's own field
+                 * routine may write one of them outside UpdateFieldCache, where the hook does not see it */
+                if (e->fc_known) {
+                    int32_t v[FLD_CACHE_N];
+                    fld_cache_read(e->b, v);
+                    if (memcmp(v, e->fc, sizeof(v)) != 0) { fld_cache_put(e); FL.cachefix++; }
+                }
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { FL.faults++; log_line("FIELD tick raised exception %08lX", GetExceptionCode()); }

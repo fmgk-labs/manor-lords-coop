@@ -39,7 +39,7 @@ Both DLLs have **one export** each (`coop_patch_tick`, `coop_steam_tick`). The L
 
 1. **Actions.** A player's action shows at once on their own copy. One line goes to the host. The host replays it with the game's own function, through an invisible helper lord, so the host's own mouse and selection are not disturbed. All copies get the result.
 2. **Pushed values ("exact mode").** The host sends the numbers players read: each building's stock, the region's totals, approval and its factors, public order, wealth, population, what each villager holds. On a friend's copy, native hooks stop the game from changing those values by itself (items `GOODS`, `TOTALS`, `HOLD`).
-3. **Host-only outcomes.** Where a result must be exact, the friend's game is stopped from deciding it, and the host's result is applied: deaths and routs in battle (`NOKILL`, `NOROUT`), the end of a building site (`NOFINISH`), a tree falling (`FELL`), the end of a villager's task (`ENDHOLD`), which job a villager picks (`CHOOSE`, `PICK`).
+3. **Host-only outcomes.** Where a result must be exact, the friend's game is stopped from deciding it, and the host's result is applied: deaths and routs in battle (`NOKILL`, `NOROUT`), a villager's death of hunger, cold, a work accident, a fire or a collapse (`NODEATH`: a villager dies on every copy when the host says so, with the game's own death and notice), the end of a building site (`NOFINISH`), a tree falling (`FELL`), the end of a villager's task (`ENDHOLD`), which job a villager picks (`CHOOSE`, `PICK`).
 4. **Made on friends.** What exists on the host but not on a friend is made there: a family, a rival lord's building, a squad.
 5. **Resync (last resort).** When a copy differs in a way values cannot repair, the host saves, and **only that copy** loads the save (`single`, the default). `resync = all` in `coop.cfg` makes every copy load. **Joining is the same operation.**
 
@@ -78,6 +78,7 @@ The third word of a line. Most kinds go one way: from the host to friends (H→F
 | `MC` | `coop_x_maint.lua` | every building's maintenance: status and each tracker (H→F) |
 | `Q` | `coop_x_scene.lua` | small scene pieces: yard gates, stalls, carts (H→F) |
 | `Y` | `coop_x_fields.lua` | fields and gardens (H→F) |
+| `ST` | `coop_x_stats.lua` | a building's time pie and expertise, prices and foreign supply, squads' morale and stamina, militia gear, retainers' and villagers' experience, the production log (native TRKDUMP/TRKSET), expertise (native EXP), the fertility grid (block hashes, rows on a friend's ask: `ST GH/GA/GC`), the region graphs' day records (`ST H`, native HSET) (H→F; a friend asks with `ST ASK`) |
 | `J` | `coop_join.lua` | join and resync |
 | `BYE`, `HL` | `coop_session.lua` | the host leaves, or loads |
 
@@ -105,6 +106,7 @@ Each module registers itself with the core and gets `onWorld` (a world attached)
 | `coop_x_jobs.lua` | The job board: tasks, holds, which villager does what |
 | `coop_x_fields.lua` | Fields and gardens |
 | `coop_x_scene.lua` | Yard gates, stalls, carts |
+| `coop_x_stats.lua` | Time pie, expertise, prices, squads' men, experience (loaded by `main.lua` after the list) |
 | `coop_sites.lua` | Building sites finish with the host's |
 | `coop_join.lua` | Join and resync |
 | `coop_session.lua` | The host is gone: every friend back to the main menu |

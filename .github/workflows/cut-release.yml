@@ -1,39 +1,58 @@
-# Pushing a tag v<version> publishes the GitHub release, with no browser and no personal token:
-#   1. the maintainers build and test the zip (docs/MAINTAINERS.md, "Cutting a release") and push it to the branch
-#      `release-zips` as ManorLordsCoop-<version>-nexus.zip (it holds the UE4SS loader and the native DLLs, which are
-#      not built here);
-#   2. the release notes are in docs/releases/v<version>.md on the tagged commit, with a list under "## New in <version>";
-#   3. the tag v<version> is pushed.
-# This workflow then creates the release with that zip and starts nexus-release.yml for the tag (a release made by the
-# workflow token does not start other workflows by itself; a workflow_dispatch does).
-name: Cut release
+# The ONLY release path: a merge to main that raises the mod's version publishes it.
+#   1. The maintainers build and test the zip (docs/MAINTAINERS.md, "Cutting a release") and push it, with its
+#      .sha256, to the branch `release-zips` as ManorLordsCoop-<version>-nexus.zip (it holds the UE4SS loader and the
+#      native DLLs, which are not built here, so players get exactly the tested file).
+#   2. The pull request to main raises C.version in mod/ManorLordsCoop/Scripts/coop.lua and adds
+#      docs/releases/v<version>.md with a list under "## New in <version>", and lists the issues it touches (Refs #N).
+#   3. When it is merged, this workflow: stops if a release v<version> already exists; checks the zip against its
+#      .sha256; tags the merge commit v<version>; publishes the GitHub release with the zip; sends the zip to the
+#      Nexus page as the new main file (the same steps as nexus-release.yml, which stays for a manual re-send).
+# Needs: the repository's workflow permissions "Read and write" (organization settings allow it), the secret
+# NEXUSMODS_API_KEY, and a pushing account GitHub has not restricted.
+name: Release on merge
 
 on:
   push:
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
+    branches: [main]
+    paths:
+      - "mod/ManorLordsCoop/Scripts/coop.lua"
+      - "docs/releases/**"
+  workflow_dispatch:
 
 permissions:
   contents: write
-  actions: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  NEXUS_MOD_ID: "454"
+  NEXUS_FILE_ID: "1663"
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check the version and the notes
+        with:
+          fetch-depth: 0
+      - name: Version, notes and whether it is new
         id: v
         env:
-          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION="${TAG#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          IN_CODE=$(grep '^C.version = ' mod/ManorLordsCoop/Scripts/coop.lua | cut -d'"' -f2 | head -1)
-          if [ "$IN_CODE" != "$VERSION" ]; then echo "The tag says $VERSION but coop.lua says $IN_CODE"; exit 1; fi
+          VERSION=$(grep '^C.version = ' mod/ManorLordsCoop/Scripts/coop.lua | cut -d'"' -f2 | head -1)
+          TAG="v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"; echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG exists already: nothing to do."; echo "new=0" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "new=1" >> "$GITHUB_OUTPUT"
           if [ ! -s "docs/releases/$TAG.md" ]; then echo "docs/releases/$TAG.md is missing"; exit 1; fi
           if ! grep -q "^## New in $VERSION" "docs/releases/$TAG.md"; then echo "The notes need a heading: ## New in $VERSION"; exit 1; fi
-      - name: Take the tested zip from the release-zips branch
+      - name: Take the tested zip
+        if: steps.v.outputs.new == '1'
         env:
           VERSION: ${{ steps.v.outputs.version }}
         run: |
@@ -42,16 +61,31 @@ jobs:
           git show "FETCH_HEAD:ManorLordsCoop-${VERSION}-nexus.zip.sha256" > expected.sha256
           echo "$(cut -d' ' -f1 expected.sha256)  ManorLordsCoop-${VERSION}-nexus.zip" | sha256sum -c -
           if unzip -l "ManorLordsCoop-${VERSION}-nexus.zip" | grep -q "coop_dev.lua"; then echo "The zip holds the test-only coop_dev.lua"; exit 1; fi
-      - name: Publish the release
+          awk '/^## New in/{f=1;next} /^## /{f=0} f && /^- /{sub(/^- /,""); gsub(/\*\*|`/,""); print}' "docs/releases/v${VERSION}.md" > changelog.txt
+          { echo "CHANGELOG<<EOF_CHANGELOG"; cat changelog.txt; echo "EOF_CHANGELOG"; } >> "$GITHUB_ENV"
+      - name: Tag and publish the GitHub release
+        if: steps.v.outputs.new == '1'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.v.outputs.tag }}
           VERSION: ${{ steps.v.outputs.version }}
         run: |
           gh release create "$TAG" "ManorLordsCoop-${VERSION}-nexus.zip" --repo "$GITHUB_REPOSITORY" \
-            --title "Manor Lords Co-op ${VERSION}" --notes-file "docs/releases/$TAG.md" --verify-tag
-      - name: Send it to Nexus
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: gh workflow run nexus-release.yml --repo "$GITHUB_REPOSITORY" --ref main -f tag="$TAG"
+            --target "$GITHUB_SHA" --title "Manor Lords Co-op ${VERSION}" --notes-file "docs/releases/$TAG.md"
+      - name: Send it to Nexus Mods
+        if: steps.v.outputs.new == '1'
+        uses: Nexus-Mods/upload-action@v1.0.0-beta.11
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          file_id: ${{ env.NEXUS_FILE_ID }}
+          filename: ManorLordsCoop-${{ steps.v.outputs.version }}-nexus.zip
+          version: ${{ steps.v.outputs.version }}
+          display_name: Manor Lords Co-op ${{ steps.v.outputs.version }} (game 0.8.117)
+          description: Mod ${{ steps.v.outputs.version }} for Manor Lords 0.8.117 (Steam). Includes the UE4SS loader build it was tested on (MIT). Every player needs this same file.
+          category: main
+          archive_existing_version: true
+          primary_mod_manager_download: false
+          allow_mod_manager_download: false
+          update_mod_version: true
+          mod_id: ${{ env.NEXUS_MOD_ID }}
+          changelog: ${{ env.CHANGELOG }}

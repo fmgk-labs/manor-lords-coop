@@ -21,7 +21,21 @@
 --   Y S <bkey> <n> <ops>               changes of a field (n = its plants on the host; ops: coop_fields.h)
 --   Y K <bkey> <n> <crc>               the host's checksum of a field's plants (every cfg.checkEvery s): counted
 --   Y B <bkey> <points> <border> <final>   a field's point lists' lengths (FieldPoints, fieldBorderPoints, finalBorder)
+--   Y V <bkey> <v1>,<v2>,...           (lane 71) the field's own values the panel shows that no player sets (VPROPS order)
 --   bkey = <type>@<x/10>,<y/10> (as coop_facts.lua)
+--
+-- Lane 71 (live r5/r9, the player's own field 14@7992,4146: sown 5/0, sowing 1/0, operation mode 2/0, harvest planned
+-- 1/0 for days although the push ran). From the code: a friend indexed a building only when ITS OWN counts said "field"
+-- (type 39, or sown + unploughed above 0); a grain field is not type 39, and the friend's own one stood at 0 / 0, so it
+-- was never in the friend's index: every Y S / Y K of it was dropped ("noField") and it was never held. Now:
+--   * the index also takes a building with ploughed ground, ripe plants or field workers (any type);
+--   * a friend takes into its index every field the host names (by key, through the world module's building index), so
+--     the host's word decides what is a field, not this copy's own counts;
+--   * the values of the field routine itself (operation mode, harvest planned, its days and yield, the yield) travel as
+--     Y V and are written here every 0.5 s against this copy's own routine (forceHarvest is not among the native
+--     piece's counted numbers; the others are, and the native audit puts them back every 0.5 s: on a field the native
+--     piece holds only forceHarvest is written from here, on any other field all five).
+--   Not carried here on purpose: crop per year, crop rotation, fertilizing (a player's own settings: town actions).
 local C = rawget(_G, "Coop")
 if type(C) ~= "table" or type(C.register) ~= "function" or type(C.api) ~= "table" then return "coop_x_fields: load coop.lua first" end
 local A = C.api
@@ -32,6 +46,11 @@ P.version = "0.1"
 -- (lane 45) pollEvery 0.4 s, was 0.15 s: each poll is a command to the native piece, its tick and a file read (the
 -- owner's window for what players see is 3 s); a friend looks for field_ask.txt at most every 0.4 s too
 P.cfg = P.cfg or { pollEvery = 0.4, indexEvery = 5.0, checkEvery = 10.0, announceEvery = 5.0, pointsEvery = 30.0, indexPerTick = 12, hostStale = 15.0, logEvery = 60.0 }
+-- lane 71: the field routine's values (host: read every valuesEvery s, valuesPerTick fields a tick; friend: written every
+-- applyEvery s); a key the host names that this copy has not indexed is looked up at most every adoptEvery s
+for k, v in pairs({ valuesEvery = 1.0, valuesPerTick = 12, applyEvery = 0.5, adoptEvery = 2.0 }) do if P.cfg[k] == nil then P.cfg[k] = v end end
+local VPROPS = { "fieldOperationMode", "forceHarvest", "plannedHarvest_DaysLeft", "plannedHarvest_PredictedYield", "yield" }
+P.VPROPS = VPROPS
 P.stats = P.stats or {}
 P.t = P.t or {}
 local function log(fmt, ...) A.log("fields: " .. fmt, ...) end
@@ -68,15 +87,50 @@ local function indexStep(S)
       if not live(b) then return end
       local a = addr(b)
       local old = P.byA and a and P.byA[string.format("%X", a)]        -- once a field, a field while it stands (all ploughed, none sown: both counts 0)
-      if not old and A.btype(b) ~= 39 and b.field_numSown + b.field_numUnplowed <= 0 then return end
+      -- (lane 71) the field routine's own marks, any type: ploughed ground, ripe plants, field workers (a grain field all
+      -- ploughed and not sown yet has sown 0 and unploughed 0)
+      if not old and A.btype(b) ~= 39 and b.field_numSown + b.field_numUnplowed <= 0 and not ((b.field_ploughingPerc or 0) > 0
+         or (b.field_numReadyToHarvest or 0) > 0 or (b.fieldWorkersNeeded or 0) > 0) then return end
       local k = old or keyOf(b)
       if a and not sc.t[k] then sc.t[k] = { b = b, a = a }; sc.byA[string.format("%X", a)] = k end
     end)
   end
   sc.i = stop + 1
   if sc.i <= n then return false end
+  -- (lane 71) the fields the host named and this copy took in (adopt): kept while they stand
+  for k, x in pairs(P.adopted or {}) do
+    if not sc.t[k] then
+      if live(x.b) and addr(x.b) == x.a then sc.t[k] = { b = x.b, a = x.a }; sc.byA[string.format("%X", x.a)] = k else P.adopted[k] = nil end
+    end
+  end
   P.idx, P.byA, P.t.index, P.scan = sc.t, sc.byA, os.clock(), nil
   return true
+end
+
+-- (lane 71) friend: a field the host names that this copy's index lacks (its own counts do not say "field"): found by
+-- its key in the world module's building index and taken in; the host's word decides what is a field here
+local function adopt(S, k)
+  P.adoptT = P.adoptT or {}
+  local now = os.clock()
+  if now - (P.adoptT[k] or -99) < P.cfg.adoptEvery then return nil end
+  P.adoptT[k] = now
+  -- the world module's index first (it is rebuilt on a friend only for its stock rules, not in exact mode), then the
+  -- town module's finder (its index, then a live look through the engine's list), as the job board finds buildings
+  local b
+  local W = rawget(C, "world")
+  if W and W.buildingByKey then local ok, x = pcall(W.buildingByKey, k); if ok then b = x end end
+  if not b then
+    local t, x, y = k:match("^(%d+)@(%-?%d+),(%-?%d+)$")
+    local T = rawget(C, "town")
+    if t and T and T.findB then local ok, f = pcall(T.findB, tonumber(t), tonumber(x) * 10, tonumber(y) * 10, 20); if ok then b = f end end
+  end
+  if not b or not live(b) then bump("adoptMiss"); return nil end
+  local a = addr(b); if not a then return nil end
+  local e = { b = b, a = a }
+  P.idx = P.idx or {}; P.byA = P.byA or {}; P.adopted = P.adopted or {}
+  P.idx[k] = e; P.byA[string.format("%X", a)] = k; P.adopted[k] = e
+  bump("adopted"); log("%s: named by the host, not a field by this copy's own counts: taken into the index", k)
+  return e
 end
 local function indexDue(clock) return P.scan ~= nil or not P.idx or clock - (P.t.index or -99) >= P.cfg.indexEvery end
 
@@ -85,17 +139,97 @@ local function pointCounts(b)
   if ok then return a, c, d end
 end
 
+-- ---------------------------------------------------------------- lane 71: the field routine's values (Y V)
+local function busy() return rawget(C, "hold") or (C.join and C.join.state) end     -- (moved up from the friend part)
+local function vals(b)
+  local t = {}
+  for i, p in ipairs(VPROPS) do
+    local v = b[p]
+    if type(v) == "boolean" then v = v and 1 or 0 end
+    v = math.tointeger(v) or v
+    if type(v) ~= "number" then return nil end
+    t[i] = v
+  end
+  return t
+end
+-- host: a few fields a tick, every field each cfg.valuesEvery s; a line when its values changed (all again with the
+-- point counts' cfg.pointsEvery, after a join or resync, and for a field a friend asked whole)
+local function hostValues(S, clock)
+  if not P.idx then return end
+  local q = P.vq
+  if not q then
+    if clock - (P.t.vals or -99) < P.cfg.valuesEvery then return end
+    P.t.vals = clock
+    q = { i = 0 }; for k in pairs(P.idx) do q[#q + 1] = k end
+    P.vq = q
+  end
+  P.sentV = P.sentV or {}
+  local stop = math.min(#q, q.i + P.cfg.valuesPerTick)
+  for i = q.i + 1, stop do
+    local k = q[i]; local e = P.idx[k]
+    if e and live(e.b) then
+      local ok, t = pcall(vals, e.b)
+      if ok and t then
+        local line = table.concat(t, ",")
+        if P.sentV[k] ~= line then P.sentV[k] = line; send("Y V " .. k .. " " .. line); bump("valsSent") end
+      end
+    end
+  end
+  q.i = stop
+  if q.i >= #q then P.vq = nil end
+end
+-- friend: the host's values written into every field of the index that differs, a few fields a tick
+local function friendValues(S, clock)
+  if not (P.hv and next(P.hv)) or busy() then return end
+  local q = P.wq
+  if not q then
+    if clock - (P.t.apply or -99) < P.cfg.applyEvery then return end
+    P.t.apply = clock
+    -- the host sends every field's values again every cfg.pointsEvery s: one it has not named for 2.5 times that is gone there
+    for k in pairs(P.hv) do if clock - ((P.hvT or {})[k] or clock) > 2.5 * P.cfg.pointsEvery then P.hv[k] = nil; P.hvT[k] = nil end end
+    q = { i = 0 }; for k in pairs(P.hv) do q[#q + 1] = k end
+    P.wq = q
+  end
+  local stop = math.min(#q, q.i + P.cfg.valuesPerTick)
+  for i = q.i + 1, stop do
+    local k = q[i]; local want = P.hv[k]
+    local e = want and (P.idx and P.idx[k] or adopt(S, k))
+    if e and live(e.b) then
+      -- a field the native piece holds gets its counted numbers (mode, planned days and yield, yield) from the host's
+      -- c-op with every change and its 0.5 s audit: only forceHarvest (in no counted list) is written here then, or the
+      -- two writers would hand a number back and forth for up to a second after a host change
+      local nat = P.hooked and P.held and P.held[k] ~= nil
+      local ok, err = pcall(function()
+        for j, p in ipairs(VPROPS) do
+          local cur = e.b[p]; local isB = type(cur) == "boolean"
+          local c = isB and (cur and 1 or 0) or cur
+          if want[j] ~= nil and c ~= want[j] and (not nat or p == "forceHarvest") then
+            if isB then e.b[p] = (want[j] == 1) else e.b[p] = want[j] end
+            bump("valFix"); bump("valFix_" .. p)
+          end
+        end
+      end)
+      if not ok then bump("valErr"); P.lastErr = tostring(err) end
+    end
+  end
+  q.i = stop
+  if q.i >= #q then P.wq = nil end
+end
+
 -- ---------------------------------------------------------------- host
 local function hostTick(S, clock)
   local p = patch()
-  if not p then return end
-  if clock - (P.t.announce or -99) >= P.cfg.announceEvery then
+  if p and clock - (P.t.announce or -99) >= P.cfg.announceEvery then
     P.t.announce = clock; P.hostOk = avail(); send("Y X " .. (P.hostOk and "1" or "0"))
   end
-  if not P.hostOk then return end
   if rawget(C, "hold") then P.wasHold = true; return end            -- a join or resync: nothing is sent meanwhile
-  if P.wasHold then P.wasHold = nil; P.sentB = {}; log("a join or resync ended: the point counts are sent again") end
-  if clock - (P.t.bAll or -99) >= P.cfg.pointsEvery then P.t.bAll = clock; P.sentB = {} end   -- the point counts again (a friend that came later)
+  if P.wasHold then P.wasHold = nil; P.sentB = {}; P.sentV = {}; log("a join or resync ended: the point counts are sent again") end
+  if clock - (P.t.bAll or -99) >= P.cfg.pointsEvery then P.t.bAll = clock; P.sentB = {}; P.sentV = {} end   -- the point counts again (a friend that came later)
+  if not (p and P.hostOk) then                                      -- (lane 71) no native piece here: the field values still go out
+    if indexDue(clock) then indexStep(S) end
+    hostValues(S, clock)
+    return
+  end
   if indexDue(clock) and indexStep(S) then
     P.watched = P.watched or {}
     for k, e in pairs(P.idx) do
@@ -110,6 +244,7 @@ local function hostTick(S, clock)
     for k in pairs(P.watched) do if not P.idx[k] then P.watched[k] = nil end end
   end
   if not P.idx then return end
+  hostValues(S, clock)                                               -- (lane 71)
   if clock - (P.t.poll or -99) < P.cfg.pollEvery then return end
   P.t.poll = clock
   p.send("FIELD POLL"); p.tick()
@@ -135,6 +270,7 @@ end
 -- ---------------------------------------------------------------- friend
 local function friendField(S, k)
   local e = P.idx and P.idx[k]                                       -- a field not in the index yet: its next line (and "Y F")
+  if not e then e = adopt(S, k) end                                  -- (lane 71) named by the host: taken in by its key
   if not e or not live(e.b) then bump("noField"); return nil end
   return e
 end
@@ -143,7 +279,6 @@ end
 -- nothing); a field is held, and asked for whole ("Y F"), when its first line arrives
 -- a join, a resync or a load on this copy: the hook out at once (the held fields go with it; the load makes new
 -- objects, and the game's own UpdateFieldCache runs on them while loading)
-local function busy() return rawget(C, "hold") or (C.join and C.join.state) end
 local function hookOff(why)
   local p = patch()
   if p and P.hooked then p.send("FIELD HOOK OFF"); p.tick(); log("fields: hook off (%s)", why); bump("hookOff") end
@@ -161,6 +296,7 @@ end
 
 local function friendTick(S, clock)
   hookWanted(S, clock)
+  friendValues(S, clock)                                             -- (lane 71) with or without the native piece
   -- a checksum that did not match (FIELD CHECK wrote field_ask.txt): ask the host for that field whole
   local pa = patch()
   if pa and P.hooked and clock - (P.t.ask or -99) >= P.cfg.pollEvery then
@@ -210,6 +346,14 @@ end
 local function onLine(S, w)
   local what, k = w[4], w[5]
   if what == "X" then P.hostSays = w[5] == "1"; P.t.hostX = os.clock(); return end
+  if what == "V" then                                                -- (lane 71) the field routine's values: written by friendValues
+    local t = {}
+    for v in (w[6] or ""):gmatch("[^,]+") do t[#t + 1] = tonumber(v) end
+    if #t ~= #VPROPS then bump("valBad"); return end
+    P.hv = P.hv or {}; P.hv[k] = t; P.hvT = P.hvT or {}; P.hvT[k] = os.clock()
+    if not (P.idx and P.idx[k]) then friendField(S, k) end           -- a field this copy did not know: taken in now
+    return
+  end
   if not P.hooked then bump("notHooked"); return end
   local p = patch()
   if what == "S" or what == "K" then
@@ -245,6 +389,7 @@ end
 
 local function onWorld(S)
   P.idx, P.byA, P.scan, P.watched, P.held, P.crc, P.sentB = nil, nil, nil, {}, {}, {}, {}
+  P.adopted, P.adoptT, P.hv, P.sentV, P.vq, P.wq = {}, {}, {}, {}, nil, nil  -- (lane 71)
   local p = patch()
   if p then if P.hooked then p.send("FIELD HOOK OFF") end; p.send("FIELD FORGET"); p.tick() end
   P.hooked = false
@@ -256,6 +401,7 @@ local function onMessage(S, from, kind, w, line)
     local e = P.idx and P.idx[w[5]]; local p = patch()
     if e and p then p.send("FIELD FULL " .. tostring(e.a)); bump("wholeAsked") end
     if P.sentB then P.sentB[w[5]] = nil end                        -- and its point counts again (a friend that reloaded)
+    if P.sentV then P.sentV[w[5]] = nil end                        -- (lane 71) and its values
     return true
   end
   if S.role ~= "friend" or from ~= "host" then bump("ignored"); return true end
@@ -263,7 +409,7 @@ local function onMessage(S, from, kind, w, line)
   if C.stale("host", w) then bump("staleLine"); return true end      -- (lane 62: by the host's own stamps, not by two clocks; coop.lua C.stale)
   bump("in"); bump("inBytes", #line)
   if wall and w[4] == "S" then                                       -- how late the host's changes arrive here (link + frames)
-    local d = A.now() - wall
+    local d = (C.men and C.men.hostClock and C.men.hostClock() or A.now()) - wall     -- (lane 73) by the host's clock, not this PC's
     if d > (P.stats.delayMax or 0) then P.stats.delayMax = d end
     if d > 1 then bump("late1s") end; if d > 2 then bump("late2s") end
   end
@@ -286,4 +432,15 @@ end
 
 C.register("fields", { onWorld = onWorld, tick = tick, onMessage = onMessage,
   idle = function(S) if P.hooked then hookOff("no world") end end })     -- the core's tick at the menu and while loading
+-- (lane 71) the values module (coop_x_values.lua: collapses and sites' work on the host's word) is loaded from here, the
+-- way this file is loaded from coop_facts.lua: main.lua's module list is fixed
+do
+  local here = (debug.getinfo(1, "S").source or ""):gsub("^@", ""):gsub("\\", "/")
+  local chunk, err = loadfile((here:match("^(.*)/[^/]*$") or ".") .. "/coop_x_values.lua")
+  if chunk then
+    local ok, r = pcall(chunk)
+    if not ok then A.log("values: coop_x_values.lua failed: %s", tostring(r)) end
+  elseif err and not tostring(err):find("No such file") then A.log("values: coop_x_values.lua cannot be read: %s", tostring(err)) end
+end
+
 return "coop_x_fields " .. P.version .. " loaded"

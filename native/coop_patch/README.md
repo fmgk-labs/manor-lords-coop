@@ -859,11 +859,12 @@ held field by itself (50 plants a tick, its own 5 % rule for the size) every dra
 same tick (`followed`); the host's drawn size travels as `d<ranges>=<x>.<y>.<z>` and is written with the mesh's own
 UpdateInstanceTransform (vtable +B58h, as the drawing routine calls it), and the counted numbers as `c<12 x 8 hex>`
 (written over the game's own after its count: the hook wraps UpdateFieldCache). A plant count that differs
-from the host's is counted (`countdiff`) and only the common plants are held.
+from the host's is counted (`countdiff`) and only the common plants are held. (lane 71) The audit also puts the
+host's counted numbers back when this copy's own field routine wrote one outside UpdateFieldCache (`cachefix`).
 **Status:** `FIELD hooked|idle|unavailable <why>` (never the word on: the host's "everything off" rule looks for it) and
 `fields held= watched= hookcalls= heldcalls= restored= drawn= painted= queued= nodraw= sets= setpts= grows= beyond= unknown=
 polls= lines= outbytes= checkok= checkbad= audits= leaks= cuts= countdiff= gone= otherthread= dumps= refused= faults=
-ushook= usset= uspoll=` (microseconds inside the hook, SET and POLL).
+ushook= usset= uspoll= ... cachefix=` (microseconds inside the hook, SET and POLL; cachefix: lane 71).
 **After a game update:** FIELD needs its three signatures with exactly one hit, FCACHE's first 8 bytes as known in one
 aligned qword, and the known build; anything else: `FIELD unavailable <reason>`, nothing written, and the friend's
 fields are its own villagers' again (as before lane 40).
@@ -973,6 +974,22 @@ squads stood 2 to 7 m apart (bandits up to 18 m); a place written from Lua is wa
   `MEN POLL` also writes `H <hex> <x> <y> <z>` for each watched man whose own place moved 1 m since it was last written
   (memory committed when first read, vtable in the module at every read, under SEH). `menstat` adds `hoff= heres=
   herelines= herebad= ushere=`. Round 2's `MEN WAYS` (path points) was taken out by lane 48 (own places were better).
+- Led points (lane 73; why and the rules: the LEAD block at the head of `coop_men.h`). Host: `MEN LEAD <ms>` (0 = off,
+  the default; the Lua sends 2000). A HERE line of a moving man then ends ` L <x> <y> <z> <cm/s> <0|1>`: the point of his
+  own way (SMUnit.Path from PathPoint on, at most 64 points) that he reaches in that time at his speed (3 to 15 m ahead,
+  never past the last point; 1 = that end), and his speed from his last two places. A man who stopped is written at
+  once with ` S`, though he moved under 1 m. Friend: `MEN SET <hex>=<led x>,<y>,<z>,<1|2>,<host's man's x>,<y>,<cm/s>`:
+  the man walks to the led point; the pace rule holds him as far from it as the host's man is (behind: up to 1.5, a
+  muster's man 3; ahead: down to 0.5), the host's place moved on by his speed for at most 1 s since the line came. A
+  new led point is given with a GO only when the man has under the host's man's 1 s and 1 m of way left, or when the
+  point he walks to lies over 1.5 m off the straight way to the new one; else it is only noted. `menstat` adds `lead=
+  leads= stills= leadsets= leadgos= leadturns= leadkeeps= slowed= halts= haltms= walkms=` (halts: how often a held man of a
+  walking squad came to a stand while his host line was under 1.2 s old; haltms / walkms: the time such men stood /
+  walked: the measure of the live stop-and-go march, also in a bug report). Offline: tests in V1 and V1b (28 checks).
+- Far-held (lane 73): `MEN SET <hex>=<x>,<y>,<z>,3` for a free merchant's path end (coop_x_merch.lua). He is held like
+  any man (the place in every request of his, a GO at once, a GO that waits while he is busy), but the pace rule, the
+  run-off check, the FOREIGN dump, REGO and the halt count skip him. Before, he was dropped a line after his SET and
+  walked to his own end or stood (live: each such merchant put outright every 2 s). `menstat` adds `fars=`. 6 checks.
 
 ## GOODS and a demolished building (lane 46)
 
@@ -1047,6 +1064,50 @@ than the ceiling, the re-set's own end.
 
 Status: `ENDHOLD on|off n= held= passed= expired= skipped= faults= other= sets= bad=`. Offline E1-E3.
 
+## NODEATH: nobody dies by a friend's own game (lane 64)
+
+`coop_die.h`. A live session of three PCs (2026-11-17): a villager starved on two friends' copies and not on the host.
+Each copy rolls that death by itself (the daily hunger and cold step: on the family's day of the month, hunger 0 or
+cold 0, one in two, no food or fuel in the region). In a fight the rule is P1 (NOKILL); NODEATH is the same rule for
+the other causes. The host's deaths reach a friend through the mod's Lua, which calls the game's own
+`SMUnit:just_die` by the reflected function: none of the sites below is on that way.
+
+`SMUnit::just_die` (4e03010) has ten direct callers and the reflected thunk's jump (4afcc95). Read in the game file
+(`research\2026-11-10-game-probe\lanes\lane_s21_64\`):
+
+| caller | what | NODEATH |
+|---|---|---|
+| 4dad116, 4dad193 | CombatHit's kill path | behind P1 (NOKILL) |
+| 4d9026b | the daily hunger and cold step (4d8f670) | site `hunger` (signature `NDHUNGER`): the jne "today is not this family's day" in front of the death roll becomes `nop; jmp` (`0F 85` to `90 E9`, the same distance): no roll, no notice `death_hunger` / `death_cold`, no kill; the day's hunger and cold counting stays |
+| 4db9d99 | the work accident (4db9c80: a roll, then death or injury, each with its notice) | site `accident` (`NDACC`): the building's call of it is jumped over (`E8` to `EB 03`); the family's "injured" mark is the host's word (coop_facts.lua) |
+| 4e1b5a5 | fireDamage ("Died in a fire") | site `fire` (`NDFIRE`): the call is jumped over; the routine still returns 1 |
+| 4d2f10b | a collapsing building ("crushed") | site `crush` (`NDCRUSH`): `test ebx,ebx` becomes `xor ebx,ebx` (`85` to `31`): nobody is found inside, no kill, no notice |
+| 4d63ce3 | the animals' daily hunger step (4d638b0) | site `animal` (`NDANIMAL`): the call is jumped over (the notice before it is the caller's and stays) |
+| 4da9907, 4e065d0 | trade-route merchants taken out by the game's own book-keeping | left alone |
+| 4dc7c65 | a charge's action 40 (a fight; its purpose was not read) | left alone |
+
+No routine kills for illness or old age in this build: a family's sickness is a mark, and nothing reads `Age` as a cause.
+
+A sixth site, `bury` (signature `NDBURY`, added after the game runs of 2026-11-18): a burial is the host's outcome too.
+A villager's "is there a body to bury" (4e0a040, its one caller 4de5d1a) tests the corpse count of his region
+(`cmp dword [rax+500h],0; je none`, 4e0a07a); the je becomes `nop; jmp` (`0F 84` to `90 E9`, the same distance), so a
+friend's villagers start no burial by themselves (they did, up to a game day before the host's: "hof corpses 6/2").
+A body goes on a friend when the host's goes: the events module's E PC list, 3 s after it says so (destroyUnit).
+The status has `bury=` after `animal=`; "on" means all six.
+
+    NODEATH ON | OFF        every available site on / all off (also at ALLOFF and when the DLL goes off)
+
+Each site is a signature of the table with exactly one hit, its original bytes, the call's target (`JUSTDIE`,
+`ACCIDENT`) and the patch inside one aligned 8-byte block (the same rule as P1); a site that does not hold is left
+out and named. Not tied to the known build: the signatures decide.
+Status: `NODEATH on|off|part|unavailable hunger=<on|off|na> accident= fire= crush= animal= refused=`. "on" means all
+five. The mod sends NODEATH ON on a friend's copy while it plays in the host's world, OFF while a save loads and when
+the copy is no friend any more, and logs once what the status says. Offline ND1-ND4, and the hunger site in the image test.
+
+What a friend's copy loses with it on: nothing a player sees by itself. A unit at health 0 in a fire lives until the
+host's word (its health stays at or below 0; CombatHit's own floor puts it back to 1 at the next hit). A work
+accident's injury is not rolled there: the mark comes from the host, the notice `worker_injured` does not (open).
+
 ## REPORT: the player's "Make Bug Report" button (lane 61)
 
 `coop_report.h`. The mod writes `patch_report_job.txt` in this DLL's I/O folder (UTF-8, tab-separated fields):
@@ -1074,6 +1135,60 @@ console window).
 Status: `REPORT idle | running report_<stamp> | done report_<stamp>.zip <files> [opened] |
 folder report_<stamp> <files> <why> [opened] | refused report_<stamp> <why> | refused - <why>`. Offline RP1-RP3.
 
+## COLLAPSE and SITEHP: a collapse and a site's work on the host's word (lane 71)
+
+Source: `coop_rolls.h` (this lane's own block; the reading of the game's code is in its head comment).
+
+**COLLAPSE.** A mine's collapse is a roll of each copy: `TemporalComponent::updateDay` calls, per building, a roll
+(4cfac70: `GetCollapseChance`, then `rand()`) and then `collapseBuilding` (4d2ee10), which marks the building (+3A0h),
+may kill one unit inside (a second roll against the type's byte +29Ch), turns it into a ruin and lets its families go.
+`COLLAPSE WATCH` (host) moves the entry's first 5 bytes into a stub of this DLL: every collapse runs as before and its
+building and its type before the call are written to `collapse_out.txt` at the tick. `COLLAPSE ON` (friend) uses the same stub, and every call the
+game makes returns at once (`blocked`); the death roll's `cmp edx,eax` becomes `cmp edx,edx` (one byte), so the jump over
+the death is always taken (the host's death comes with its family lists). `COLLAPSE DO <building>` runs the host's
+collapse with the game's own routine (the trampoline). `COLLAPSE OFF` and ALLOFF put both back.
+Signatures COLLENT (the entry, up to the +3A0h mark) and CKILL (the death roll); known build only.
+**Status:** `COLLAPSE off|watch|on blocked= seen= done= pending= dropped= faults= bad= kill=` or `COLLAPSE unavailable <why>`.
+
+**SITEHP.** `getConstructionProgress` (4d3d940) is 0.5 x (delivered goods / needed goods + the sum of the parts' hp
+(+314h) / the sum of their max (+318h)), over the part list at +2F8h. The goods half is the host's already (GOODS); the
+hp half is each copy's own builders. `SITEHP WATCH <b>` and `SITEHP POLL` (host) write `sitehp_out.txt`, one line
+`<b hex> <fraction bits>` per site whose work fraction changed. `SITEHP HOLD <b> <fraction bits>` (friend) sets every
+tick the parts' hp so that their sum is the host's fraction of their max (each part in proportion, the rest in list
+order, never above its max). `DROP <b>`, `FORGET`. A site is checked alive at every use (object number and name, a
+region, a part list of 0 to 64 parts with vtables in the module). Signature SPROG (the two sums); known build only.
+**Status:** `SITEHP available held= watched= writes= polls= lines= gone= bad= faults=` or `SITEHP unavailable <why>`.
+**Offline:** tests C1-C4 and SH1-SH3 in `test/patch_test.c` (2026-11-17: 732 passed, 0 failed; 80 of 80 signatures
+hold on the test copy's game file).
+
+**COLLAPSE, the one caller let through (lane 71, round two).** The third caller of collapseBuilding (4dcdc61) is a
+soldier's task 58 GrabLootOrDismantle in SMUnit::proximityAction (READ: currentUnitRole 5, Tasks[0].Type 58, its target
+building not marked yet, the soldier in reach: the tasks at the building are ended, the building collapses, then the
+soldier's loot). Stopped, the building would stay unmarked and the loot code after the call would run again and again,
+so on a friend this call is let through (`passed`; the stub notes each call's return address; the site is checked at the
+scan to be an E8 to the entry; `COLLAPSE PASS <ret hex>` for the offline test). `COLLAPSE DO` leaves a building already
+marked (+3A0h, `already`).
+
+**MROLL (lane 71, round two).** The daily maintenance roll (4cfacc0, called from updateDay 4d78212 for each building):
+effects 1 and 2 change the owner's influence; effect 6 rolls a work accident (4db9c80: 1 in 100 a death, else an
+injury and its notice). `MROLL ON` (friend) moves 4cfacc0's first 5 bytes into a stub and every call returns at once
+(`blocked`). `MROLL WATCH` (host) does the same for 4db9c80: the accident runs, its building, worker and whether the
+worker died go to `accident_out.txt` at the tick. `MROLL OFF` and ALLOFF put both back. Signatures MRDAY, MRACC; known
+build only. Lane 64's NODEATH (NDACC) jumps over the accident's call inside 4cfacc0 on a friend: the two do not touch the
+same bytes. **Status:** `MROLL off|on|watch blocked= seen= pending= dropped= faults= bad=`. **Offline:** M1-M3 (751
+passed, 0 failed; 82 of 82 signatures hold).
+
+**FAMROLL (lane 71, round three).** Births and new families: Region::growPopulation (4c64ee0, from updateDay) makes a
+person (4c65336) and on some days a family (4c6590f) through the maker 4c51db0, at each copy's own day change and with a
+name and looks of its own. Sickness: the family's daily step (4d8f670) rolls a new sickness on the family's day
+(4d8f8fd; 1 in 31 after day 30), which writes the mark and recomputes the members' work and walk penalties (4c3a410,
+4ded390). `FAMROLL ON` (friend) moves the maker's first 5 bytes into a stub (the stub notes the return address): the two
+growPopulation calls return 0 at once (`births`, `families`; READ: both callers take a 0 as "try the next one"), every
+other call runs (`passed`: a letter's, 4cdba10); and the sickness roll's jne becomes jmp (one byte). The host's growth
+reaches a friend by the people module's V G lines, the sickness mark by the facts module. `FAMROLL SITES <ret1> <ret2>`
+for the offline test. Signatures GROWMK, SICKROLL; none of the bytes lanes 36 and 64 patch. **Status:** `FAMROLL off|on
+births= families= passed= sick= sites= faults= bad=`. **Offline:** FR1-FR4 (766 passed, 0 failed; 84 of 84 signatures).
+
 **0.9.2 (lane 62): the Steam piece's two files.** Two more job verbs, with the fields of `file`: `steamlog <source><TAB><name><TAB><cap>` for `coop_steam.log` and `steamstatus ...` for `steam_status.txt`. Their Steam names are taken out by the SHAPE of the line before the common scrub (`coop_scrub.h`, `scrub_steam`), because the mod may not know those names any more (after a lobby was lost the status lists nobody; the log holds names of earlier sessions) and the name list takes only names of 3 bytes or more: in the log `<name> (<id>) connected as friendN` gets `friend N` for the name and the "is in the lobby but the co-op mod ..." note gets `<name>`; in the status a player line `<slot> <id> <state> <ping> <name>` gets `host` or `friend <slot>`; the log's `first callback ...: first bytes <hex>` lines (raw callback bytes: whole Steam ids in hex, which the rule for decimal ids does not see) lose their bytes. A job takes 40 files now (24 before). Offline RP4 (a name not in the job, a 2-letter name, a name with spaces, parentheses and digits, a last line without a line end, a first-callback line; mock names and ids): 718 passed, 0 failed (702 before).
 ## MAINT: a building's maintenance on the host's word (lane 67)
 
@@ -1099,3 +1214,40 @@ MDECSUB (4bb35eb, a tracker of 20h bytes, +10h). Known build only; anything else
 MT4: READ of a synthetic component, SET writes held types only, the next tick puts this copy's own wear back, another
 object at the address drops the entry, DROP, FORGET, seven bad forms, ALLOFF, another build, a pattern twice, a wear at
 another offset); image test 18 passed.
+
+## HIST: the first-run probes for the three histories Lua cannot reach (lane 72)
+
+Why and what was read: `research/2026-11-10-game-probe/lanes/lane_s21_72/report.txt` sections 7 and 8. Known build
+only; nothing is patched. One file per command in the I/O folder, ending with `END`.
+
+| Command | Does |
+|---|---|
+| `HIST SUBDUMP <subsystem> <tag> [days] [stride]` | `hist_sub_<tag>.txt`: ProductionSubsystem's region records (+38h, 20h each) and, per region, the newest `days` day records (100h each): the date (+F0h) and the three maps at +0h, +50h, +A0h (allocated elements only, `stride` bytes each, default 16) |
+| `HIST GRIDHASH <engine> <tag> [block] [steps]` | `hist_grid_<tag>.txt`: the fertility grid (+8E0h, 10h a cell) hashed per block of `block` x `block` cells (default 32), each float clamped to 0..1 and rounded to `steps` (default 255): what the overlay can show |
+| `HIST DUMP <object> <offset> <bytes> <tag>` | `hist_dump_<tag>.txt`: up to 4096 bytes at object + offset |
+| `HIST DUMPLIST <object> <offset> <size> <max> <tag>` | `hist_list_<tag>.txt`: the first min(num, max) elements of the list whose header is at object + offset |
+| `HIST TRYADD <tracker> <good> <amount>` | one call of the tracker's own add routine 4bb3620 (signature HADD), no worker. A TEST copy only: refused unless the environment variable COOP_ROLE is set (the harness's copies; Steam never sets it) AND `dev_hist_tryadd.txt` is in the I/O folder (a test script makes it; no package holds it), both checked at every command; at most 16 calls |
+
+Every object passes comp_sane (committed, 8-aligned, vtable in the module) at the command; every list's count is
+checked against its capacity and a ceiling and its elements' memory is checked readable before any read; everything
+under __try. TRYADD also checks the tracker's owner (+90h), the owner's engine (+2E8h) and the weather master (+118h).
+**Status:** `HIST available reads= files= tryadd=ready|gated|unavailable calls= refused= bad= faults=` or
+`HIST unavailable <why>`. **Offline:** section H of `test/patch_test.c` (H1-H4).
+
+### HIST: the carries (lane 72, game run). These run in a player's install.
+
+| Command | Does |
+|---|---|
+| `HIST TRKDUMP <tag> <tracker>,...` | `hist_trk_<tag>.txt`: each production tracker's log (map +0C8h; entries {int64 day, int32 amount}) |
+| `HIST TRKSET <tracker> <good> <from> <day/amount,...or ->` | the friend's log of a good written in place from entry `from`; room for a longer list or a missing good made with the game's add 4bb3620 (HADD), the last entry's day set to "not today" for the call and put back |
+| `HIST EXP <tag> <component>[=<value>],...` | an ExpertiseComponent's float at +0B8h (not reflected) read, or written (0..100000) and read back |
+| `HIST GRIDHASH <engine> <tag> 32 0` | steps 0: the grid hashed on its exact bits |
+| `HIST GRIDROWS <engine> <tag> <bx>:<by>,...` | `hist_grows_<tag>.txt`: 32 row hashes of each 32 x 32 block |
+| `HIST GRIDGET <engine> <tag> <bx> <by> <rowmask>` | `hist_gget_<tag>.txt`: the rows of a block whose bit is set, each cell as 32 hex digits (four floats' bits) |
+| `HIST GRIDSET <engine> <tag>` | reads `hist_gin_<tag>.txt` (lines as GRIDGET writes them); a changed cell is written only when it is on the game's redraw queue (engine +1018h, int32 cell indices) or the queue has room for it (never grown); the rest is counted `deferred` |
+| `HIST HSET <subsystem> <tag> [ADD]` | reads `hist_hin_<tag>.txt`: `<region> <d/m/y> <0/50/A0> <good>=<n>,...`; the record found by its date; an amount written in place; with ADD a good the map lacks is added with the game's find-or-add 14489C0 (three byte-identical copies exist, so it is verified at its RVA, all 160 bytes and its call's target) |
+| `HIST MAPADD <subsystem> <region> <d/m/y> <0/50/A0> <good> <amount>` | the find-or-add's trial: a TEST copy only (COOP_ROLE and `dev_hist_mapadd.txt`, as TRYADD) |
+
+Game routines called from a player's install: the tracker's add (TRKSET) and the map find-or-add (HSET ADD), each
+after the advisor's trial on test copies passed: an existing and a new key, a save, a load, both kept (lane 72
+report, sections 13 and 15).

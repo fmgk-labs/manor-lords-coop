@@ -63,8 +63,13 @@ enum { S_TSR = 0, S_REFORM, S_P1, S_P2, S_P3A, S_P3B, S_NF1, S_NF2, S_JG /* lane
        S_WALLREB /* lane 53 (WALLSET) */, S_WALLINS /* lane 53 */, S_PACE /* lane 52 (MEN: the squad's pace rule) */,
        S_TREEFIND /* lane 54 (FELL) */, S_FELLHIT /* lane 54 */,
        S_ENDTASK /* lane 49, round four */,
-       S_LOGADD /* lane 66 (NOLOG) */, S_LOGNEW /* lane 66 */,
-       S_MSTAT /* lane 67 (MAINT) */, S_MDECAY, S_MDECSUB /* lane 67 */, S_DLL_COUNT };
+       S_JUSTDIE /* lane 64 (NODEATH) */, S_ACCIDENT, S_NDHUNGER, S_NDACC, S_NDFIRE, S_NDCRUSH, S_NDANIMAL, S_NDBURY /* lane 64 */,
+       S_LOGADD /* lane 66 (NOLOG) */, S_LOGNEW, S_LOGPOP /* lane 66 */,
+       S_MSTAT /* lane 67 (MAINT) */, S_MDECAY, S_MDECSUB /* lane 67 */,
+       S_HADD /* lane 72 (HIST TRYADD) */,
+       S_COLLENT /* lane 71 (COLLAPSE) */, S_CKILL /* lane 71 */, S_SPROG /* lane 71 (SITEHP) */,
+       S_MRDAY /* lane 71 (MROLL) */, S_MRACC /* lane 71 */,
+       S_GROWMK /* lane 71 (FAMROLL) */, S_SICKROLL /* lane 71 */, S_DLL_COUNT };
 #define HOLD_GATES 10                   /* lane 31: S_HAPPR .. S_HPREM and S_HPRMALL are hooked at their entry; S_HWMON is a store site; lane 36: S_HEMIG */
 #define TOTALS_SITES 6
 #define S_PATCH_LAST S_NT      /* the patch sites are S_P1..S_PATCH_LAST */
@@ -490,6 +495,56 @@ static const sig_def SIGS[] = {
     { "ENDTASK", "the end of a unit's tasks (entry; hooked by ENDHOLD)",
       "4C 8B DC 55 56 49 8D 6B A1 48 81 EC B8 00 00 00 4D 89 6B D8 48 8B F1 45 33 ED C6 81 25 0D 00 00 00 41 8B C5 4C 89 6D 67 48 89 81 90 08 00 00",
       K_ENTRY, -1, 0, {0}, {0}, -1, 0x4dfb960, 1 },
+    /* ---- lane 64 (NODEATH): on a friend's copy nobody dies by that copy's own game; a death comes on the host's word.
+     * Source: research\2026-11-10-game-probe\lanes\lane_s21_64\report.txt (the READ of each routine and its bytes).
+     * SMUnit::just_die (4e03010) has ten direct callers and the reflected thunk's jump. The two in CombatHit are behind
+     * P1 (NOKILL); the two trade-route merchant clean-ups (4da9907, 4e065d0) and the charge's action 40 (4dc7c65) are
+     * left alone; the other five are the sites below. Each patch lies inside one aligned 8-byte block.
+     * JUSTDIE = just_die's entry, ACCIDENT = the work accident's entry (4db9c80: a roll, then death or injury, each
+     * with its notice): the targets the three K_CALL sites must reach. */
+    { "JUSTDIE", "SMUnit::just_die entry (the call target of NDFIRE and NDANIMAL)",
+      "48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 55 41 54 41 55 41 56 41 57 48 8B EC 48 81 EC 80 00 00 00 48 8B 05 ?? ?? ?? ??",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4e03010, 1 },
+    { "ACCIDENT", "the work accident's entry (the call target of NDACC)",
+      "48 89 5C 24 10 48 89 6C 24 20 57 48 83 EC 60 49 8B E8 8B DA 48 8B F9 4D 85 C0 74 17 48 8D 91 E8 04 00 00",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4db9c80, 1 },
+    /* the daily hunger and cold step (4d8f670), per family: "movzx eax,[family+2Fh]; cmp [time+168h],eax; jne next" is
+     * the test "is today this family's day of the month" in front of the death roll (hunger 0 or cold 0, one in two,
+     * no food or no fuel in the region: a random member is put on the death list, the lord gets the notice
+     * death_hunger / death_cold). The jne becomes "nop; jmp" (the same rel32): the roll, the notice and the kill are
+     * never reached; the hunger and cold counting before it is untouched. */
+    { "NDHUNGER", "no own death of hunger or cold (the daily step's death roll is jumped over)",
+      "41 0F B6 47 2F 41 39 86 68 01 00 00 0F 85 ?? ?? ?? ?? 49 8B 85 50 03 00 00 80 B8 09 0A 00 00 00 0F 85 ?? ?? ?? ??",
+      K_FIXED, 12, 2, {0x0F, 0x85}, {0x90, 0xE9}, -1, 0x4d8fec7, 1 },
+    /* the building's daily accident roll (4cfac70) calls ACCIDENT for one worker at work in it: the call is jumped
+     * over (no death, no injury, neither notice; the family's "injured" mark is the host's word, coop_facts.lua) */
+    { "NDACC", "no own work accident (the call of the accident routine is jumped over)",
+      "48 39 B0 98 00 00 00 74 0B 48 83 C3 08 48 3B DD 75 CF EB 10 4C 8B C6 BA 01 00 00 00 48 8B CF E8 ?? ?? ?? ??",
+      K_CALL, 31, 2, {0xE8, 0xBD}, {0xEB, 0x03}, S_ACCIDENT, 0x4cfad9f, 1 },
+    /* fireDamage (4e1b430): health - 1 a call inside a burning building; at 0 "Died in a fire" and just_die: that call
+     * is jumped over (the routine still returns 1; the unit lives until the host's word) */
+    { "NDFIRE", "no own death in a fire (fireDamage's call of just_die is jumped over)",
+      "48 83 BB E0 0C 00 00 00 74 0A B2 01 48 8B CB E8 ?? ?? ?? ?? 48 8B CB E8 ?? ?? ?? ?? B0 01",
+      K_CALL, 23, 2, {0xE8, 0x66}, {0xEB, 0x03}, S_JUSTDIE, 0x4e1b58e, 1 },
+    /* a collapsing building: "mov ebx,<units inside>; test ebx,ebx; jle none" (4d2f0ba) before one of them is picked,
+     * killed and the lord told "crushed". "test" becomes "xor": none is inside (ebx is loaded for this test only and
+     * written again before its next read on both ways) */
+    { "NDCRUSH", "no own death under a collapsing building (nobody is found inside)",
+      "4C 3B 6D CF 0F 85 ?? ?? ?? ?? 8B 5D BF 85 DB 0F 8E ?? ?? ?? ?? FF 15 ?? ?? ?? ?? 25 FF 7F 00 00 66 0F 6E C3",
+      K_FIXED, 13, 1, {0x85}, {0x31}, -1, 0x4d2f0b0, 1 },
+    /* the animals' daily hunger step (4d638b0): its death list's loop "mov rcx,[rbx]; call just_die": jumped over */
+    { "NDANIMAL", "no own death of an animal of hunger (the daily step's call of just_die is jumped over)",
+      "48 8D 3C C3 48 3B DF 74 16 90 48 8B 0B E8 ?? ?? ?? ?? 48 83 C3 08 48 3B DF 75 EF",
+      K_CALL, 13, 2, {0xE8, 0x28}, {0xEB, 0x03}, S_JUSTDIE, 0x4d63cd6, 1 },
+    /* a villager's "is there a body to bury" (4e0a040, unit rcx; its one caller 4de5d1a): "mov rax,[rcx+328h]; test;
+     * je none; cmp dword [rax+500h],0; je none" (the unit's region, its corpse count) before the walk over the bodies
+     * ("found corpse in the region", "corpse not taken care of", "Moving corpse for burial"). The second je becomes
+     * "nop; jmp" (the same rel32): this copy finds no body to bury and starts no burial by itself; the routine returns
+     * 0 by its own way out. A body goes on a friend when the host's goes (the events module's E PC). Game runs f1, c3:
+     * a friend's villagers buried up to a day before the host's ("hof corpses 6/2"). */
+    { "NDBURY", "no own burial (a villager finds no body to bury)",
+      "48 8B 81 28 03 00 00 48 85 C0 0F 84 ?? ?? ?? ?? 83 B8 00 05 00 00 00 0F 84 ?? ?? ?? ?? 48 8D 15",
+      K_FIXED, 23, 2, {0x0F, 0x84}, {0x90, 0xE9}, -1, 0x4e0a06a, 1 },
     /* ---- lane 66 (NOLOG): the game's notices. A notice (the lord's log, PawnCPP.log at +5C0h: 100 entries of A0h,
      * Text +0, Location +10h, fullDescr +28h, Timestamp +38h, opensMenu +3Ch, Actor +40h, Tag +90h, day +98h) is added
      * by PawnCPP::addLog (4b29190) or addLogIfNew (4b292b0): 58 of the game's call sites (theft, deaths, drought,
@@ -504,6 +559,14 @@ static const sig_def SIGS[] = {
     { "LOGNEW", "PawnCPP::addLogIfNew, from its 9th byte (hooked by NOLOG)",
       "48 81 EC 00 01 00 00 49 89 5B 08 49 8B C0 48 8B 5D 7F 0F 57 C9 49 89 73 10 0F 57 C0 49 89 7B 18",
       K_ENTRY, -1, 0, {0}, {0}, -1, 0x4b292b8, 1 },
+    /* lane 66 (NOLOG): PawnCPP::playPopupMessageGUI's native stub (4ac7a90: FindFunctionChecked, then ProcessEvent), the
+     * game's event window ("Cold!", "Hunger!", the royal tax increase). Its only callers are the game's own code:
+     * playPopupMessageIfNotPlayedRecently (4b54a40, from the daily cold and hunger routine 4d8f6d4 at 4d8fc8c, 4d8fdaa)
+     * and recalculateRoyalTaxes (4b5fcb0). The mod's own call reaches the window through the script layer, not this
+     * stub. The pattern starts after the hooked 5 bytes and holds the stub's own FName displacement (one hit). */
+    { "LOGPOP", "PawnCPP::playPopupMessageGUI native stub, from its 6th byte (hooked by NOLOG)",
+      "48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 30 48 8B DA 49 8B F0 48 8B 15 EF 27 9B 04 48 8B F9 E8 27 D6 9A FC 48 8B C8 48 8B E8 E8 0C 47 88 FC",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4ac7a95, 1 },
     /* ---- lane 67 (MAINT): GetMaintenanceStatus (4b98590: "movzx eax,byte [rcx+A0h]; ret") and the first bytes of
      * GetMaintenanceStatusForTypes after it (4b985a0: "lea rdi,[rcx+A8h]", the trackers' map). Never called or patched:
      * the status's displacement (+3) and the map's (+36) are checked. */
@@ -521,6 +584,53 @@ static const sig_def SIGS[] = {
     { "MDECSUB", "the wear's subtraction: a tracker of 20h bytes, what is left at +10h (used by MAINT)",
       "48 C1 E0 05 48 03 01 48 8D 4D FF 29 58 10 8B 45 03 F7 D0 21",
       K_ENTRY, -1, 0, {0}, {0}, -1, 0x4bb35eb, 1 },
+    /* ---- lane 72 (HIST TRYADD, a test copy's probe only): ProductionTrackerComponent's add routine 4bb3620 (tracker rcx,
+     * good edx, amount r8d, worker r9 or null), void: finds or adds the good's list in the map at +0C8h, removes the
+     * oldest of 366, adds to today's entry or appends one {int64 day, int32 amount}, broadcasts OnNewProductionAdded
+     * (+0B8h). 25 call sites. Its entry up to "test rbp,rbp; je" (the owner read at +90h). Called, never patched. */
+    { "HADD", "the production tracker's add routine (called by HIST TRYADD on a test copy)",
+      "48 89 5C 24 18 89 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 50 48 8B A9 90 00 00 00 45 33 FF 4D 8B F1 45 8B E0 44 8B D2 48 8B D9 48 85 ED 74 ??",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4bb3620, 1 },
+    /* ---- lane 71 (COLLAPSE): collapseBuilding (4d2ee10, building rcx): its entry up to "mov byte [rsi+3A0h],1" (the
+     * building marked) and the call that tells the two kinds of collapse apart. The first 5 bytes ("mov [rsp+20h],rbx")
+     * are moved into a stub of this DLL by COLLAPSE ON / WATCH. */
+    { "COLLENT", "collapseBuilding entry (hooked by COLLAPSE)",
+      "48 89 5C 24 20 55 56 57 41 56 41 57 48 8D 6C 24 C9 48 81 EC D0 00 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 27 48 8B F1 C6 81 A0 03 00 00 01 8B 89 B8 03 00 00 E8",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4d2ee10, 1 },
+    /* ---- lane 71 (COLLAPSE): the death roll inside collapseBuilding (4d2ef73): rand() & 7FFFh scaled, capped at 100,
+     * against the type's byte +29Ch ("movzx eax,byte [rbx+29Ch]"), "cmp edx,eax; jge" over the death. COLLAPSE ON makes
+     * the compare "cmp edx,edx" (+59: D0 -> D2): the jump is always taken. Not a function entry (K_ENTRY: one hit). */
+    { "CKILL", "collapseBuilding's death roll (patched by COLLAPSE ON)",
+      "FF 15 ?? ?? ?? ?? 4C 8B 65 A7 BA 64 00 00 00 25 FF 7F 00 00 4C 89 65 C7 66 0F 6E C8 0F B6 83 9C 02 00 00 0F 5B C9 F3 0F 59 0D ?? ?? ?? ?? F3 0F 2C C9 3B CA 0F 4C D1 45 33 FF 3B ?? 0F 8D",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4d2ef73, 1 },
+    /* ---- lane 71 (SITEHP): getConstructionProgress's sums over the building's parts (4d3da16, building rsi): the part
+     * list at +2F8h (count +300h), "addss xmm0,[rax+314h]" (a part's hp) and "addss xmm1,[rax+318h]" (its max). Never
+     * called or patched: the four displacements are in the pattern. Not a function entry (K_ENTRY: one hit). */
+    { "SPROG", "a site's progress: its parts' hp +314h and max +318h (used by SITEHP)",
+      "48 8B 8E F8 02 00 00 0F 57 C9 48 63 86 00 03 00 00 48 8B D1 66 0F 5A D6 4C 8D 04 C1 49 3B C8 74 ?? 66 0F 1F 84 00 00 00 00 00 48 8B 02 48 83 C2 08 F3 0F 58 80 14 03 00 00 49 3B D0 75 EC 0F 1F 40 00 0F 1F 84 00 00 00 00 00 48 8B 01 48 83 C1 08 F3 0F 58 88 18 03 00 00",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4d3da16, 1 },
+    /* ---- lane 71 (MROLL): the daily maintenance roll (4cfacc0, building rcx; called only from updateDay 4d78212): its
+     * entry up to GetActiveMaintenanceEffect and the switch over the effect. The first 5 bytes ("mov [rsp+18h],rbx") are
+     * moved into a stub of this DLL by MROLL ON. */
+    { "MRDAY", "the daily maintenance roll's entry (hooked by MROLL ON)",
+      "48 89 5C 24 18 48 89 74 24 20 57 48 83 EC 30 48 8B F1 48 8B 89 48 03 00 00 E8 ?? ?? ?? ?? 0F B6 F8 8B CF 83 E9 01 0F 84",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4cfacc0, 1 },
+    /* ---- lane 71 (MROLL): the work accident (4db9c80, worker rcx, 1 edx, building r8; its one caller 4cfadbe): its entry up
+     * to the place test. The first 5 bytes ("mov [rsp+10h],rbx") are moved into a stub of this DLL by MROLL WATCH. */
+    { "MRACC", "the work accident's entry (hooked by MROLL WATCH)",
+      "48 89 5C 24 10 48 89 6C 24 20 57 48 83 EC 60 49 8B E8 8B DA 48 8B F9 4D 85 C0 74 17 48 8D 91 E8 04 00 00 49 8B C8 E8",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4db9c80, 1 },
+    /* ---- lane 71 (FAMROLL): the person and family maker (4c51db0: region, family or -1, role, home; growPopulation's two
+     * calls 4c65336 and 4c6590f, a letter's 4cdbc6b): its entry up to "lea rsi,[r9+3F8h]". The first 5 bytes ("mov
+     * [rsp+10h],rbx") are moved into a stub of this DLL by FAMROLL ON. */
+    { "GROWMK", "the person and family maker's entry (hooked by FAMROLL ON)",
+      "48 89 5C 24 10 44 88 44 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 D0 48 81 EC 30 01 00 00 F3 0F 10 15 ?? ?? ?? ?? 49 8D B1 F8 03 00 00",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4c51db0, 1 },
+    /* ---- lane 71 (FAMROLL): the sickness roll in the family's daily step (4d8f8fd): rand() & 7FFFh scaled, capped at 30,
+     * "test eax,eax; jne" over the new sickness (+39: 75 -> EB by FAMROLL ON), then the day-30 test. Not an entry. */
+    { "SICKROLL", "the family's sickness roll (patched by FAMROLL ON)",
+      "FF 15 ?? ?? ?? ?? 25 FF 7F 00 00 66 0F 6E C0 B8 1E 00 00 00 0F 5B C0 F3 41 0F 59 C4 F3 0F 2C C8 3B C8 0F 4C C1 85 C0 ?? ?? 49 83 BE 60 01 00 00 1E",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4d8f8fd, 1 },
 
     /* ---- below: only checked by the offline tool (sigs5.txt lists them; the DLL does not use them) ---- */
     { "ALT-A", "arrows pass avoidKilling=1 (updateProj)",
@@ -535,9 +645,6 @@ static const sig_def SIGS[] = {
     { "recalc", "recalcStatsFromEquipment entry",
       "48 8B C4 55 57 48 8D 68 A1 48 81 EC 98 00 00 00 F3 0F 10 89 E0 0A 00 00",
       K_ENTRY, -1, 0, {0}, {0}, -1, 0x4e27970, 0 },
-    { "just_die", "just_die impl entry",
-      "48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 55 41 54 41 55 41 56 41 57 48 8B EC 48 81 EC 80 00 00 00 48 8B 05 ?? ?? ?? ??",
-      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4e03010, 0 },
     { "updProjSite", "updateProj CombatHit site",
       "F2 0F 10 4F 38 41 B1 01 F2 0F 10 47 40 4D 8B C6",
       K_ENTRY, -1, 0, {0}, {0}, -1, 0x4c6fa65, 0 },

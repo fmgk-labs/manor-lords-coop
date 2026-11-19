@@ -248,26 +248,86 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 - **Basis:** owner's live play (seen in a friend's log); the reason by code reading. It never causes a resync: the daily comparison looks at the player's own town only.
 - **Workaround:** none needed.
 
-### G8. A notice shows twice on a friend for a few seconds (0.2.4)
+### G8. A notice shows twice on a friend for a few seconds (0.2.4; fixed in 0.2.5)
 
 - **You see:** on a friend, "Another Ruler's Army was sighted." or "Enemy Unit has been spotted!" shows as two lines for 2 to 6 seconds, then one. The host shows one.
 - **Numbers:** 0.2.4: on test copies with real clicks, 3 cases in 8 minutes at speed 4. In 0.2.3 the second line stayed. Every other kind of notice shows once, with the host's words and building.
 - **Basis:** lane 63's real-click run on the 0.2.4 zip; lane 66's runs. The friend's own line leaves the notice list at once but stays drawn for a few seconds.
 - **Workaround:** none needed.
 
-### G9. A game event window on a friend only
+### G9. A game event window on a friend only (fixed in 0.2.5)
 
 - **You see:** a friend may get the game's "Cold!" or "Hunger!" window while the host does not. It stays until **Close** is clicked.
 - **Numbers:** seen in 3 test runs on one friend copy. Each copy decides these windows from its own fuel and food numbers, once per 180 days.
 - **Basis:** lane 66's reading of the game file; lane 63's real-click runs.
 - **Workaround:** click **Close**. The host's numbers are the true ones.
 
-### G10. The building panel's "Yield" line differs
+### G10. The building panel's "Yield" line differs (fixed in 0.2.5)
 
 - **You see:** a building's "Yield" can read "None" on a friend and "Modest" on the host, or "Excellent" against "Average".
 - **Numbers:** seen on a Logging Camp, a quarry and a sawpit on test copies. Productivity, maintenance and stock are equal; only the yield word differs.
 - **Basis:** lane 67's runs: the line reads each copy's own 30-day production log, which is not carried yet (being built).
 - **Workaround:** read the host's panel.
+
+### G11. An open panel and another player's change
+
+- **You see (0.2.2 and 0.2.3):** another player changes a value in a panel you have open (a field's priority, a trade rule, a worker count). The value is right at once, but your panel shows the old one until you close it and open it again.
+- **0.2.5:** the open panel redraws itself within a moment of the change, with the game's own redraw. It waits while you hold a button or a slider, have a drop-down open, type in a box, or for half a second after your own click.
+  - **Redraws:** building panels and every tab (the building's own settings, and the region's trade rules, limits, taxes and workers); the region panel and the lord panel (taxes, policies, perks, region name, war and peace); the development tree (perk and policy cards, region name, trade summary); claims; the army panel and the mercenary panel (a friend's orders on the host, a player's behaviour stance on every copy, squad names, the retinue).
+  - **Left to the game's own redraw (not checked):** on a friend, the host's push stance and skills (the game's own functions ask for the redraw themselves).
+  - **As in the plain game:** the approval breakdown redraws once a day.
+  - **Not carried at all:** joining two castle walls in the castle planner.
+  - **If you both change one value:** the host's order of arrival decides, as before. Your panel shows the final value after you let go.
+- **Basis:** helper's runs on test copies (two copies, one PC, scripts only): a field's priority 9 of 9 (the friend's panel redrawn 40 to 70 ms after the host's line), workers 2 of 2, the chosen tab kept 3 of 3, region and lord panels 3 of 3, development tree 6 of 6, behaviour stance 6 of 6, mercenary panel redrawn with the army panel; with nobody acting 0 redraws over 9 game days, 3 times. Never tested: a held button, a dragged slider, an open drop-down and typing with a real mouse; a scrolled list.
+- **Fixed with it:** with a field's panel open on two copies, the field's fertilization setting went back and forth between them and could swallow the host's own field priority click.
+- **Workaround (0.2.2 and 0.2.3):** close the panel and open it again.
+
+### G12. Some host notices missing on a friend (0.2.4 and 0.2.5)
+
+- **You see:** the host's notice list shows "Storage is full (Storehouse)" or "No storage space left for production (Sawpit)"; a friend's list shows fewer lines, or "No recent events.".
+- **Numbers:** on two test saves the friend lacked 1 and 3 of the host's notices.
+- **Basis:** the release panel check on 0.2.4 and 0.2.5 (two copies, one PC). Cause found: a friend's own list clean-up removed the notices copied from the host. Fix being built for 0.2.6.
+- **Workaround:** read the host's list.
+
+### G13. Another lord's army count late on a friend
+
+- **You see:** another lord's army can show more soldiers on a friend than on the host for up to about 4.5 seconds, for example 36 against 0 after a fight.
+- **Numbers:** 27 of 43,335 readings in one test session were outside 3 seconds.
+- **Basis:** helper's runs on test copies. Fix being built for 0.2.6.
+- **Workaround:** none needed; it settles by itself.
+
+### G14. An animal that starves
+
+- **You see:** when a sheep or cow starves, the notice reaches a friend, but the animal stays alive there about 30 seconds longer and its body is not shown.
+- **Basis:** helper's runs on test copies. Fix being built for 0.2.6.
+
+### G15. Mourning and new villagers after a friend's reload
+
+- **You see:** right after a friend reloads, a home's mourning days can read wrong for a short time, and a new villager can appear on the friend several seconds after the host.
+- **Basis:** helper's runs on test copies. Fix being built for 0.2.6.
+
+### G16. A friend can keep extra free merchants
+
+- **You see:** after a reload a friend can show more free merchants than the host. They are not removed, to keep the merchants the host also has safe.
+- **Basis:** helper's runs: with removal on, a friend could delete a merchant the host still had; 0.2.5 keeps them all (3 of 3 reloads equal at 21 merchants). A safe removal is planned for 0.2.6.
+
+### G17. A rare resync after a demolition (0.2.4 and 0.2.5)
+
+- **You see:** once in a test session, a demolition made a friend resync (a short reload).
+- **Basis:** helper's run on test copies: the building's name was lost before the line was sent. The same code is in 0.2.4. Fix being built for 0.2.6.
+- **Workaround:** none needed; the resync repairs it.
+
+### G18. Hand carts for gatherers on a friend
+
+- **You see:** on a friend, a gatherer may carry by hand where the host's uses a hand cart; the carts drawn are the host's.
+- **Basis:** helper's runs: task given 15 of 15, the cart back at the host's stand 12 of 13. Being built for 0.2.6.
+
+### G19. A trade limit changed by another player, with the Trade tab open (0.2.5)
+
+- **You see:** another player changes a trade limit while you have the same building's Trade tab open. The value is right in the game, but your open panel keeps showing the old number.
+- **Numbers:** 1 of 1 try with real clicks on the 0.2.5 zip (10 to 11; the open panel still showed 10 minutes later). Worker counts in an open panel did redraw (2 of 2).
+- **Basis:** the real-click check on test copies. Fix being built for 0.2.6.
+- **Workaround:** close the panel and open it again.
 
 ---
 

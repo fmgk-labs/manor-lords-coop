@@ -107,10 +107,26 @@ J.cfg = J.cfg or { on = true,        -- the whole board
 for k, v in pairs({ endHoldSkip = { [59] = true, [60] = true, [61] = true }, gatherHold = true, endHold23 = true, endHoldCap = 600.0, endHoldRenew = true, arriveHold = true, arriveR = 300, arriveRs = 120, arriveF = 0.002, arriveMax = 600.0, placeScreen = true, endHold = true, endHoldCeil = 30.0, endLag = 0.5, speedScale = true, regAudit = true, regAuditEvery = 5.0, pick = true, choose = true, chooseLag = 3.0, resFar = 5000, pickWait = 6.0, placeStanding = false, handsTell = true, hands = true, boardCarry = true, handsLag = 1.5, carryKeep = true, carryGrace = 8.0, resWait = 12.0, resIndexEvery = 4.0, ask = true, askAfter = 4.0, askEvery = 20.0, drift = true, driftLag = 1.5 }) do
   if J.cfg[k] == nil then J.cfg[k] = v end                     -- a board loaded again over an older cfg
 end
+-- (lane 74) THE HOST'S WORD IS KEPT, NEVER DROPPED, AND GIVEN THE MOMENT THE VILLAGER CAN TAKE IT (text at "KEPT" below)
+--   keep      friend: a host line for a villager who is a soldier here (or whose walk the squad mirror still holds) waits
+--             for him instead of being dropped; false = the board of before (dropped, he asks after cfg.askAfter)
+--   solTell   host: a villager who is a soldier says "ended" once and nothing else until he is a villager again
+--   hereWait  friend: wall seconds a line waits for a building, a unit or a villager it names that is not here yet
+--   spread    friend: gives that come from host lines pass a queue: at most cfg.giveMax and cfg.giveMs a frame, the
+--             villager nearest to the camera first, none waiting longer than cfg.giveWait wall seconds
+--   evLog     friend: one log line per call-up and per send-home of this copy (what came of each man's host lines)
+for k, v in pairs({ keep = true, solTell = true, hereWait = 8.0, spread = true, giveMs = 2.0, giveMax = 6, giveWait = 1.0, evLog = true, evAfter = 12.0 }) do
+  if J.cfg[k] == nil then J.cfg[k] = v end
+end
 J.n = J.n or {}
 local function bump(k, d) J.n[k] = (J.n[k] or 0) + (d or 1) end
 local function got(f, d) local ok, v = pcall(f); if ok and v ~= nil then return v end; return d end
 local function rnd(x) return math.floor(x + 0.5) end
+-- (lane 64) a unit the board may touch: a living one. A dead unit stays a valid object (its body lies in the region's
+-- corpses list) and stayed on the board's lists until their next rebuild (cfg.refresh, 5 s): in that time the host's
+-- next start for its key gave the dead body a task and put it where the host's villager stood (live session of
+-- 2026-11-17: a villager who had died on a friend's copy only stood by a hitching post, not to be hovered or selected).
+local function live(u) return valid(u) and got(function() return u.dead end, false) ~= true end
 local FOLLOW = 41                   -- "Follow" (leading an ox): its target place moves every frame
 -- (lane 19) the task types the board gives: the ones given on two copies without harm (lane 13's runs, lane 19's).
 -- Any other type is sent as "cannot be named" (U F). Why: a rival's villager given type 65 (no name in ETaskType, at a
@@ -300,7 +316,7 @@ local function build(S)
             local m = wf[f].familyMembers
             for j = 1, #m do
               local u = un(m[j])
-              if valid(u) then add(i .. "." .. f .. "." .. j, u, own) end
+              if live(u) then add(i .. "." .. f .. "." .. j, u, own) end
             end
           end
         end
@@ -322,7 +338,7 @@ local function build(S)
             local n = #ox
             if n > 0 then
               local bk = bkey(b)
-              for j = 1, n do local u = un(ox[j]); if valid(u) and not byAddr[u:GetAddress()] then add(tag .. bk .. "#" .. j, u, false) end end
+              for j = 1, n do local u = un(ox[j]); if live(u) and not byAddr[u:GetAddress()] then add(tag .. bk .. "#" .. j, u, false) end end
             end
           end
         end
@@ -346,7 +362,7 @@ local function build(S)
       local ua = S.eng.unitArr
       for q = 1, #ua do
         local u = un(ua[q])
-        if valid(u) then local a = u:GetAddress(); local k = want[a]; if k and not byAddr[a] and not byKey[k] then add(k, u, false); bump("animal_kept"); want[a] = nil end end
+        if live(u) then local a = u:GetAddress(); local k = want[a]; if k and not byAddr[a] and not byKey[k] then add(k, u, false); bump("animal_kept"); want[a] = nil end end
       end
       for _ in pairs(want) do bump("animal_lost") end
       bump("kept_scan_us", math.floor((os.clock() - t0) * 1e6))
@@ -424,13 +440,90 @@ local function encTask(e, t, ty)
     tu, fu, res, encPT(t.TargetLocation), encPT(t.finalLocation), rnd(el.X), rnd(el.Y), rnd(el.Z), t.bPaidInAdvance and 1 or 0, rnd(p.X), rnd(p.Y), rnd(p.Z), e.hs or "0")
 end
 
+-- (lane 74) the host's side of the call-up and send-home log lines (cfg.evLog): when each villager became a soldier or
+-- a villager again on the host, the task he had, the tasks seen on him while a soldier, and when his first task after
+-- a send-home was told. Written 12 s after the event; "told:" lists each man with the ms after the event's start.
+local function hevOf(kind, e, clock, ty)
+  if not J.cfg.evLog then return end
+  J.hev = J.hev or {}
+  local E = J.hev[kind]
+  if not E or clock - E.t0 > 3.0 then
+    if E then J.hevDone = J.hevDone or {}; J.hevDone[#J.hevDone + 1] = E end
+    E = { kind = kind, t0 = clock, wall = A.now(), men = {} }; J.hev[kind] = E
+  end
+  local R = { key = e.key, t = clock, ty = ty, home = kind == "home" or nil }
+  E.men[#E.men + 1] = R; E.tl = clock; e.hevR = R; R.e = e
+end
+local function hevTold(e, ty)
+  local R = e.hevR
+  if R and R.home and not R.told then R.told = os.clock(); R.tty = ty end
+end
+local function hevTick(clock)
+  if J.hev then
+    for kind, E in pairs(J.hev) do if clock - E.t0 > (J.cfg.evAfter or 12.0) then J.hev[kind] = nil; J.hevDone = J.hevDone or {}; J.hevDone[#J.hevDone + 1] = E end end
+    if next(J.hev) == nil then J.hev = nil end
+  end
+  if not J.hevDone then return end
+  for _, E in ipairs(J.hevDone) do
+    local by, seen, told, lo, hi, list = {}, {}, 0, nil, nil, {}
+    for _, R in ipairs(E.men) do
+      if R.e and R.e.hevR == R then R.e.hevR = nil end; R.e = nil
+      by[R.ty or -1] = (by[R.ty or -1] or 0) + 1
+      for t in pairs(R.seen or {}) do seen[t] = (seen[t] or 0) + 1 end
+      if R.told then told = told + 1; local d = R.told - R.t; if not lo or d < lo then lo = d end; if not hi or d > hi then hi = d end
+        list[#list + 1] = string.format("%s:%d:%s", R.key, math.floor((R.told - E.t0) * 1000 + 0.5), tostring(R.tty)) end
+    end
+    local function txt(t) local o = {}; for k, v in pairs(t) do o[#o + 1] = (k == -1 and "none" or tostring(k)) .. " x" .. v end; table.sort(o); return #o > 0 and table.concat(o, ", ") or "nothing" end
+    if E.kind == "call" then
+      log("jobs: call-up on the host at %.3f: %d villagers became soldiers within %.1f s; their task at that moment: %s; tasks seen on them while soldiers: %s", E.wall, #E.men, (E.tl or E.t0) - E.t0, txt(by), txt(seen))
+    else
+      log("jobs: send-home on the host at %.3f: %d men became villagers within %.1f s; first task told for %d (%.2f to %.2f s after) | told: %s", E.wall, #E.men, (E.tl or E.t0) - E.t0, told, lo or 0, hi or 0, table.concat(list, " "))
+    end
+  end
+  J.hevDone = nil
+end
 local function hostOne(e)
   if J.cfg.handsTell then                                      -- (lane 23) its load changed: U L <unit> <load>
     local hs = handsOf(e.u)
     if hs ~= e.hs then e.hs = hs; local l = "U L " .. e.key .. " " .. hs; A.send(l); bump("sent_hands"); bump("bytes", #l + 20) end
   end
   local n, ty, tx, t = peek(e.u)
-  if n == e.n and ty == e.ty and tx == e.tx then return end
+  local same = n == e.n and ty == e.ty and tx == e.tx
+  -- (lane 74) A SOLDIER IS HIS SQUAD'S ON EVERY COPY (cfg.solTell). A villager who is a soldier right now (the game's
+  -- own isSoldier, looked at when his task changes and every half second) says "ended" once; while he is one nothing
+  -- of his is told (his call-up walk 53 and his fight 24 went out as starts and "cannot be named" before: the friend's
+  -- board gave or skipped them, 112 to 324 a minute in a battle). The moment he is a villager again his task is told
+  -- anew. A friend's question about him (U Q, U H) is answered "ended".
+  -- (the game run's log, cfg.evLog: the soldier state is watched also with cfg.solTell off, and nothing is changed then)
+  local tell = J.cfg.solTell ~= false
+  if tell or J.cfg.evLog then
+    local c = os.clock()
+    if not same or c - (e.solC or -1) > 0.5 then
+      e.solC = c
+      local s = got(function() return e.u:isSoldier() end, false) == true
+      if s ~= (e.solH or false) then
+        e.solH = s or nil
+        if s then
+          bump("soldier_on"); hevOf("call", e, c, n > 0 and ty or -1)
+          if tell then
+            -- (game run r2: also after "cannot be named": a friend kept that word and its place through the whole
+            -- muster and walked its man there at the send-home; the host's real start then waited behind that walk)
+            local said = e.told or e.freeSent ~= nil; e.freeSent = nil
+            if said then e.told = nil; e.retell = nil; A.send("U E " .. e.key); bump("sent_end"); bump("bytes", #e.key + 28) end
+          end
+        else bump("soldier_off"); hevOf("home", e, c, -1); if tell then e.n = nil; same = false end end
+      end
+    end
+    if e.solH then
+      local R = e.hevR; if R and n > 0 then R.seen = R.seen or {}; R.seen[ty] = true end
+      if tell then
+        if e.retell then e.retell = nil; e.told = nil; A.send("U E " .. e.key); bump("sent_end"); bump("bytes", #e.key + 28) end
+        e.n, e.ty, e.tx = n, ty, tx
+        return
+      end
+    end
+  end
+  if same then return end
   e.n, e.ty, e.tx = n, ty, tx
   if n == 0 or ty == LAZY then                                 -- its task ended (nothing to do, or the game's "Lazy")
     if ty == LAZY then bump("lazy") end
@@ -443,6 +536,7 @@ local function hostOne(e)
     -- (lane 23) a running task told again (a friend's hello or its question U Q) goes as U R: not a new start
     local k = e.retell and "U R " or "U S "; e.retell = nil
     A.send(k .. line); e.freeSent = nil; e.told = true; bump(k == "U R " and "sent_retell" or (e.own and "sent" or "sent_rival")); bump("bytes", #line + 24)
+    if e.hevR then hevTold(e, ty) end
   else
     e.told = nil; e.retell = nil
     bump("unnamed_" .. why)
@@ -450,6 +544,7 @@ local function hostOne(e)
       e.freeSent = ty; local p = e.u.realPos                   -- (lane 19) where the host's unit stands: a gated friend walks there
       local l = string.format("U F %s %d %d,%d,%d", e.key, ty, rnd(p.X), rnd(p.Y), rnd(p.Z))
       A.send(l); bump("sent_free"); bump("bytes", #l + 20)
+      if e.hevR then hevTold(e, "unnamed" .. ty) end
     end
   end
 end
@@ -460,7 +555,8 @@ local function each(list, st, cap, fn)
   st = math.max(st, math.ceil(n / cap))
   for i = 1 + (J.tickN % st), n, st do
     local e = list[i]
-    if valid(e.u) then local ok, er = pcall(fn, e); if not ok then bump("errors"); J.lastErr = tostring(er) end end
+    if live(e.u) then local ok, er = pcall(fn, e); if not ok then bump("errors"); J.lastErr = tostring(er) end
+    elseif not e.deadSaid and valid(e.u) then e.deadSaid = true; e.host = nil; e.q = nil; e.pend = nil; J.chDirty = true; bump("dead_left_alone") end   -- (lane 64) dead: off the board at once
   end
 end
 
@@ -984,13 +1080,69 @@ end
 -- type 17 (the board's "stay here"). The board names a villager by region.family.member; who gave this man a villager's
 -- start is not traced (the friend's full log of that sitting is gone). Counted: skip_soldier in the jobs line.
 local function soldierNow(e) return J.cfg.soldiers ~= true and got(function() return e.u:isSoldier() end, false) == true end
+-- (lane 74) KEPT. Until this lane a host line for a villager who was a soldier here was DROPPED (e.host and e.q
+-- emptied): nothing gave it again when he became a villager, so he stood until he asked (cfg.askAfter 4 s, two legs of
+-- the link, then the answer), and not at all when the host had said "ended" or "cannot be named" before. With a link
+-- of 1 s each way that is every man of a militia at every send-home and call-up that does not happen in the same
+-- second on both copies (tests/jobs/t_jobs_delay.lua: the board of before against this one). Now:
+--   the host's word about a villager is ALWAYS taken in (e.host: his running task; "ended"; "cannot be named" with
+--   the place): a soldier's too. Nothing of it is given while he is a soldier here, or while the squad mirror's table
+--   still holds his walk (coop_x_men.lua M.held, read only; at most 2 s): the line waits as e.q, marked q.kept, and
+--   the unit is on J.kept, looked at EVERY frame. The frame he can take it he gets it (through the give queue below).
+--   A later word of the host replaces a kept one ("ended" empties it). A soldier is not looked at otherwise: no
+--   "stand here", no load written, no question, no place.
+--   A villager with no word of the host at the moment he comes back asks at once (U Q), not after cfg.askAfter.
+-- cfg.keep = false (console) is the board of before, for a test's "before".
+local function menHold(e)
+  local Mn = rawget(C, "men"); local h = Mn and Mn.held
+  if not h or not e.addr or next(h) == nil then return false end
+  if h[string.format("%X", math.tointeger(e.addr) or e.addr)] == nil then e.heldT = nil; return false end
+  local c = os.clock(); e.heldT = e.heldT or c
+  if c - e.heldT > 2.0 then if not e.heldOver then e.heldOver = true; bump("held_over") end; return false end   -- a stale entry never holds a villager for good
+  return true
+end
+local function notReady(e)
+  if J.cfg.soldiers == true then return nil end
+  if got(function() return e.u:isSoldier() end, false) == true then return "soldier" end
+  if J.cfg.keep ~= false and menHold(e) then return "held" end
+  return nil
+end
+-- (lane 74) one log line per call-up and per send-home of this copy (cfg.evLog): J.ev[kind] = the event being
+-- gathered, e.evR = this villager's record in it. Kinds: "home" (soldier -> villager here), "call" (the other way).
+local function evOf(kind, e, clock)
+  if not J.cfg.evLog then return nil end
+  J.ev = J.ev or {}
+  local E = J.ev[kind]
+  if not E or clock - E.t0 > 3.0 then
+    if E then J.evDone = J.evDone or {}; J.evDone[#J.evDone + 1] = E end      -- the one before is written at its time
+    E = { kind = kind, t0 = clock, wall = A.now(), men = {}, n = 0, fN = 0, fMax = 0, gMax = 0, gMs = 0 }; J.ev[kind] = E
+  end
+  local R = { key = e.key, t = clock, home = kind == "home" or nil }
+  E.men[#E.men + 1] = R; E.n = E.n + 1; E.tl = clock
+  e.evR = R; R.e = e
+  return R
+end
+local function keep(e, q, why, clock)
+  if not q.kept then q.keptT = clock; bump("kept_" .. why) end
+  q.kept = why; q.inq = nil; e.q = q
+  J.kept = J.kept or {}; J.kept[e.key] = e
+end
 local function give(e, q, clock)
   if stale(q.rec) then                                         -- (lane 59) a record of an earlier world: dropped, never given
     e.q = nil; e.host = nil; bump("stale_record_refused")
     log("jobs: refused a record of loaded world %s for %s in loaded world %s (ident %s)", tostring(RW[q.rec]), e.key, tostring(C.s.loads), tostring(q.ident))
     return false
   end
-  if soldierNow(e) then e.q = nil; e.host = nil; bump("skip_soldier"); return false end
+  -- (lane 74) a line that waited (kept, queued) may outlive its villager: a dead one stays a valid object (lane 64)
+  if got(function() return e.u.dead end, false) == true then e.q = nil; e.host = nil; bump("skip_dead"); return false end
+  -- (lane 52, round 3) a soldier gets nothing from the board. (lane 74) ... and the host's line waits for him (KEPT)
+  local nr = notReady(e)
+  if nr then
+    bump(nr == "soldier" and "skip_soldier" or "skip_held")
+    if J.cfg.keep == false then e.q = nil; e.host = nil; return false end
+    if q.hold or q.again then if e.q == q then e.q = nil end; return false end   -- the board's own repeat: nothing of the host's to keep
+    keep(e, q, nr, clock); return false
+  end
   if J.fellP and fellHolds(e, q) then return false end          -- (lane 54) a felling waits for its tree here
   if traderHolds(e, q, clock) then return false end            -- (lane 54, round two) a trade leg waits for the mount
   local why = J.why; J.why = nil                              -- (lane 23) the reason of this give, for the give log
@@ -1006,6 +1158,8 @@ local function give(e, q, clock)
   -- (lane 23, diagnosis) test only: every give, one line, when J.giveLog is an open file (set from the console)
   if J.giveLog then pcall(function() J.giveLog:write(string.format("G\t%.3f\t%s\t%s\t%s\t%s\n", A.now(), e.key, tostring(q.rec.Type), q.hold and "hold" or (q.again and "again" or "given"), why or "-")) end) end
   e.given = q.ident; e.givenT = clock; e.isHold = q.hold or nil
+  q.kept = nil; q.inq = nil; e.fp = nil                         -- (lane 74)
+  local R = e.evR; if R and not q.hold and not R.give then R.give = clock; R.gty = tonumber(q.rec.Type) end
   local n, ty, tx = peek(e.u); e.n, e.ty, e.tx = n, ty, tx
   if not q.hold then local gt = tonumber(q.rec.Type) or -1; e.gty = gt; bump("give_" .. gt) end
   bump(q.hold and "held" or (q.again and "given_again" or (e.own and "given" or "given_rival")))
@@ -1038,7 +1192,14 @@ local function pwOn(e, clock) return e.pw ~= nil and clock - e.pw.t < (J.cfg.pic
 local function walkThere(e, p, clock)
   if J.fellP and J.fellP[e.key] then return end                  -- (lane 54) a felling waits for its tree here
   if not (J.gateOn and p) then return end
-  if soldierNow(e) then bump("skip_soldier"); return end           -- (lane 52, round 3) see give()
+  -- (lane 52, round 3) see give(). (lane 74) the place waits for him: he walks there when he is a villager again and
+  -- the host has said nothing else about him by then
+  local nr = notReady(e)
+  if nr then
+    bump(nr == "soldier" and "skip_soldier" or "skip_held")
+    if J.cfg.keep ~= false then e.fp = { X = p.X, Y = p.Y, Z = p.Z, t = os.clock() }; J.kept = J.kept or {}; J.kept[e.key] = e end
+    return
+  end
   local u = e.u; local q = u.realPos
   if (q.X - p.X) ^ 2 + (q.Y - p.Y) ^ 2 < 300 * 300 then return end
   if got(function() return #u.Inventory end, 1) > 0 then return end
@@ -1047,13 +1208,216 @@ local function walkThere(e, p, clock)
   if ok then e.given = "17|-|-"; e.givenT = clock; e.isHold = nil; local n, ty, tx = peek(u); e.n, e.ty, e.tx = n, ty, tx; bump("walk_instead") end
 end
 
+-- (lane 74) THE GIVE QUEUE (cfg.spread). When many villagers get a task in the same moment (a militia sent home: every
+-- man's host line within a second; a burst of the link), each give is a setTask, often a place, then that villager's
+-- path request in this copy's game: all in one frame. Gives that come from a host line (a start given directly, a
+-- start that cuts the task before, a kept line at its release) go through here: at once while this frame has given
+-- fewer than cfg.giveMax and spent under cfg.giveMs on them, otherwise queued and given in the next frames, the
+-- villager nearest to the local player's camera first. A queued line is the unit's waiting one (e.q, marked q.inq), so
+-- everything that already steps back for a waiting line does (no question, no drift, no load written, the arrive hold
+-- lets go: as at the give itself before), a newer line of the host replaces it, and the END HOLD's list no longer
+-- names the old task (as after the give before). Nothing waits longer than cfg.giveWait wall seconds.
+-- The board's own repeats (again, drift, stand here) keep their own pace: one villager's look at a time.
+local function camAt(S, clock)
+  local c = J.cam
+  if not c or clock - c.t > 0.2 then
+    local l = got(function() return S.p1.Camera:K2_GetComponentLocation() end, nil)
+    c = { t = clock, x = l and l.X, y = l and l.Y }; J.cam = c
+  end
+  return c
+end
+local function giveNow(e, q, clock)
+  local t0 = os.clock()
+  if q.hs and J.cfg.hands and got(function() return handsOf(e.u) end, q.hs) ~= q.hs then   -- (lane 35) the cut's load, at the cut
+    local okH = pcall(setHands, e.u, q.hs); bump(okH and "hands_at_start" or "errors")
+  end
+  J.why = q.gw; local ok = give(e, q, clock)
+  local F = J.gf; F.n = F.n + 1; F.ms = F.ms + (os.clock() - t0) * 1000
+  bump("gives_timed"); bump("gives_timed_ms", math.floor((os.clock() - t0) * 1000 + 0.5))   -- (the clock steps in ms: the sum over many gives is the measure)
+  if q.inqT then local w = clock - q.inqT; if w > (J.gqWaitMax or 0) then J.gqWaitMax = w end; local R = e.evR; if R then R.qw = w end end
+  return ok
+end
+local function later(e, q, why, clock)
+  q.gw = why
+  local F = J.gf; if not F then F = { n = 0, ms = 0 }; J.gf = F end
+  local G = J.gq
+  if J.cfg.spread == false or ((not G or #G == 0) and F.n < (J.cfg.giveMax or 6) and F.ms < (J.cfg.giveMs or 2.0)) then return giveNow(e, q, clock) end
+  if not G then G = {}; J.gq = G end
+  local d = 0
+  local c = camAt(C.s, clock)
+  if c.x then local p = got(function() local r = e.u.realPos; return { r.X, r.Y } end, nil); if p then d = (p[1] - c.x) ^ 2 + (p[2] - c.y) ^ 2 end end
+  q.inq = true; q.inqT = clock; q.kept = nil; e.q = q
+  G[#G + 1] = { e = e, q = q, t = clock, d = d }; J.gqDirty = true
+  bump("give_queued"); if #G > (J.gqMax or 0) then J.gqMax = #G end
+  return false
+end
+-- every friend tick, before the looks: the queue's turn
+local function drain(S, clock)
+  local F = J.gf; if not F then F = { n = 0, ms = 0 }; J.gf = F end
+  local G = J.gq; if not G or #G == 0 then return end
+  if J.gqDirty then J.gqDirty = nil; table.sort(G, function(a, b) if a.d ~= b.d then return a.d < b.d end; return a.t < b.t end) end
+  local maxN, maxMs, wait = J.cfg.giveMax or 6, J.cfg.giveMs or 2.0, J.cfg.giveWait or 1.0
+  local rest, over = {}, 0
+  for i = 1, #G do
+    local x = G[i]; local e, q = x.e, x.q
+    if e.q ~= q or not q.inq or not live(e.u) then bump("give_queue_left")            -- replaced by a newer word, given at a look, the unit gone
+    else
+      local late = clock - x.t > wait
+      if (F.n < maxN and F.ms < maxMs) or (late and over < maxN) then
+        if late then over = over + 1; bump("give_queue_late") end
+        giveNow(e, q, clock)
+      else rest[#rest + 1] = x end
+    end
+  end
+  J.gq = rest
+end
+-- a villager who was a soldier (or held) here can take the host's word now
+local function released(e, clock)
+  local q = e.q
+  if q and q.kept then
+    local R = e.evR; if R then R.kept = clock - (q.keptT or clock) end
+    later(e, q, "release", clock)
+  elseif e.fp and not e.host and not q then local p = e.fp; e.fp = nil; if os.clock() - (p.t or 0) < 3.0 then walkThere(e, p, clock) end   -- (an older place is where the host's villager stood before the muster)
+  elseif not q and e.host and not e.free then
+    -- the host's villager is on a task this copy's never got (he was a soldier before the line was kept: cfg.keep off
+    -- then on, a line of an older board): the same task, as a repeat
+    later(e, { rec = e.host.rec, ident = e.host.ident, again = true }, "release_again", clock)
+  elseif not q and not e.host and not e.hostIdle and not e.free and not e.pend and J.cfg.ask and J.gateOn and clock - (e.askT or -100) > 2.0 then
+    e.askT = clock; A.send("U Q " .. e.key); bump("asked"); bump("asked_at_release")   -- no word of the host about him: asked now, not after cfg.askAfter
+    local R = e.evR; if R then R.asked = (R.asked or 0) + 1 end
+  end
+  if not (e.q and e.q.kept) and not e.fp and J.kept then J.kept[e.key] = nil end
+end
+-- a villager's look begins here: true = he is a soldier (or held) and the look is over
+local function soldierLook(e, n, ty, tx, clock)
+  local nr = notReady(e)
+  if nr == "soldier" then
+    if not e.sol then
+      e.sol = clock
+      pcall(arriveRestore, e.addr, "soldier")                  -- his own walking speed back before the squad has him
+      local R = evOf("call", e, clock)
+      if R then R.had = n > 0 and ty or nil; R.host = e.host and (tonumber(e.host.rec.Type) or -1) or (e.hostIdle and "ended" or (e.free and "free" or "none")) end
+    end
+    e.n, e.ty, e.tx = n, ty, tx; e.gty = nil
+    e.idleT = nil; e.drT = nil; e.endT = nil; e.bcT = nil; e.hmT = nil; e.pw = nil
+    -- a start that waited behind his task (queued) when he was called up is a kept line from here on: the host's
+    -- "ended" empties it, the host's next start replaces it (the desk test: given as it was at his send-home, 12 s
+    -- old, it stood before the host's new start for cfg.grace)
+    if e.q and not e.q.kept then keep(e, e.q, "soldier", clock) end
+    return true
+  end
+  if e.sol then
+    local R = evOf("home", e, clock)
+    if R then R.sol = clock - e.sol; R.before = e.q and e.q.kept and (tonumber(e.q.rec.Type) or -1) or nil; R.word = e.host and "task" or (e.hostIdle and "ended" or (e.free and "free" or "none")) end
+    e.sol = nil
+    if nr == nil or not ((e.q and e.q.kept) or e.fp) then released(e, clock) end   -- (a kept line of a man still held waits on J.kept)
+  elseif nr == nil and J.kept and J.kept[e.key] then released(e, clock) end
+  return nr ~= nil and e.q ~= nil and e.q.kept ~= nil
+end
+-- every friend tick: the villagers a line waits for (few, and only around a call-up or a send-home)
+local function keptLook(S, clock)
+  for k, e in pairs(J.kept) do
+    if e.fp and clock - (e.fp.t or 0) > 3.0 then e.fp = nil end
+    -- a line kept for longer than 5 s (a muster): looked at four times a second, not every frame
+    local slow = false
+    if e.q and e.q.kept and clock - (e.q.keptT or clock) > 5.0 then if clock - (e.klT or 0) < 0.25 then slow = true else e.klT = clock end end
+    if not live(e.u) or J.byKey[k] ~= e or not ((e.q and e.q.kept) or e.fp) then J.kept[k] = nil
+    elseif slow then
+    elseif not notReady(e) then
+      if e.sol then
+        local R = evOf("home", e, clock)
+        if R then R.sol = clock - e.sol; R.before = e.q and e.q.kept and (tonumber(e.q.rec.Type) or -1) or nil; R.word = e.host and "task" or (e.hostIdle and "ended" or (e.free and "free" or "none")) end
+        e.sol = nil
+      end
+      released(e, clock)
+    end
+  end
+  if next(J.kept) == nil then J.kept = nil end
+end
+-- the event lines. A man counts as "working" from the first look that sees him on a task and moving, or on a task
+-- at its place; "idle over 5 s" is a man who is not working 5 s after he became a villager here while the host's
+-- villager has a task (the host's word: e.host).
+local function evWrite(E)
+  local men = E.men
+  local function span(f)
+    local lo, hi, k = nil, nil, 0
+    for _, R in ipairs(men) do local v = f(R); if v then k = k + 1; if not lo or v < lo then lo = v end; if not hi or v > hi then hi = v end end end
+    return k, lo or 0, hi or 0
+  end
+  local fps = E.fT and E.fT > 0 and E.fN / E.fT or 0
+  if E.kind == "call" then
+    local on, ended, task, other = 0, 0, 0, 0
+    for _, R in ipairs(men) do
+      if R.had then on = on + 1 end
+      if R.host == "ended" then ended = ended + 1 elseif type(R.host) == "number" then task = task + 1 else other = other + 1 end
+    end
+    local kk = 0; for _, R in ipairs(men) do if R.e and R.e.q and R.e.q.kept then kk = kk + 1 end end
+    log("jobs: call-up here at %.3f: %d villagers became soldiers within %.1f s; %d were on a task (ended by the game's call-up); the host's word then: ended %d, a task %d, none or unnamed %d; host lines kept for them now: %d | frames %.0f a second, longest %.0f ms",
+      E.wall, E.n, (E.tl or E.t0) - E.t0, on, ended, task, other, kk, fps, E.fMax * 1000)
+    return
+  end
+  local nB = span(function(R) return R.before and 0 end)
+  local nL, l0, l1 = span(function(R) return R.line and (R.line - R.t) end)
+  local nG, g0, g1 = span(function(R) return R.give and (R.give - R.t) end)
+  local nW, w0, w1 = span(function(R) return R.work and (R.work - R.t) end)
+  local nQ, _, q1 = span(function(R) return R.qw end)
+  local asked, dropped, idle, noword, bad, glist = 0, 0, 0, 0, {}, {}
+  for _, R in ipairs(men) do
+    if R.give then glist[#glist + 1] = string.format("%s:%d:%s", R.key, math.floor((R.give - E.t0) * 1000 + 0.5), tostring(R.gty))
+    else glist[#glist + 1] = R.key .. ":-1:" .. (R.line and "line" or (R.before and "kept" or "none")) end
+    asked = asked + (R.asked or 0)
+    if R.drop then dropped = dropped + 1 end
+    if not R.before and not R.line then noword = noword + 1 end
+    local late = (R.idle5 and true) or false
+    if late then
+      idle = idle + 1
+      if #bad < 6 then bad[#bad + 1] = string.format("%s line %s given %s working %s%s%s", R.key, R.before and "before" or (R.line and string.format("%.1f s", R.line - R.t) or "none"),
+        R.give and string.format("%.1f s", R.give - R.t) or "never", R.work and string.format("%.1f s", R.work - R.t) or "never", R.at5 and (" (at 5 s: " .. R.at5 .. ")") or "", R.drop and (" dropped: " .. R.drop) or "") end
+    end
+  end
+  log("jobs: send-home here at %.3f: %d men became villagers within %.1f s. Host task lines for them: %d before (kept), %d after (%.1f to %.1f s), no line %d. Given %d (%.1f to %.1f s; %d waited for a free frame, at most %.2f s). Working %d (%.1f to %.1f s). Asked the host %d, dropped %d, idle over 5 s with a host task %d%s | frames %.0f a second, longest %.0f ms; gives in one frame at most %d (%.1f ms) | given: %s",
+    E.wall, E.n, (E.tl or E.t0) - E.t0, nB, nL, l0, l1, noword, nG, g0, g1, nQ, q1, nW, w0, w1, asked, dropped, idle, #bad > 0 and (": " .. table.concat(bad, "; ")) or "", fps, E.fMax * 1000, E.gMax, E.gMs, table.concat(glist, " "))
+end
+local function evTick(clock, gap)
+  local F = J.gf
+  for kind, E in pairs(J.ev) do
+    if gap then E.fN = E.fN + 1; E.fT = (E.fT or 0) + gap; if gap > E.fMax then E.fMax = gap end end
+    if F and F.n > E.gMax then E.gMax = F.n end
+    if F and F.ms > E.gMs then E.gMs = F.ms end
+    if clock - E.t0 > (J.cfg.evAfter or 12.0) then J.ev[kind] = nil; J.evDone = J.evDone or {}; J.evDone[#J.evDone + 1] = E end
+  end
+  if next(J.ev) == nil then J.ev = nil end
+  if J.evDone then
+    for _, E in ipairs(J.evDone) do
+      for _, R in ipairs(E.men) do if R.e and R.e.evR == R then R.e.evR = nil end end
+      local ok, er = pcall(evWrite, E); if not ok then bump("errors"); J.lastErr = "event line: " .. tostring(er) end
+      for _, R in ipairs(E.men) do R.e = nil end
+    end
+    J.evDone = nil
+  end
+end
+-- a villager of a send-home's event, at his look: does he work yet?
+local function evLook(e, u, n, ty, t, clock)
+  local R = e.evR
+  if not R.work and n > 0 and ty ~= 30 and not (e.isHold and ty == 17) then
+    local sp = got(function() return u.realSpeed end, 0)
+    local near = false
+    if sp <= 2 then local p, tp = u.realPos, t.TargetLocation.Pos; near = (p.X - tp.X) ^ 2 + (p.Y - tp.Y) ^ 2 < 300 * 300 end
+    if sp > 2 or near then R.work = clock end                   -- (a walking villager's realSpeed read about 8 in the game run)
+  end
+  if not R.at5 and clock - R.t > 5.0 then
+    R.at5 = string.format("task %s, speed %.0f, host %s", n > 0 and tostring(ty) or "none", got(function() return u.realSpeed end, 0), e.host and tostring(e.host.rec.Type) or (e.hostIdle and "ended" or "none"))
+    if not R.work and e.host then R.idle5 = true end
+  end
+end
+
 local function onStart(S, w, clock)
   if J.skip and J.skip[w[5]] then J.skipW = J.skipW or {}; J.skipW[w[5]] = w; bump("skip_test"); return end   -- (lane 23, diagnosis) test only
   local e = J.byKey and J.byKey[w[5]]
-  if not e or not valid(e.u) then build(S); e = J.byKey[w[5]] end
-  if not e or not valid(e.u) then bump("skip_no_unit_here"); return end
+  if not e or not live(e.u) then build(S); e = J.byKey[w[5]] end                     -- (lane 64: a dead unit is no unit; the lists are read again)
+  if not e or not live(e.u) then bump("skip_no_unit_here"); return end
   if not J.retry then e.pend = nil end
-  e.hostIdle = nil; e.pw = nil                                   -- (lane 46) a pickup wait ends at the host's next start
+  e.hostIdle = nil; e.pw = nil; e.fp = nil                       -- (lane 46) a pickup wait ends at the host's next start
   if w[19] and w[19] ~= e.hl then e.hl = w[19]; e.hlT = clock end   -- (lane 23) the host's unit's load
   local ty = tonumber(w[6]); local T, F = decPT(w[14]), decPT(w[15])
   local ex, ey, ez = (w[16] or ""):match("^(%-?%d+),(%-?%d+),(%-?%d+)$")
@@ -1063,11 +1427,26 @@ local function onStart(S, w, clock)
                 resourceType = math.tointeger(tonumber(w[7])) or 0, resourceAmt = math.tointeger(tonumber(w[8])) or 0, executed = false, ID = -1, bPaidInAdvance = w[17] == "1" }
   local hp; local hx, hy, hz = (w[18] or ""):match("^(%-?%d+),(%-?%d+),(%-?%d+)$")
   if hx then hp = { X = hx + 0.0, Y = hy + 0.0, Z = hz + 0.0 } end
-  local function skip(why) bump(why); bump(why .. (e.own and "_own" or "_other")); e.free = true; e.host = nil; e.q = nil; walkThere(e, ty == FOLLOW and hp or T.Pos, clock) end
-  if w[9] ~= "-" then rec.targetBuilding = findB(w[9]); if not rec.targetBuilding then return skip("skip_no_building") end end
-  if w[10] ~= "-" then rec.finalBuilding = findB(w[10]); if not rec.finalBuilding then return skip("skip_no_building") end end
-  if w[11] ~= "-" then local x = J.byKey[w[11]]; if not (x and valid(x.u)) then return skip(w[11]:match("^[oa]") and "skip_no_animal" or "skip_no_unit") end; rec.targetUnit = x.u end
-  if w[12] ~= "-" then local x = J.byKey[w[12]]; if not (x and valid(x.u)) then return skip("skip_no_unit") end; rec.finalUnit = x.u end
+  local function skip(why) bump(why); bump(why .. (e.own and "_own" or "_other")); e.free = true; e.host = nil; e.q = nil; if e.evR then e.evR.drop = why end; walkThere(e, ty == FOLLOW and hp or T.Pos, clock) end
+  -- (lane 74) a building or a unit the line names that is not here YET (a site the host's line for it has not made
+  -- here so far, a family just moved in, the lists a rebuild behind): the start waits and looks again every half
+  -- second, as a start does for its resource (lane 23), for cfg.hereWait wall seconds; until this lane it was dropped
+  -- at once and the villager walked to the place and stood. true = it waits.
+  local function notHere(what)
+    local t0 = J.retry and e.pend0 or clock
+    if (J.cfg.hereWait or 0) > 0 and clock - t0 < J.cfg.hereWait then
+      e.pend = { w = w, tl = clock }; e.pend0 = t0; e.host = nil; e.q = nil
+      if not J.retry then bump("here_wait_" .. what); walkThere(e, ty == FOLLOW and hp or T.Pos, clock) end
+      return true
+    end
+    if J.retry then bump("here_gave_up_" .. what) end
+    e.pend = nil
+    return false
+  end
+  if w[9] ~= "-" then rec.targetBuilding = findB(w[9]); if not rec.targetBuilding then if notHere("building") then return end; return skip("skip_no_building") end end
+  if w[10] ~= "-" then rec.finalBuilding = findB(w[10]); if not rec.finalBuilding then if notHere("building") then return end; return skip("skip_no_building") end end
+  if w[11] ~= "-" then local x = J.byKey[w[11]]; if not (x and valid(x.u)) then if notHere("unit") then return end; return skip(w[11]:match("^[oa]") and "skip_no_animal" or "skip_no_unit") end; rec.targetUnit = x.u end
+  if w[12] ~= "-" then local x = J.byKey[w[12]]; if not (x and valid(x.u)) then if notHere("unit") then return end; return skip("skip_no_unit") end; rec.finalUnit = x.u end
   if w[13] ~= "-" then
     local r = findRes(w[13], clock)
     if not valid(r) then
@@ -1088,6 +1467,7 @@ local function onStart(S, w, clock)
   end
   e.pend = nil
   e.free = nil; bump("received"); if e.own then bump("received_own") end
+  if e.evR and e.evR.home and not e.evR.line then e.evR.line = clock end   -- (lane 74) the send-home's log line
   local q = { rec = rec, ident = ty .. "|" .. w[9] .. "|" .. w[10] .. (ty == FOLLOW and ("|" .. w[11]) or ""), t = clock, hp = hp }
   stamp(rec)                                                   -- (lane 59) this record is this world's
   -- (lane 49, round four) the target building's address, taken now while the handle is this frame's (ENDHOLD's list
@@ -1102,7 +1482,9 @@ local function onStart(S, w, clock)
   local n, cty, ctx, t = peek(e.u)
   local cur = n > 0 and identOf(t, cty) or nil
   if cur == q.ident and (w[9] ~= "-" or ty == FOLLOW) then    -- its own game is already there (a load picked up, the next leg)
-    e.given = cur; e.givenT = clock; e.isHold = nil; e.q = nil; bump("already"); return
+    e.given = cur; e.givenT = clock; e.isHold = nil; e.q = nil; bump("already")
+    local R = e.evR; if R and not R.give then R.give = clock; R.gty = ty end   -- (lane 74) the log line: he has it
+    return
   end
   -- (lane 35, item 3) a carry, fetch or crafting: the host's unit ended its task before (that is why it starts this one), so this
   -- copy's unit ends it too, now. Waiting for it (a carry with goods up to cfg.carryGrace, any other task while near its
@@ -1112,10 +1494,9 @@ local function onStart(S, w, clock)
   -- Not tree work (17 felling, 23 cutting a felled tree): cut short, this copy's tree never falls (or is never cut up)
   -- and the gatherers that follow find no felled tree here (f2, f3: gathering 61 % with the cut, 92 % without, m1)
   if e.given and cur == e.given and not e.isHold and CUT[cty] then
-    if J.cfg.hands and w[19] and got(function() return handsOf(e.u) end, w[19]) ~= w[19] then
-      local okH = pcall(setHands, e.u, w[19]); bump(okH and "hands_at_start" or "errors")
-    end
-    bump("cut_prev"); J.why = "cut"; give(e, q, clock); return
+    -- (lane 74) through the give queue: the load is written when the cut is made (giveNow), not a frame before it
+    q.hs = w[19]
+    bump("cut_prev"); later(e, q, "cut", clock); return
   end
   if e.given and cur == e.given and not e.isHold then
     -- (lane 23, gap a) a carry with goods in hands is not cut: the load would stay in the hands (lane 19, 401 samples)
@@ -1125,7 +1506,7 @@ local function onStart(S, w, clock)
     if not far then e.q = q; bump("queued"); return end
     bump("queue_skipped_far")
   end
-  J.why = J.retry and "retry" or "direct"; give(e, q, clock)
+  later(e, q, J.retry and "retry" or "direct", clock)          -- (lane 74) through the give queue
 end
 
 -- (lane 54, round two) WORK CYCLES. A crafter (25) yields its goods when its strokes reach targetRepetitions (25 or 20),
@@ -1163,6 +1544,17 @@ local function friendOne(e, clock, speed, grace)
   if J.skip and J.skip[e.key] then return end                  -- (lane 23, diagnosis) test only: a villager the board leaves alone
   local u = e.u
   local n, ty, tx, t = peek(u)
+  -- (lane 74) a soldier is his squad's: the look ends here (KEPT, above give()); the look that sees him a villager
+  -- again gives what the host said meanwhile
+  if J.cfg.keep ~= false then if soldierLook(e, n, ty, tx, clock) then return end
+  elseif J.cfg.evLog then                                      -- the board of before, watched for the log lines only
+    local s = soldierNow(e)
+    if s and not e.sol then e.sol = clock; local R = evOf("call", e, clock); if R then R.had = n > 0 and ty or nil; R.host = e.host and (tonumber(e.host.rec.Type) or -1) or (e.hostIdle and "ended" or (e.free and "free" or "none")) end
+    elseif not s and e.sol then local R = evOf("home", e, clock); if R then R.sol = clock - e.sol end; e.sol = nil end
+  end
+  if e.evR and e.evR.home then pcall(evLook, e, u, n, ty, t, clock) end
+  -- a line in the give queue is given by the queue (not by this look), unless it has waited twice the queue's limit
+  local inq = e.q ~= nil and e.q.inq and clock - (e.q.inqT or clock) < 2 * (J.cfg.giveWait or 1.0)
   pcall(workHold, e, u, n, ty, t)                              -- (lane 54, round two) a work cycle ends on the host's word
   pcall(arriveHold, e, u, n, ty, t, clock, speed)              -- (lane 49, round five) goods change hands on the host's word
   pcall(gatherHold, e, u, n, ty)                               -- (lane 49, round five) ... and a gatherer's yield
@@ -1173,7 +1565,7 @@ local function friendOne(e, clock, speed, grace)
     -- (lane 19, gap 4) a given task that ended within 2 game seconds: this copy lacked what it needs (stock, an empty stall)
     if e.gty then if (clock - (e.givenT or 0)) * speed < 2.0 then bump("quick_end_" .. e.gty) end; e.gty = nil end
     if n == 0 then
-      if e.q then J.why = "after_prev"; give(e, e.q, clock)                          -- the task before ended: the waiting one starts
+      if e.q then if not inq then J.why = "after_prev"; give(e, e.q, clock) end     -- the task before ended: the waiting one starts
       elseif pwOn(e, clock) then bump("pick_waiting")              -- (lane 46) it waits with its load for the host's carry
       elseif J.cfg.carryKeep and J.gateOn and e.host and not TAKES[tonumber(e.host.rec.Type) or -1] and got(function() return #u.Inventory end, 0) > 0 then
         -- (lane 23, gap a) it ended holding goods (a tree felled, a log picked up): given the same task again it would
@@ -1202,7 +1594,7 @@ local function friendOne(e, clock, speed, grace)
       end
       if e.q and cur == e.q.ident and cur:sub(-4) ~= "|-|-" then e.given = cur; e.givenT = clock; e.isHold = nil; e.q = nil; bump("self")
       elseif cur ~= e.given then                               -- a task the unit took by itself
-        if e.q then J.why = "after_prev_self"; give(e, e.q, clock)
+        if e.q then if not inq then J.why = "after_prev_self"; give(e, e.q, clock) end
         elseif slow then                                       -- (lane 23) the game's own re-pick of a cyclic task
           if traderBack(e, cur, clock, speed) then return end      -- (lane 54, round two) the host's trip, not its own
           if cur == e.host.ident then e.given = cur; e.givenT = clock; e.isHold = nil; bump("chosen_same")
@@ -1222,7 +1614,7 @@ local function friendOne(e, clock, speed, grace)
       end
     end
   end
-  if e.q and clock - e.q.t > ((e.q.carry and J.cfg.carryGrace) and (J.cfg.carryGrace / speed) or grace) then bump(e.q.carry and "grace_over_carry" or "grace_over"); J.why = "grace"; give(e, e.q, clock) end
+  if e.q and not inq and clock - e.q.t > ((e.q.carry and J.cfg.carryGrace) and (J.cfg.carryGrace / speed) or grace) then bump(e.q.carry and "grace_over_carry" or "grace_over"); J.why = "grace"; give(e, e.q, clock) end
   -- (lane 23, gap b) a start that waits for its resource: looked for again every half second
   if e.pend and clock - e.pend.tl > 0.5 then
     local w = e.pend.w; e.pend = nil
@@ -1234,7 +1626,7 @@ local function friendOne(e, clock, speed, grace)
   -- (lane 23, gap d) a gated unit with nothing to do and no word of the host about it asks the host (U Q)
   if J.cfg.ask and J.gateOn and n == 0 and not e.host and not e.q and not e.pend and not e.hostIdle and not e.free then
     if not e.idleT then e.idleT = clock
-    elseif clock - e.idleT > J.cfg.askAfter and clock - (e.askT or -100) > J.cfg.askEvery then e.askT = clock; A.send("U Q " .. e.key); bump("asked") end
+    elseif clock - e.idleT > J.cfg.askAfter and clock - (e.askT or -100) > J.cfg.askEvery then e.askT = clock; A.send("U Q " .. e.key); bump("asked"); if e.evR then e.evR.asked = (e.evR.asked or 0) + 1 end end
   else e.idleT = nil end
   -- (lane 23) on another task than the host's unit (and not holding a load the host's does not): the host's task
   if J.cfg.drift and J.gateOn and e.host and not e.free and not e.q and not e.pend and cur ~= e.host.ident then
@@ -1353,6 +1745,7 @@ local function fresh(S)
   if J.gateOn then gateClose(S, "world attached again") end
   J.list, J.rlist, J.byKey, J.byAddr, J.listT, J.res, J.helloFor, J.carryTo, J.fallen, J.chSent = nil, nil, nil, nil, nil, nil, nil, nil, nil, nil
   J.mnt, J.arrB, J.fellP, J.goneU, J.va, J.vaFor, J.chSet, J.skipW, J.resT = nil, nil, nil, nil, nil, nil, nil, nil, nil
+  J.kept, J.gq, J.gf, J.gqDirty, J.ev, J.evDone, J.orph, J.orphT, J.cam, J.frameT, J.hev, J.hevDone = nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil   -- (lane 74) every table that holds a unit or a record
   J.world = S.worlds; J.loadN = S.loads
 end
 local function tick(S, clock)
@@ -1364,8 +1757,12 @@ local function tick(S, clock)
   if not (valid(S.eng) and valid(S.p1)) then return end
   local t0 = os.clock()
   J.tickN = (J.tickN or 0) + 1
-  if not J.list or clock - (J.listT or 0) > J.cfg.refresh then build(S) end
+  if not J.list or clock - (J.listT or 0) > ((J.orph and S.role == "friend") and math.min(1.0, J.cfg.refresh) or J.cfg.refresh) then build(S) end   -- (lane 74) every second while a line waits for a villager who is not on the lists
   local cfg = J.cfg
+  -- (lane 74) the wall time since this board's tick before: this copy's frame, as long as the board ticks every frame.
+  -- Its longest goes into the minute's line and into each call-up's and send-home's line.
+  local gap = J.frameT and (t0 - J.frameT) or nil; J.frameT = t0
+  if gap and gap < 30.0 and gap > (J.gapMax or 0) then J.gapMax = gap end
   -- (lane 35, item 5) above speed 4 the board's wall-second windows and its look stride shrink with the speed, so they
   -- stay the same in game time (cfg.speedScale; at speed 8: villagers looked at every 2 frames instead of 4, at most twice
   -- as many in one frame, and the drift, choose and hands lags halved)
@@ -1399,18 +1796,29 @@ local function tick(S, clock)
       end end
       -- (round two) and every unit with a load that is on none of the board's lists (once per pause: the region dump's
       -- "units standing in the region" count units the board never names: l46s4..6, one good 16 off)
-      local x = {}
+      local x, nx = {}, 0
       pcall(function()
         local ua = S.eng.unitArr
         for q = 1, #ua do
           local u = un(ua[q])
           if valid(u) and not (J.byAddr and J.byAddr[u:GetAddress()]) then
             local hs = got(function() return handsOf(u) end, "0")
-            if hs ~= "0" and #x < 6 then x[#x + 1] = string.format("%s %s at %d,%d", got(function() return u:GetClass():GetFName():ToString() end, "?"), hs, math.floor(u.realPos.X / 100), math.floor(u.realPos.Y / 100)) end
+            -- (lane 74) how many there are in all (six are listed), and what each is: dead (a body the region still
+            -- holds), in a squad (its number), or neither. The live session of 2026-11-17 listed six "233x1" a few
+            -- metres apart, unmoved through three pauses in 160 s, first seen after the battle: this line could not say what
+            if hs ~= "0" then
+              nx = nx + 1
+              if #x < 6 then
+                local what = got(function() return u.dead end, false) == true and " dead" or ""
+                local sq = got(function() return u.assignedSquadID.Value end, 0)
+                if tonumber(sq) and tonumber(sq) ~= 0 then what = what .. " squad " .. tostring(math.tointeger(sq) or sq) end
+                x[#x + 1] = string.format("%s %s%s at %d,%d", got(function() return u:GetClass():GetFName():ToString() end, "?"), hs, what, math.floor(u.realPos.X / 100), math.floor(u.realPos.Y / 100))
+              end
+            end
           end
         end
       end)
-      log("jobs: paused 3 s, loads not the host's word: %d%s | units on no list with a load: %s", n, n > 0 and (": " .. table.concat(o, "; ")) or "", #x > 0 and table.concat(x, "; ") or "none")
+      log("jobs: paused 3 s, loads not the host's word: %d%s | units on no list with a load: %s", n, n > 0 and (": " .. table.concat(o, "; ")) or "", #x > 0 and (nx .. ": " .. table.concat(x, "; ")) or "none")
     end
   end
   if not J.paused then J.pzSaid = nil end
@@ -1418,6 +1826,7 @@ local function tick(S, clock)
   if S.role == "host" then
     each(J.list, stride, perFrame, hostOne)
     each(J.rlist, cfg.rstride or 12, cfg.rperFrame or 8, hostOne)
+    if J.hev or J.hevDone then local ok, er = pcall(hevTick, t0); if not ok then bump("errors"); J.lastErr = "event: " .. tostring(er) end end
   else
     -- a friend's board that just started (a join, a reload, the module loaded late) asks for every unit's running task
     if J.helloFor ~= S.worlds then J.helloFor = S.worlds; A.send("U H"); bump("hello") end
@@ -1430,14 +1839,30 @@ local function tick(S, clock)
     -- game: no "stand here", no task given again (lane 19's paths still held villagers then)
     if t0 - (J.lastU or -1e9) < cfg.quiet then
       if J.wasQuiet then J.wasQuiet = nil; A.send("U H"); bump("hello_after_quiet") end   -- every running task told again
+      -- (lane 74) lines that waited for a villager who was not on the lists, the villagers a line waits for, the give queue
+      if J.orph and J.orphT ~= J.listT then J.orphT = J.listT; local ok, er = pcall(J.orphLook, S, t0); if not ok then bump("errors"); J.lastErr = "orphans: " .. tostring(er) end end
+      if J.kept then local ok, er = pcall(keptLook, S, t0); if not ok then bump("errors"); J.lastErr = "kept: " .. tostring(er) end end
+      do local ok, er = pcall(drain, S, t0); if not ok then bump("errors"); J.lastErr = "give queue: " .. tostring(er) end end
       each(J.list, stride, perFrame, fn)
       each(J.rlist, cfg.rstride or 12, cfg.rperFrame or 8, fn)
     else bump("quiet_ticks"); if J.lastU then J.wasQuiet = true end end
+    -- (lane 74) the frame's gives are counted (the minute's line, the event lines), then the next frame starts at none
+    local F = J.gf
+    if F then if F.n > (J.gfN or 0) then J.gfN = F.n end; if F.ms > (J.gfMs or 0) then J.gfMs = F.ms end end
+    if J.ev or J.evDone then local ok, er = pcall(evTick, t0, gap); if not ok then bump("errors"); J.lastErr = "event: " .. tostring(er) end end
+    if F then F.n = 0; F.ms = 0 end
   end
   local dt = os.clock() - t0
   J.cost = (J.cost or 0) + dt; J.costN = (J.costN or 0) + 1; if dt > (J.costMax or 0) then J.costMax = dt end
   if clock - (J.logT or 0) >= 60.0 then
     if J.logT then
+      -- (lane 74) this copy's longest frame as the board saw it; a friend: the most gives of host lines in one frame,
+      -- their time, the give queue's longest and its longest wait
+      J.n.frame_longest_ms = math.floor((J.gapMax or 0) * 1000 + 0.5)
+      if S.role == "friend" and (J.gfN or 0) > 0 then
+        J.n.gives_in_a_frame_most = J.gfN; J.n.gives_in_a_frame_ms = math.floor((J.gfMs or 0) + 0.5)
+        if (J.gqMax or 0) > 0 then J.n.give_queue_longest = J.gqMax; J.n.give_queue_wait_ms = math.floor((J.gqWaitMax or 0) * 1000 + 0.5) end
+      end
       local keys = {}; for k in pairs(J.n) do keys[#keys + 1] = k end; table.sort(keys)
       local s = {}; for _, k in ipairs(keys) do s[#s + 1] = k .. " " .. J.n[k] end
       log("jobs: %s, last 60 s, %d + %d units%s: %s | tick %.3f ms mean over %d ticks, longest %.1f ms%s", S.role, #J.list, #(J.rlist or {}),
@@ -1445,6 +1870,7 @@ local function tick(S, clock)
         J.cost / math.max(1, J.costN) * 1000, J.costN, (J.costMax or 0) * 1000, J.lastErr and (" | last error: " .. J.lastErr:sub(1, 160)) or "")
     end
     J.logT = clock; J.n = {}; J.cost = 0; J.costN = 0; J.costMax = 0; J.lastErr = nil
+    J.gapMax = nil; J.gfN = nil; J.gfMs = nil; J.gqMax = nil; J.gqWaitMax = nil
   end
 end
 local function onMessage(S, from, kind, w, line)
@@ -1464,19 +1890,42 @@ local function onMessage(S, from, kind, w, line)
   local clock = os.clock()
   J.lastU = clock
   if w[4] == "S" or w[4] == "R" or w[4] == "E" or w[4] == "F" then local ok, er = pcall(fellAtHostEnd, w, clock); if not ok then bump("errors"); J.lastErr = "fell: " .. tostring(er) end end   -- (lane 54)
+  -- (lane 74) a start for a villager who is not on this copy's lists YET (a family that has just arrived or moved in:
+  -- the lists are a rebuild behind, or the host's line that makes the family here is still on its way) was dropped
+  -- (skip_no_unit_here). The latest start per name waits now (J.orph, at most 64 names, cfg.hereWait + 8 s) and is
+  -- taken up at the first rebuild of the lists that has him; the host's "ended" or "cannot be named" for the name drops it.
+  if J.orph and (w[4] == "E" or w[4] == "F") and J.orph[w[5]] then J.orph[w[5]] = nil; bump("orphan_replaced") end
+  local nou = J.n.skip_no_unit_here or 0
   if w[4] == "S" or w[4] == "R" then local ok, er = pcall(onStart, S, w, clock); if not ok then bump("errors"); J.lastErr = tostring(er) end
+    if (J.n.skip_no_unit_here or 0) > nou and J.cfg.keep ~= false and w[5] then
+      J.orph = J.orph or {}
+      local k = 0; for _ in pairs(J.orph) do k = k + 1 end
+      if k < 64 or J.orph[w[5]] then J.orph[w[5]] = { w = w, t = clock }; bump("orphan_kept") else bump("orphan_full") end
+    end
   elseif w[4] == "L" then                                      -- (lane 23) U L <unit> <load>
     local e = J.byKey and J.byKey[w[5]]
     if e and w[6] and w[6] ~= e.hl then e.hl = w[6]; e.hlT = clock end
   elseif w[4] == "F" then
     local e = J.byKey and J.byKey[w[5]]
-    if e and valid(e.u) then
+    if e and live(e.u) then
       e.free = true; e.q = nil; e.host = nil; e.pend = nil; J.chDirty = true; bump("free")
       local x, y, z = (w[7] or ""):match("^(%-?%d+),(%-?%d+),(%-?%d+)$")
       if x then pcall(walkThere, e, { X = x + 0.0, Y = y + 0.0, Z = z + 0.0 }, clock) end
     end
-  elseif w[4] == "E" then local e = J.byKey and J.byKey[w[5]]; if e then e.host = nil; e.hostIdle = true; e.endT = clock; e.pend = nil; e.pw = nil; J.chDirty = true; bump("ended") end end
+  elseif w[4] == "E" then local e = J.byKey and J.byKey[w[5]]; if e then e.host = nil; e.hostIdle = true; e.endT = clock; e.pend = nil; e.pw = nil; J.chDirty = true; bump("ended")
+    -- (lane 74) the host's villager has nothing to do: a line of his that still waits here for a soldier, or in the give queue, is not given
+    if e.q and (e.q.kept or e.q.inq or (J.cfg.keep ~= false and valid(e.u) and notReady(e) == "soldier")) then e.q = nil; bump("kept_ended") end; e.fp = nil end end
   return true
+end
+function J.orphLook(S, clock)
+  for k, o in pairs(J.orph) do
+    local e = J.byKey and J.byKey[k]
+    if e and live(e.u) then
+      J.orph[k] = nil; bump("orphan_given")
+      local ok, er = pcall(onStart, S, o.w, clock); if not ok then bump("errors"); J.lastErr = tostring(er) end
+    elseif clock - o.t > (J.cfg.hereWait or 8.0) + 8.0 then J.orph[k] = nil; bump("orphan_gave_up") end
+  end
+  if next(J.orph) == nil then J.orph = nil end
 end
 -- the mod stopping: the job list is emptied before coop_patch puts its bytes back (modules get no stop call)
 if C.stop ~= J.stopWrap then

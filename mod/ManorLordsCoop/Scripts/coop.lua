@@ -8,7 +8,7 @@
 
 local C = rawget(_G, "Coop") or {}
 _G.Coop = C
-C.version = "0.2.4"
+C.version = "0.2.5"
 
 -- where the link files live: set by main.lua to "<this mod's folder>/link/"; the development console uses the probe's folder
 local LINK = rawget(_G, "COOP_LINK_DIR")
@@ -445,6 +445,21 @@ local function commit(h)
   local cur = sc:IsSkillActiveForSquad({ Value = h }, SPREAD)
   sc:SetSkillActive({ Value = h }, SPREAD, not cur, true); sc:SetSkillActive({ Value = h }, SPREAD, cur, true)
 end
+-- (lane 70) a LINE made by formALineArmy takes with the halt skill switched off instead: measured on the host (lane 70
+-- report, part 4), commit() formed the squad at the spread-out spacing (180) whatever its own spread was (120 / 95),
+-- because the formation is made in the "on" switch and not again in the "off" one: a mod-given line had wider files
+-- and more ranks than the same line drawn by the player (the live G135: host 4 ranks, friend 3). SetSkillActive(halt,
+-- false) forms it once at the squad's own spread and orders it.
+-- Not for a squad in a fight or just halted out of one (moveOrder, sendPlace): there the old commit, as before (the
+-- first camp fight with halt-off everywhere had the friend's militia up to 15 m off the host's; lane 70 report).
+-- Test switch (console): Coop.m70commit = false gives the old commit everywhere.
+local haltAt = {}
+local function commitLine(h)
+  local sc = C.s.sc; if sc:GetUnitCount({ Value = h }) == 0 then return end
+  local s = sc:GetSquad({ Value = h })
+  if C.m70commit == false or s.isEngaged or s.targetSquad.Value ~= 0 or (haltAt[h] and os.clock() - haltAt[h] < 1.0) then commit(h); return end
+  sc:SetSkillActive({ Value = h }, HALT, false, true)
+end
 
 local function doMove(h, t)
   -- never order a squad that has no men: the game crashes on it (access violation reading 0x318; session 20 on a
@@ -456,14 +471,18 @@ local function doMove(h, t)
   local dx, dy = t.X - c.X, t.Y - c.Y; local len = math.sqrt(dx * dx + dy * dy); if len < 1 then dx, dy, len = 1, 0, 1 end
   local px, py = -dy / len, dx / len
   local a = { X = t.X - px * half, Y = t.Y - py * half, Z = t.Z }; local b = { X = t.X + px * half, Y = t.Y + py * half, Z = t.Z }
-  issuer(s):formALineArmy({ { Value = h } }, { A = a, B = b }, FName("None"), { A = a, B = b }); commit(h)
+  -- (lane 70) a friend's copy takes the host's line of this squad when the host's shape stands at that place
+  -- (coop_x_army.lua C.formLine); every copy notes the line it gave (C.formed: the host sends that shape to friends)
+  if C.formLine then local ok, a2, b2 = pcall(C.formLine, h, t.X, t.Y); if ok and a2 then a, b = a2, b2 end end
+  issuer(s):formALineArmy({ { Value = h } }, { A = a, B = b }, FName("None"), { A = a, B = b }); commitLine(h)
+  if C.formed then pcall(C.formed, h, a, b, "move") end
 end
 
 -- a move that also pulls the squad out of a fight: halt now, move a moment later
 local function moveOrder(h, t)
   local s = C.s.sc:GetSquad({ Value = h })
   if s.isEngaged or s.targetSquad.Value ~= 0 then
-    C.s.sc:SetSkillActive({ Value = h }, HALT, true, true)
+    C.s.sc:SetSkillActive({ Value = h }, HALT, true, true); haltAt[h] = os.clock()
     later(0.08, function() if sqValid(h) then doMove(h, t) end end)
   else doMove(h, t) end
 end
@@ -615,6 +634,7 @@ local function send(line)
   S.seq = S.seq + 1
   local text = string.format("%d %.3f %s\n", S.seq, now(), line)
   S.out:write(text); S.out:flush(); S.stats.sent = S.stats.sent + 1
+  if C.orderSent and line:sub(1, 2) == "O " then pcall(C.orderSent, S.seq, line) end      -- (lane 70) every order is logged as it leaves
   S.outSize = (S.outSize or 0) + #text
   K.sN = K.sN + 1; K.sB = K.sB + #text                       -- lane 45
   local lim = cutLimit(S)
@@ -626,6 +646,24 @@ local function send(line)
   end
 end
 
+-- (lane 65) THE READ HANDLE IS KEPT. Live, 2026-11-17: a friend's game at 13 to 21 frames a second, its link read
+-- 5 to 8 ms a frame (the host 0.26). Every read opened the host's file again, and on a PC that scans a file when it
+-- is opened after a write (the Steam piece appends to it every frame), an open costs about 2 ms at 4 KB and 3 ms at
+-- 4 MB on the developer's PC (desk bench, lane 65), more on a friend's. Now one handle per player's file stays open
+-- and a read is a seek and the new bytes only. The handle is let go:
+--   * when the reader moves to another file of the chain (its "~NEXT" line, a deleted file, a rewind);
+--   * when a read through it fails;
+--   * when the file has not grown for READ_IDLE s. The C runtime's handle does not share delete: while it is open,
+--     nobody can delete or replace that file, and the writer's restart (it empties <who>.txt and deletes the
+--     numbered files, coop_steam.c mirror_clear, linkReset here) shows to a reader only as its file being gone. A
+--     file that has gone quiet is opened again at the next read, after the writer had a frame to delete it.
+-- While the host's lines come (several a second) there is no open at all; a quiet file costs one open a second.
+local READ_IDLE, READ_GAP = 1.0, 0.25
+local function dropHandle(R)
+  if R and R.fh then pcall(io.close, R.fh) end
+  if R then R.fh, R.fhP = nil, nil end
+end
+local function closeReaders(S) if S and S.readers then for _, R in pairs(S.readers) do dropHandle(R) end end end
 local recvBody
 local function recv(peer)                                      -- lane 45: timed (the link file's read cost)
   local t0 = os.clock()
@@ -633,6 +671,7 @@ local function recv(peer)                                      -- lane 45: timed
   -- once a second, not at every read (b0: 95 opens a second on the host, 0.46 ms a frame)
   local R0 = C.s.readers[peer]
   if R0 and R0.missT and t0 - R0.missT < 1.0 then return {}, {} end
+  if R0 and R0.waitT then if t0 < R0.waitT then return {}, {} end; R0.waitT = nil end   -- (lane 65) a quiet numbered file
   local lines, ends = recvBody(peer)
   kAdd("link:read", (os.clock() - t0) * 1000); K.rN = K.rN + #lines
   return lines, ends
@@ -643,7 +682,13 @@ recvBody = function(peer)
   R.seg = R.seg or 1
   local lines, ends = {}, {}
   for _ = 1, 8 do                                              -- one file, or a few when the chain moves on
-    local f = io.open(segFile(peer, R.seg), "rb")
+    local p = segFile(peer, R.seg)
+    local f, opened = R.fh, false
+    if f and R.fhP ~= p then dropHandle(R); f = nil end        -- (lane 65) a handle of another file (rewind, a new place)
+    if not f then
+      f = io.open(p, "rb"); opened = f ~= nil
+      if f then f:setvbuf("no"); R.fh, R.fhP, R.growT = f, p, os.clock() end
+    end
     R.missT = nil
     if not f then
       if R.seg <= 1 then R.missT = os.clock(); break end       -- lane 45: no file of that player (see recv)
@@ -654,15 +699,32 @@ recvBody = function(peer)
       else break end
     else
       local size = f:seek("end")
+      if not size then dropHandle(R); break end               -- (lane 65) a failed read: the next read opens it again
       -- the file was emptied and written again (that player restarted the game): read it from the start. Size alone does
       -- not show it: a rejoining friend's first line is exactly as long as the first line of the session before, and the
       -- host never saw that hello (first session between two PCs, 2026-11-11). So the first bytes are compared too.
-      f:seek("set", 0); local head = f:read(48) or ""
-      if size < R.off or (R.head and #R.head > 0 and head:sub(1, #R.head) ~= R.head) then R.off = 0; R.part = ""; R.head = nil; R.floorWall = nil; R.floorSeq = nil end   -- (lane 62: written anew, no history in it)
-      if not R.head or #head > #R.head then R.head = head end
-      if size == R.off then f:close(); break end
-      f:seek("set", R.off); local data = f:read("a"); f:close()
-      if not data or #data == 0 then break end
+      -- (lane 65) compared when the size changed or the file was just opened: a quiet file is opened again after
+      -- READ_IDLE s, so a rewrite to exactly the same size is still seen, at the latest then.
+      if opened or size ~= R.off then
+        f:seek("set", 0); local head = f:read(48) or ""
+        if size < R.off or (R.head and #R.head > 0 and head:sub(1, #R.head) ~= R.head) then R.off = 0; R.part = ""; R.head = nil; R.floorWall = nil; R.floorSeq = nil end   -- (lane 62: written anew, no history in it)
+        if not R.head or #head > #R.head then R.head = head end
+      end
+      if size == R.off then
+        -- (lane 65) gone quiet: let go. A numbered file is left closed for READ_GAP s: only those are ever deleted under
+        -- a reader (the writer started again), and its delete is tried again only now and then (linkReset's retry
+        -- in send, the Steam piece's every tick). The host writes several lines a second in a world, so a quiet
+        -- numbered file means a host that paused, loads or started again; READ_GAP is then the extra wait for its
+        -- next line.
+        if not opened and os.clock() - (R.growT or 0) >= READ_IDLE then
+          dropHandle(R); if R.seg > 1 then R.waitT = os.clock() + READ_GAP end
+        end
+        break
+      end
+      f:seek("set", R.off); local data = f:read(size - R.off)
+      if not data then dropHandle(R); break end
+      R.growT = os.clock()
+      if #data == 0 then break end
       local start = (R.seg - 1) * SEGPOS + R.off - #R.part       -- where in the chain the first byte of "data" (below) is
       R.off = R.off + #data; K.rB = K.rB + #data
       S.heard = S.heard or {}; S.heard[peer] = os.clock()        -- when this player last sent anything (player list, "left the game")
@@ -680,10 +742,11 @@ recvBody = function(peer)
           lines[#lines + 1] = line; ends[#lines] = start + nl
         end
       end
-      if moved then R.seg, R.off, R.part, R.head = moved, 0, "", nil
+      if moved then dropHandle(R); R.seg, R.off, R.part, R.head = moved, 0, "", nil
       else R.part = data:sub(pos); break end
     end
   end
+  if C.linkReopen then dropHandle(R) end                       -- (lane 65) test switch dev_linkreopen.txt: the old way
   return lines, ends
 end
 
@@ -700,11 +763,20 @@ local function rewind(peer, off)
   local csize = (cs == seg) and size or fsize(segFile(peer, cs)) or R.off
   local bytes = size - o
   if cs ~= seg then bytes = bytes + csize; for k = seg + 1, cs - 1 do bytes = bytes + (fsize(segFile(peer, k)) or 0) end end
-  R.seg, R.off, R.part, R.head = seg, o, "", nil
+  dropHandle(R); R.waitT = nil; R.seg, R.off, R.part, R.head = seg, o, "", nil
   S.replay = { peer = peer, from = off, to = (cs - 1) * SEGPOS + csize, n = 0, skipS = 0, own = 0, nak = 0, t = os.clock() }
   return bytes
 end
-C.link = { send = send, recv = recv, rewind = rewind, segChain = segChain, readerAtEnd = readerAtEnd, segFile = segFile }   -- self-test: tests/linkfiles
+-- (lane 73) A seam for the development build's LINK DELAY switch (coop_dev.lua, which is never shipped: without it
+-- C.devLink is nil and these two pass straight through). The switch holds each line read for a time and lets them out
+-- in bursts, to test a copy under a slow link; a rewind drops what it holds (those lines are read again from the file).
+do
+  local recv0, rewind0 = recv, rewind
+  recv = function(peer) local d = C.devLink; if d then return d.recv(recv0, peer) end; return recv0(peer) end
+  rewind = function(peer, off) local d = C.devLink; if d then d.rewind(peer) end; return rewind0(peer, off) end
+end
+C.link = { send = send, recv = recv, rewind = rewind, segChain = segChain, readerAtEnd = readerAtEnd, segFile = segFile,
+           closeReaders = closeReaders }   -- self-test: tests/linkfiles
 
 -- ---------------------------------------------------------------- friend: watch the local player's orders
 local HOOKS = { "InpActEvt_RightMouseButton_K2Node_InputKeyEvent_3", "InpActEvt_RightMouseButton_K2Node_InputKeyEvent_2",
@@ -977,6 +1049,7 @@ local function watch()
           if was == 0 and st.rs ~= 0 and not (S.rallyT and S.rallyT[h] and clock - S.rallyT[h] < 5.0) then
             send(string.format("O RALLY %d %.0f %.0f %.0f", toHost(h), st.tx ~= 0 and st.tx or st.cx, st.ty ~= 0 and st.ty or st.cy, st.tz))
             S.localOrderT[h] = clock; S.stats.ralliesSent = (S.stats.ralliesSent or 0) + 1
+            S.rsEcho = S.rsEcho or {}; S.rsEcho[h] = { out = true, t = clock }     -- (lane 74) see mirror(): waits for its echo
           elseif was and was ~= 0 and st.rs == 0 and not (S.homeT and S.homeT[h] and clock - S.homeT[h] < 5.0) then
             -- (lane 16) Only when the player pressed the send-home button within the last 5 s (noted by the army
             -- module's hook on the command buttons; measured on two copies: the unit's status is 0 a third of a
@@ -986,6 +1059,7 @@ local function watch()
             -- the player's order, the host sent its own unit home in the middle of a fight. Without the press nothing
             -- is sent; if the host's unit is still out, the mirror calls this one up again (measured).
             if S.disbandT and clock - S.disbandT < 5.0 then send(string.format("O HOME %d", toHost(h))); S.localOrderT[h] = clock
+              S.rsEcho = S.rsEcho or {}; S.rsEcho[h] = { out = false, t = clock }   -- (lane 74) see mirror(): waits for its echo
             else S.stats.homeByGame = (S.stats.homeByGame or 0) + 1; log("unit %d went home here and this player did not send it: not sent", h) end
           end
         end
@@ -1121,6 +1195,8 @@ local function hostInbox()
         local ok, r = pcall(applyOrder, w)
         S.stats.applied = S.stats.applied + 1
         log("APPLIED %s %s %s %s delay_ms=%.0f %s", peer, w[1], w[4], w[5], (now() - tonumber(w[2])) * 1000, ok and tostring(r) or ("ERR " .. tostring(r)))
+        if C.orderAnswer then pcall(C.orderAnswer, S, peer, w, ok, r) end      -- (lane 70) every order gets its answer back (A ACK)
+        if ok and C.panels and C.panels.touched then pcall(C.panels.touched, "O:" .. tostring(w[4]), nil) end   -- (lane 69) a friend's order applied: open army panels redraw
       elseif w[3] == "BYE" and tonumber(w[2]) and not stale(peer, w) then C.friendLeft(peer, "its goodbye (" .. tostring(w[4]) .. ")", "bye")   -- (lane 51)
       elseif w[3] and tonumber(w[2]) and not stale(peer, w) then C.dispatch(peer, w, line) end
     end
@@ -1469,7 +1545,7 @@ function C.milFollow(h, st, H)
 end
 -- what the army module (coop_x_army.lua) may use of the order code above
 C.armyApi = { sqValid = sqValid, sqState = sqState, unitsOf = unitsOf, aliveList = aliveList, allSquads = allSquads, issuer = issuer, commit = commit,
-              doMove = doMove, moveOrder = moveOrder, attackOrder = attackOrder, touch = touch, hostKill = hostKill }
+              doMove = doMove, moveOrder = moveOrder, attackOrder = attackOrder, touch = touch, hostKill = hostKill, commitLine = commitLine }
 
 -- (lane 38) a trace of what the mirror does, for the test sampler (lanes/lane_s21_38/probes/samp38.lua): kept only
 -- while S.m38tr is a table (the sampler sets it); M.br is the mirror's last branch for the squad
@@ -1574,7 +1650,7 @@ local function place38(S, h, M, H, st, clock, flee)
   -- the host's places, and an order would let them go (round 1: 7 000 releases a sitting)
   local MH = C.men and C.men.holds and C.men.holds(h)
   local tw = hostMotion(M, H)
-  local lag = math.max(0, math.min(1.0, now() - tw))
+  local lag = (H.wall and C.men and C.men.lineLag) and C.men.lineLag(H.wall, 1.0) or math.max(0, math.min(1.0, now() - tw))   -- (lane 73) the line's age by the HOST's clock (coop_x_men.lua)
   local vx, vy = M.vx or 0, M.vy or 0; local v = math.sqrt(vx * vx + vy * vy)
   local px, py = H.cx + vx * lag, H.cy + vy * lag                      -- where the host's squad is now
   -- the same aim: the same target squad (an attack this mirror gave counts for 8 s: the game sets the target squad
@@ -1630,9 +1706,14 @@ end
 -- off by some metres aims that much further (its centre lands behind its line). Plain move when the facing is not known.
 local function lineAt(h, x, y, z, face, len)
   local s = C.s.sc:GetSquad({ Value = h })
-  local r = math.rad(face); local ux, uy = math.cos(r), math.sin(r); local half = math.max(150.0, (len or 0) / 2)
+  -- (lane 70) the game forms a one-squad line 2.4 m shorter than the line given (coop_x_army.lua, SHAPE): the host's
+  -- men's extent (len) is given 2.4 m longer, else this copy fitted two files fewer than the host's
+  local r = math.rad(face); local ux, uy = math.cos(r), math.sin(r); local half = math.max(150.0, ((len or 0) + 240.0) / 2)
   local a = { X = x - ux * half, Y = y - uy * half, Z = z }; local b = { X = x + ux * half, Y = y + uy * half, Z = z }
-  issuer(s):formALineArmy({ { Value = h } }, { A = a, B = b }, FName("None"), { A = a, B = b }); commit(h)
+  -- and the host's own line of this squad when its shape stands there (C.formLine), as in doMove
+  if C.formLine then local ok, a2, b2 = pcall(C.formLine, h, x, y); if ok and a2 then a, b = a2, b2 end end
+  issuer(s):formALineArmy({ { Value = h } }, { A = a, B = b }, FName("None"), { A = a, B = b }); commitLine(h)
+  if C.formed then pcall(C.formed, h, a, b, "place") end
 end
 local function sendPlace(S, h, M, H, st, key, clock, what)
   if M.placeNKey == key and M.sendT and clock - M.sendT < 6.0 then return end    -- let the last send settle first
@@ -1648,7 +1729,7 @@ local function sendPlace(S, h, M, H, st, key, clock, what)
   if M.face and (M.len or 0) >= 300 and C.s.sc:GetUnitCount({ Value = h }) > 0 then
     local s = C.s.sc:GetSquad({ Value = h }); local face, len = M.face, M.len
     if s.isEngaged or s.targetSquad.Value ~= 0 then
-      C.s.sc:SetSkillActive({ Value = h }, HALT, true, true)
+      C.s.sc:SetSkillActive({ Value = h }, HALT, true, true); haltAt[h] = os.clock()
       later(0.08, function() if sqValid(h) and C.s.sc:GetUnitCount({ Value = h }) > 0 then lineAt(h, ax, ay, H.tz, face, len) end end)
     else lineAt(h, ax, ay, H.tz, face, len) end
   else moveOrder(h, { X = ax, Y = ay, Z = H.tz }) end
@@ -1670,7 +1751,8 @@ local function mirror(H)
   local S = C.s; local sc = S.sc; local h = H.h; local clock = os.clock()
   if not sqValid(h) then S.stats.unknown = (S.stats.unknown or 0) + 1; return end
   local M0 = S.mir[h]
-  if S.mine[h] and S.localOrderT[h] and clock - S.localOrderT[h] < 2.0 then if M0 then M0.br = "own"; paceOff(S, h, M0) end; return end   -- the player just ordered it: let the host catch up
+  -- (lane 70) and while the host's answer to his order is on its way (C.orderPending, at most 3 s)
+  if S.mine[h] and ((S.localOrderT[h] and clock - S.localOrderT[h] < 2.0) or (C.orderPending and C.orderPending(h))) then if M0 then M0.br = "own"; paceOff(S, h, M0) end; return end   -- the player just ordered it: let the host catch up
   if S.mine[h] and (S.inT or (S.btnT and clock - S.btnT < 0.6)) then if M0 then M0.br = "click"; paceOff(S, h, M0) end; return end          -- the player is clicking right now: hands off
   local st = sqState(h); local M = S.mir[h]; if not M then M = { t = 0, pt = 0 }; S.mir[h] = M end
   M.st = st; M.stT = clock      -- (lane 48) kept for the men module's check (coop_x_men.lua): no reads of its own
@@ -1685,6 +1767,20 @@ local function mirror(H)
   -- called up its militia unit and its retinue against raiders; here the militia unit followed, the retinue stayed at
   -- home with 0 men against the host's 5). The player's own retinue: not in the test saves, left as it was.
   local callable = st.mil or (st.ret and not S.mine[h])
+  -- (lane 74) THIS PLAYER'S OWN CALL-UP OR SEND-HOME WAITS FOR ITS ECHO, not for 2 s. The hands-off above ends 2 s after
+  -- the order; the host's state that answers it is back after the watcher's scan (0.3 s), the link there, the host's
+  -- next state line (0.25 s) and the link back. With a link of 1 s each way that is 2.5 s and more: for the time
+  -- between, the host's OLDER state stood against this copy's new one, and the branches below undid the player's own
+  -- order (a unit sent home was called up again here and sent home a second time when the host's answer came; a
+  -- call-up was sent home and called up again), its men soldiers, villagers and soldiers again within a second, and
+  -- the job board's lines for them fell into that. Until the host's state says what the player ordered (or 8 s have
+  -- passed, or this copy's unit is no longer in the state he ordered) the mirror does nothing with this unit.
+  local Ec = S.rsEcho and S.rsEcho[h]
+  if Ec and C.m74echo == false then S.rsEcho[h] = nil; Ec = nil end   -- (test switch, friend console: Coop.m74echo = false is the mirror of before)
+  if Ec then
+    if H.rs == nil or (H.rs ~= 0) == Ec.out or (st.rs ~= 0) ~= Ec.out or clock - Ec.t > 8.0 then S.rsEcho[h] = nil
+    else M.br = "echo"; paceOff(S, h, M); S.stats.rsEchoWait = (S.stats.rsEchoWait or 0) + 1; return end
+  end
   if H.rs and H.rs ~= 0 and st.rs == 0 and callable then
     if S.mine[h] and seenRs ~= 0 then return end
     -- (lane 24) A call-up this copy's game refuses (lane 20 F4: tried every 5 s for minutes, the unit stayed at home)
@@ -1763,15 +1859,20 @@ local function mirror(H)
             if valid(e.u) then
               local okM, md = pcall(function() return e.u.animMode end)
               if okM and md == 0 then
-                local n = 0
-                local okW, err = pcall(function()
-                  local u = e.u
-                  u.meleeTraining = rt
-                  for s = 1, 11 do local g = rids[s]; if g and g ~= 0 and u:GetEquippedID(s) ~= g then u:equip(g, true, false); n = n + 1 end end
-                  u.animMode = 1; u.currentAnimset = FName(rset)
-                end)
-                S.stats.milWhole = (S.stats.milWhole or 0) + 1
-                if (M.wholeSaid or 0) < 20 then M.wholeSaid = (M.wholeSaid or 0) + 1; log("mirror: militia squad %d: %s joined as a villager: armed as the unit's men are (%d things, set %s)%s", h, tostring(e.tok), n, rset, okW and "" or (" FAILED: " .. tostring(err))) end
+                -- (lane 73) through coop_x_men.lua's armLate: the animation TABLE, the set and the mode together, and only
+                -- when the table is the game's own for that set (a friend's copy closed after the set name alone was
+                -- written: lane 67, r1). A man it does not arm stays as he is and is asked again on the next pass.
+                local arm = C.men and C.men.armLate
+                local okW, did, n, how = pcall(function() if not arm then return false, 0, "no men module" end; return arm(S, e.u, ref, rt, rset, rids) end)
+                if not okW then how = "FAILED: " .. tostring(did); did = false end
+                if did then S.stats.milWhole = (S.stats.milWhole or 0) + 1 end
+                M.armSaid = M.armSaid or {}                       -- one line per man and result (also when he waits)
+                local key = tostring(e.tok) .. "|" .. tostring(how)
+                if not M.armSaid[key] then
+                  M.armSaid[key] = true
+                  local okA, ad = pcall(function() return e.u:GetAddress() end)
+                  log("mirror: militia squad %d: %s (unit %X) joined as a villager: %s (%d things, set %s): %s", h, tostring(e.tok), okA and math.tointeger(ad) or 0, did and "armed as the unit's men are" or "NOT armed", tonumber(n) or 0, rset, tostring(how))
+                end
               end
             end
           end
@@ -2145,7 +2246,7 @@ local function mirror(H)
     for _, k in ipairs(st.sk) do if k == SPRINT then ours = true end end
     if hs ~= ours then M.sprT = clock; if S.mine[h] then touch(h) end; pcall(function() sc:SetSkillActive({ Value = h }, SPRINT, hs, true) end); S.stats.sprint = (S.stats.sprint or 0) + 1; mtr(h, hs and "sprint" or "walk") end
   end
-  if H.behav and st.behav ~= H.behav and clock - (M.bt or 0) > 1.0 then M.bt = clock; touch(h); pcall(function() sc:SetBehaviourStance({ Value = h }, H.behav, false) end) end
+  if H.behav and st.behav ~= H.behav and clock - (M.bt or 0) > 1.0 then M.bt = clock; touch(h); pcall(function() sc:SetBehaviourStance({ Value = h }, H.behav, false) end); if S.mine[h] and C.panels and C.panels.touched then pcall(C.panels.touched, "A:BEHAV", nil) end end   -- (lane 69) a player's stance on the lord's own squad: army panel redraws
   if H.sk and clock - (M.skT or 0) > 1.0 then
     local want, have, changed = {}, {}, false
     -- Raiding (19) is never set here, and taken off when this copy's squad has it: with it, this copy's raiders
@@ -2506,10 +2607,29 @@ do
   removeTick = timed(removeTick, "core:upkeep"); friendUpkeep = timed(friendUpkeep, "core:upkeep")
   C.costTimed = timed                  -- the end of this file wraps C.scrubClose, C.scrubQuests, C.quietHelper the same way
 end
+-- (lane 65) TEST SWITCH dev_slowopen.txt in the link folder (looked for every 5 s): while it is there, every io.open of
+-- the mod's Lua first waits <ms> on the game thread (the file's first number, else 2), as on a PC whose real-time scan
+-- makes each open slow (a friend's PC, 2026-11-17). The native pieces' own opens are not slowed. Test only.
+local ioOpen0 = rawget(_G, "COOP_IO_OPEN0") or io.open; _G.COOP_IO_OPEN0 = ioOpen0
+local function slowOpenCheck()
+  local f = ioOpen0(LINK .. "dev_slowopen.txt", "rb")
+  local ms = f and (tonumber((f:read("a") or ""):match("%d+%.?%d*") or "") or 2) or nil
+  if f then f:close() end
+  -- and dev_linkreopen.txt: the link files are opened again at every read, as before lane 65 (the "before" of a run)
+  local r = ioOpen0(LINK .. "dev_linkreopen.txt", "rb"); if r then r:close() end
+  if (r ~= nil) ~= (C.linkReopen == true) then C.linkReopen = r ~= nil or nil; log("test switch dev_linkreopen.txt: link files opened again at every read %s", r and "ON" or "OFF") end
+  if ms == C.slowOpenMs then return end
+  C.slowOpenMs = ms
+  if ms then
+    io.open = function(p, m) local t = os.clock(); while (os.clock() - t) * 1000 < ms do end; return ioOpen0(p, m) end
+    log("test switch dev_slowopen.txt: every open of the mod's Lua waits %.1f ms from now on", ms)
+  else io.open = ioOpen0; log("test switch dev_slowopen.txt gone: opens no longer slowed") end
+end
 local function body()
   local S = C.s; local clock = os.clock()
   local roleN0 = S.roleN                                      -- (lane 62) C.setRole counts its calls: see the module loop below
 if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local tf0 = io.open(LINK .. "dev_trace.txt", "rb"); if tf0 then tf0:close(); C.traceF = io.open(LINK .. S.name .. "_trace.txt", "w+b") end end   -- (lane 47, round three: test switch dev_trace.txt)
+  if clock - (S.slowT or -10) > 5.0 then S.slowT = clock; slowOpenCheck() end   -- (lane 65) test switch dev_slowopen.txt
   if S.role == "idle" then
     -- Not a co-op game (a solo game, or the title screen before anything was chosen): the mod changes nothing. Only the
     -- menu, the Steam link and the native piece keep ticking, so the player can start hosting or accept an invite.
@@ -2889,7 +3009,11 @@ function C.tick()
   K.fMax = 0; K.fName = nil
   local kb0, t0 = collectgarbage("count"), os.clock()
   FR.p1 = false; FR.eng = false                              -- (objs checks them again first)
+  -- (lane 65) the Steam piece first (what came this frame is in the link files before the core reads them) and its
+  -- flush last (what this frame wrote leaves this frame); before, it ran among the modules: a frame later each way
+  local stp = rawget(C, "steam"); if stp and stp.pump then pcall(stp.pump) end
   local ok, e = pcall(body)
+  if stp and stp.flush then pcall(stp.flush) end
   FR.p1 = false; FR.eng = false
   if not ok then countErr(S, "the tick", e) end
   pcall(C.sessionStep, S)                                    -- (lane 61) "session:" lines (every 2 s at most)
@@ -3183,6 +3307,7 @@ end
 function C.stop()
   if C.handle then pcall(CancelDelayedAction, C.handle); C.handle = nil end
   if C.s then C.s.on = false; if C.s.out then pcall(function() C.s.out:close() end); C.s.out = nil end end
+  if C.s then closeReaders(C.s) end                                    -- (lane 65) the kept read handles
   C.logClose()                                                          -- (lane 47) opened again by the next line
   return "stopped"
 end
@@ -3228,6 +3353,7 @@ function C.setRole(role, name, peers)
   if (role == "friend" or role == "host") and Psn and Psn.newGame then pcall(Psn.newGame, "the role is now " .. role) end
   S.reattach = S.reattach or valid(S.eng) or nil   -- (lane 59) a world is attached now: the next attach is this same world (S.sameWorld); kept when C.setRole is called twice before a tick
   S.eng = nil; S.p1 = nil                       -- attach the world again as this role: every module gets onWorld
+  closeReaders(S)                                                       -- (lane 65) the kept read handles
   S.seq = 0; S.startWall = now(); S.heard = {}; S.gone = {}; S.stats.states = 0; S.readers = {}
   -- start reading every other player's file at its end: what was written before this role began is not for it
   local others = role == "friend" and { "host" } or S.peers

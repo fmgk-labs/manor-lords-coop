@@ -11,6 +11,18 @@
 #define COOP_STEAM_MOCK 1
 #define DEAD_AFTER_MS 10000  /* the mock scenarios time a silent player out after 10 s; the shipped DLL waits 5 minutes */
 #define MAX_FRIENDS 3        /* the mock scenarios are written for 4 players; the shipped DLL builds with 7 friends */
+/* (lane 65) the mock's file layer counts: every CreateFileW of the DLL (and of this test; the counts are taken around
+ * the DLL's ticks only, see step_once) and every attribute look (GetFileAttributesExW / GetFileAttributesW) */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+static long g_opens, g_looks;
+static HANDLE t_CreateFileW(LPCWSTR p, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD fl, HANDLE tpl)
+{ g_opens++; return CreateFileW(p, acc, share, sa, disp, fl, tpl); }
+static BOOL t_GetFileAttributesExW(LPCWSTR p, GET_FILEEX_INFO_LEVELS lv, LPVOID out) { g_looks++; return GetFileAttributesExW(p, lv, out); }
+static DWORD t_GetFileAttributesW(LPCWSTR p) { g_looks++; return GetFileAttributesW(p); }
+#define CreateFileW t_CreateFileW
+#define GetFileAttributesExW t_GetFileAttributesExW
+#define GetFileAttributesW t_GetFileAttributesW
 #include "../coop_steam.c"
 
 /* ================================================================ checks */
@@ -58,6 +70,7 @@ struct Node {
     int slotToggle, inviteDialogs, faultReported;
     int loggedOff;               /* (lane 62) Steam is offline on this PC (BLoggedOn answers 0) */
     uint64_t lastInviteLobby;    /* (lane 62) the lobby the last invite window was opened for */
+    long nOpens, nLooks;         /* (lane 65) files opened / attributes looked at by this node's DLL ticks */
     int joinRefuse;              /* (lane 62, part two) Steam answers this PC's JoinLobby with this code (0: as it is) */
     int stale;                   /* (part two) this PC's Steam still answers member and owner questions as before a drop */
     uint64_t staleLobby, staleOwner, staleMem[8];
@@ -486,7 +499,9 @@ static void step_once(void)
         Node *n = g_nodes[i];
         if (!n->c || n == g_skip) continue;
         g_cur = n;
+        long o0 = g_opens, l0 = g_looks;
         coop_tick_safe(n->c);
+        n->nOpens += g_opens - o0; n->nLooks += g_looks - l0;
         if (n->c->off && strstr(n->c->offReason, "internal fault") && !n->crash && !n->faultReported) {
             n->faultReported = 1;
             check(0, "%s switched itself off after a fault: %s", n->name, n->c->offReason);
@@ -846,6 +861,132 @@ int main(void)
     check(ok && n == 1, "friend1.txt emptied -> T -> the host's copy is emptied (%d lines)", n);
     free_lines(v, n);
 
+    /* ---- (lane 65) file opens in play: the host's mod writes about 40 lines a second (live: states at 20 a second and
+     * more), the friend's mod a line a second; 10 s. Counted around each DLL's ticks only (step_once). */
+    {
+        run_ms(2000);
+        long ho = H->nOpens, fo = F1->nOpens, hl = H->nLooks, fl = F1->nLooks;
+        int hs = 0, fs = 0;
+        for (int st = 0; st < 625; st++) {
+            if (st % 3 != 0) { char l[100]; snprintf(l, sizeof(l), "%d 5.000 S play %d", 10 + hs, hs); append_line(H, L"host.txt", l); hs++; }
+            if (st % 62 == 0) { char l[100]; snprintf(l, sizeof(l), "%d 5.000 O play %d", 10 + fs, fs); append_line(F1, L"friend1.txt", l); fs++; }
+            step_once();
+        }
+        run_ms(500);
+        double hOps = (H->nOpens - ho) / 10.0, fOps = (F1->nOpens - fo) / 10.0;
+        printf("INFO  file opens a second by the DLL in play (10 s, host %d lines, friend %d lines): host %.1f, friend %.1f; attribute looks a second: host %.1f, friend %.1f\n",
+               hs, fs, hOps, fOps, (H->nLooks - hl) / 10.0, (F1->nLooks - fl) / 10.0);
+        char wantL[100]; snprintf(wantL, sizeof(wantL), "%d 5.000 S play %d\n", 10 + hs - 1, hs - 1);
+        check(file_has(F1, L"host.txt", wantL), "(lane 65) the %d play lines reached the friend's host.txt", hs);
+        n = file_lines(F1, L"host.txt", &v);
+        int cnt = 0, order = 1, nextId = 0;
+        for (int i = 0; i < n; i++) { const char *q = strstr(v[i], " S play "); if (q) { int id = atoi(q + 8); if (id != nextId) order = 0; nextId = id + 1; cnt++; } }
+        free_lines(v, n);
+        check(cnt == hs && order, "(lane 65) ... each once, in order (%d of %d)", cnt, hs);
+#ifdef HANDLE_IDLE_MS
+        check(hOps <= 2.0 && fOps <= 2.0, "(lane 65) no file opened per tick: host %.1f, friend %.1f opens a second (the 0.4 DLL: 132 and 173)", hOps, fOps);
+#endif
+    }
+#ifdef HANDLE_IDLE_MS
+    /* ---- (lane 65) a turnover with kept handles, then the host's game starts again and deletes the file in use */
+    {
+        wchar_t p2[MAX_PATH]; lpath(H, L"host.2.txt", p2); write_file(p2, "", 0);
+        append_line(H, L"host.txt", "900 6.000 ~NEXT 2");
+        for (int i = 0; i < 40; i++) { char l[100]; snprintf(l, sizeof(l), "%d 6.000 X seg2 %d", 901 + i, i); append_line(H, L"host.2.txt", l); if (i % 5 == 4) step_once(); }
+        ok = wait_file_has(F1, L"host.2.txt", "940 6.000 X seg2 39", 3000);
+        check(ok && F1->c->mirrors[0].seg == 2 && H->c->hostTail.seg == 2, "(lane 65) turnover: the host's tail and the friend's mirror go on in host.2.txt");
+        wchar_t fin[MAX_PATH] = L"";
+        if (F1->c->mirrors[0].h) GetFinalPathNameByHandleW(F1->c->mirrors[0].h, fin, MAX_PATH, 0);
+        check(F1->c->mirrors[0].h && wcsstr(fin, L"host.2.txt") != NULL, "(lane 65) the friend's kept write handle is of host.2.txt now");
+        check(H->c->hostTail.h != NULL, "(lane 65) the host's DLL holds host.2.txt for reading while lines come");
+        /* the host's game starts again: host.txt emptied, host.2.txt deleted while the DLL reads it (its handle shares delete) */
+        wchar_t p1[MAX_PATH]; lpath(H, L"host.txt", p1); truncate_file(p1);
+        int delOk = DeleteFileW(p2) != 0;
+        append_line(H, L"host.txt", "1 7.000 X after the second restart");
+        ok = wait_file_has(F1, L"host.txt", "1 7.000 X after the second restart", 5000);
+        n = file_lines(F1, L"host.txt", &v);
+        check(delOk && ok && n == 1 && !tw_exists(F1, L"host", 2) && H->c->hostTail.seg == 1,
+              "(lane 65) restart: the file the DLL read could be deleted; the DLL starts again at host.txt and the friend's copy has only the new line (%d lines)", n);
+        free_lines(v, n);
+    }
+    /* ---- (lane 65) a write that fails (another program locks the mirror file): the lines wait, none lost or doubled */
+    {
+        run_ms(HANDLE_IDLE_MS + 300);
+        check(F1->c->mirrors[0].h == NULL, "(lane 65) a quiet mirror's write handle is let go");
+        wchar_t p[MAX_PATH]; lpath(F1, L"host.txt", p);
+        HANDLE lk = CreateFileW(p, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+        OVERLAPPED ov; memset(&ov, 0, sizeof(ov));
+        BOOL locked = lk != INVALID_HANDLE_VALUE && LockFileEx(lk, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 0xFFFFFFFF, 0x7FFFFFFF, &ov);
+        size_t lg = log_size(F1);
+        for (int i = 0; i < 20; i++) { char l[100]; snprintf(l, sizeof(l), "%d 8.000 X locked %d", 2 + i, i); append_line(H, L"host.txt", l); }
+        run_ms(800);
+        int held = !file_has(F1, L"host.txt", "X locked 0") && log_has_from(F1, lg, "could not write to host.txt");
+        if (locked) UnlockFileEx(lk, 0, 0xFFFFFFFF, 0x7FFFFFFF, &ov);
+        if (lk != INVALID_HANDLE_VALUE) CloseHandle(lk);
+        ok = wait_file_has(F1, L"host.txt", "21 8.000 X locked 19", 3000);
+        n = file_lines(F1, L"host.txt", &v);
+        int cnt = 0, order = 1, nextId = 0;
+        for (int i = 0; i < n; i++) { const char *q = strstr(v[i], " X locked "); if (q) { int id = atoi(q + 10); if (id != nextId) order = 0; nextId = id + 1; cnt++; } }
+        free_lines(v, n);
+        check(locked && held && ok && cnt == 20 && order, "(lane 65) a write that fails: the lines wait (logged), then all 20 arrive once, in order (%d)", cnt);
+    }
+    /* ---- (lane 65) the mod's writer keeps its file open (coop.lua S.out): one append handle across 50 lines, a tick
+     * after each; the tail's "attributes first" look must still see every line */
+    {
+        wchar_t p[MAX_PATH]; lpath(H, L"host.txt", p);
+        HANDLE wh = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_ALWAYS, 0, NULL);
+        for (int i = 0; i < 50; i++) {
+            char l[100]; int k = snprintf(l, sizeof(l), "%d 9.000 X kept %d\n", 30 + i, i); DWORD w = 0;
+            WriteFile(wh, l, (DWORD)k, &w, NULL);
+            step_once();
+            if (i == 20) run_ms(HANDLE_IDLE_MS + 200);           /* a quiet second in between: the tail lets go and looks again */
+        }
+        ok = wait_file_has(F1, L"host.txt", "79 9.000 X kept 49", 3000);
+        CloseHandle(wh);
+        n = file_lines(F1, L"host.txt", &v);
+        int cnt = 0, order = 1, nextId = 0;
+        for (int i = 0; i < n; i++) { const char *q = strstr(v[i], " X kept "); if (q) { int id = atoi(q + 8); if (id != nextId) order = 0; nextId = id + 1; cnt++; } }
+        free_lines(v, n);
+        check(ok && cnt == 50 && order, "(lane 65) a writer that keeps its file open: all 50 lines arrive once, in order (%d)", cnt);
+    }
+    /* ---- (lane 65, round three) the mod's frame order. Each frame per copy, as coop.lua runs it:
+     *   before: the core reads the link files, the core writes (orders), the modules run (the Steam piece's tick among
+     *           them; a module after it writes too), so a line received this frame is read next frame, and a module's
+     *           line written after the Steam tick leaves next frame;
+     *   after:  the Steam piece's tick first, the core reads, the core and the modules write, coop_steam_flush last.
+     * Counted: frames from the host mod's line to the friend mod reading it, and from a friend module's line (written
+     * after the Steam tick in the old order) to the host mod reading it. Both include one frame of network (the mock
+     * delivers a message at the next frame's start). */
+    {
+        int res[2][2];
+        for (int mode = 0; mode < 2; mode++) {
+            run_ms(500);
+            char hl[80], fl[80]; snprintf(hl, sizeof(hl), "%d 9.500 X order-test host %d", 100 + mode, mode); snprintf(fl, sizeof(fl), "%d 9.500 O order-test friend %d", 100 + mode, mode);
+            int hostAt = -1, friendAt = -1, fRead = -1, hRead = -1;
+            for (int fr = 0; fr < 30 && (fRead < 0 || hRead < 0); fr++) {
+                g_now += 16; mock_pump();
+                Node *nn[2] = { H, F1 };
+                for (int i = 0; i < 2; i++) {
+                    Node *x = nn[i];
+                    if (mode == 1) { g_cur = x; coop_tick_safe(x->c); }              /* after: the Steam tick first */
+                    if (x == F1 && fRead < 0 && file_has(F1, L"host.txt", hl)) fRead = fr;          /* the core reads */
+                    if (x == H && hRead < 0 && file_has(H, L"friend1.txt", fl)) hRead = fr;
+                    if (x == H && fr == 2) { append_line(H, L"host.txt", hl); hostAt = fr; }        /* the core writes */
+                    if (mode == 0) { g_cur = x; coop_tick_safe(x->c); }              /* before: the Steam tick among the modules */
+                    if (x == F1 && fr == 2) { append_line(F1, L"friend1.txt", fl); friendAt = fr; } /* a module after it writes */
+                    if (mode == 1) { g_cur = x; coop_flush_safe(x->c); }             /* after: the flush last */
+                }
+                g_cur = NULL;
+            }
+            res[mode][0] = fRead < 0 ? -1 : fRead - hostAt; res[mode][1] = hRead < 0 ? -1 : hRead - friendAt;
+        }
+        printf("INFO  frames from a line written to its reading on the other copy (one frame of it is the network): host to friend %d before, %d after; a friend module's line to the host %d before, %d after\n",
+               res[0][0], res[1][0], res[0][1], res[1][1]);
+        check(res[0][0] == 2 && res[1][0] == 1, "(lane 65) a received line is read in the frame it arrived (host to friend: %d frames before, %d after)", res[0][0], res[1][0]);
+        check(res[0][1] == 3 && res[1][1] == 1, "(lane 65) a line a module writes leaves in its own frame and is read in the frame it arrives (%d frames before, %d after)", res[0][1], res[1][1]);
+    }
+#endif
+
     /* ---- oversize line is skipped, the next one goes */
     {
         char *big = (char *)malloc(70010);
@@ -1167,6 +1308,12 @@ int main(void)
 
         /* the Steam mirror in the middle of a file: friend1's current host file is locked across two turnovers */
         {
+            /* (lane 65) the DLL keeps the mirror's write handle while lines come: another program can lock the file
+             * only once that handle was let go (HANDLE_IDLE_MS without a line) */
+#ifdef HANDLE_IDLE_MS
+            run_ms(HANDLE_IDLE_MS + 300);
+            check(F1->c->mirrors[0].h == NULL, "(lane 65) a quiet mirror file's write handle is let go");
+#endif
             wchar_t p[MAX_PATH]; tw_path(F1, L"host", F1->c->mirrors[0].seg, p);
             HANDLE lk = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
             int segBefore = F1->c->mirrors[0].seg;

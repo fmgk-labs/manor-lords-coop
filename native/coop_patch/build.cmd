@@ -41,7 +41,8 @@ cl %CFLAGS% /LD coop_patch.c /Fo"%OUT%\obj\\" /Fe"%OUT%\coop_patch.dll" /link /D
 if errorlevel 1 ( popd & echo BUILD FAILED: coop_patch.dll & exit /b 1 )
 
 echo Building out\test\coop_patch.dll (test build: /DCOOP_PATCH_TEST)
-cl %CFLAGS% /DCOOP_PATCH_TEST /LD coop_patch.c /Fo"%OUT%\obj\\" /Fe"%OUT%\test\coop_patch.dll" /link /DLL /NODEFAULTLIB:msvcrt.lib kernel32.lib
+rem (lane 65) test\count_opens.h counts the test build's file opens (the mechanism test reads them)
+cl %CFLAGS% /DCOOP_PATCH_TEST /FItest\count_opens.h /LD coop_patch.c /Fo"%OUT%\obj\\" /Fe"%OUT%\test\coop_patch.dll" /link /DLL /NODEFAULTLIB:msvcrt.lib kernel32.lib
 if errorlevel 1 ( popd & echo BUILD FAILED: test coop_patch.dll & exit /b 1 )
 
 echo Building out\test\patch_test.exe

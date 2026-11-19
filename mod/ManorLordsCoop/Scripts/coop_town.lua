@@ -384,6 +384,10 @@ function T.finish(S, job, status, fwd, extra)
   T.results[tag] = status
   stat(S, ok and "t_applied" or "t_failed")
   A.log("TOWN %s %s %s (from %s, waited %.0f ms): %s", ok and "APPLIED" or "FAILED", job.act, tag, tostring(job.from), (vnow() - job.t) * 1000, tostring(status))
+  -- (lane 64) a replayed action can put a family out here (a demolished house, an upgrade) and a friend's copy houses
+  -- nobody by itself: the families get the host's homes now, in this tick (coop_x_events.lua, E.homesNow)
+  if ok and S.role == "friend" then local Ev = rawget(C, "events"); if Ev and Ev.homesNow then pcall(Ev.homesNow, "the town action " .. tostring(job.act)) end end
+  if ok and C.panels and C.panels.touched and not (C.modules and C.modules[job.origin]) then pcall(C.panels.touched, job.act, job.f and job.f[1]) end   -- (lane 69) another player's action (not a module's own line, e.g. "people"): open panels redraw (coop_x_panels.lua)
   if S.role == "host" and job.origin ~= S.name then
     if ok then
       T.out(string.format("T %s %s %s %s", job.origin, job.n, job.act, fwd or job.fields))
