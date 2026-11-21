@@ -59,6 +59,7 @@ local function setDll(path)
 end
 if not P.dll then setDll(modDir .. "/coop_patch.dll") end
 if P.wanted == nil then P.wanted = (readCfg(modDir .. "/coop.cfg").native or ""):lower() ~= "off" end   -- on by default (session 18); "native = off" in coop.cfg switches it off
+function P.cfgGet(key) return readCfg(modDir .. "/coop.cfg")[key] end      -- (lane 64, round 5) one key of coop.cfg, for another module
 
 -- ---- the DLL
 local function log(fmt, ...) if C.s then A.log("patch: " .. fmt, ...) end end
@@ -160,6 +161,14 @@ end
 function P.noTheft()
   if not P.fn then return "missing" end
   local it = P.status().items.NT
+  return it and tostring(it.state) or "missing"
+end
+
+-- (lane 64, round 5) the state of item NM (NOMOURN) on this copy: "on" = this copy's own game no longer takes a day
+-- off a home's mourning; "off", "unavailable", or "missing" (no native piece, or one older than 0.9.10)
+function P.noMourn()
+  if not P.fn then return "missing" end
+  local it = P.status().items.NM
   return it and tostring(it.state) or "missing"
 end
 
@@ -568,6 +577,29 @@ function P.endHoldSet(ceilMs, list)
   P.send(string.format("ENDHOLD SET %X %s", math.max(1, math.floor(ceilMs)), #s > 0 and table.concat(s, ",") or "-")); P.tick()
   return true
 end
+-- (lane 74, round 3) OXCART, part of PICK (coop_patch README "PICK"): a friend's ox does not take a timber cart by its
+-- own choice. P.pickOxen(addrs): the board's oxen (the whole list; {} = none). P.pickTimber(classAddr): the timber
+-- cart's class (0 = unset). Both are only stored by the DLL; an older DLL refuses them (counted as bad, nothing else).
+function P.pickOxen(addrs)
+  if not P.fn then return false end
+  local s = {}
+  for i = 1, math.min(#addrs, 64) do s[#s + 1] = string.format("%X", addrs[i]) end
+  P.send("PICK OXEN " .. (#s > 0 and table.concat(s, ",") or "-")); P.tick()
+  return true
+end
+function P.pickTimber(classAddr)
+  if not P.fn then return false end
+  P.send(string.format("PICK TIMBER %X", classAddr or 0)); P.tick()
+  return true
+end
+-- (lane 74, round 7) HANDCART, part of PICK (coop_patch README "PICK"): a friend's villager does not take a hand cart by
+-- its own choice. P.pickHandcart(classAddr): the hand cart's class (0 = unset); only stored by the DLL; an older DLL
+-- refuses it (counted as bad, nothing else).
+function P.pickHandcart(classAddr)
+  if not P.fn then return false end
+  P.send(string.format("PICK HANDCART %X", classAddr or 0)); P.tick()
+  return true
+end
 function P.pickSet(list)
   if not P.fn then return false end
   local s = {}
@@ -614,6 +646,40 @@ function P.fell(region, x, y)
   if t - fellT > 10.0 then fellT = t; local it = P.status().items.FELL; fellOk = it ~= nil and it.state == "available" end
   if not fellOk then return false end
   P.send(string.format("FELL %X %d %d", region, math.floor(x + 0.5), math.floor(y + 0.5))); P.tick()
+  return true
+end
+
+-- (lane 88) MERCCUT: a friend's list of mercenary offers shortened to the host's length (coop_patch README "MERCCUT";
+-- lanes/lane_s21_88/design_mercs.txt). P.mercAvail() says whether the item is there (asked at most every 10 s);
+-- P.mercCut(engine, list, now, want) sends the command (engine: the RTSMultiEngineCPP's address; list: the address
+-- the script layer gives for engine.availableMercs) and runs the tick, so the cut is done when it returns.
+local mercOk, mercT = false, -100
+function P.mercAvail()
+  if not P.fn then return false end
+  local t = os.clock()
+  if t - mercT > 10.0 then mercT = t; local it = P.status().items.MERCCUT; mercOk = it ~= nil and it.state == "available" end
+  return mercOk
+end
+function P.mercCut(engine, list, now, want)
+  if not P.mercAvail() then return false end
+  P.send(string.format("MERCCUT %X %X %d %d", engine, list, now, want)); P.tick()
+  return true
+end
+
+-- (lane 87) NOROLL: a friend's own mercenary month roll returns at once (coop_patch README "NOROLL";
+-- lanes/lane_s21_87/design_noroll.txt). Switched by the values module (coop_x_values.lua, beside MROLL).
+-- P.noRollOn() says whether it is on here now (the status file, read at most once a second). P.noRollPass() lets the
+-- NEXT call of the game's roll through, once, and runs the tick: the caller makes that call right after it, in the
+-- same tick (the realm module, when this copy holds fewer offers than the host). Only while this copy's own notices
+-- are dropped (NOLOG): the roll gives its player the notice "mercenaries_available", which a friend takes from the host.
+function P.noRollOn()
+  if not P.fn then return false end
+  local it = P.status().items.NOROLL
+  return it ~= nil and it.state == "on"
+end
+function P.noRollPass()
+  if not (P.noRollOn() and P.nlOn == true) then return false end
+  P.send("NOROLL PASS"); P.tick()
   return true
 end
 
@@ -673,7 +739,7 @@ local function step(S, inWorld)
       -- each time (sitting n1: MEN HOOK ON, ALLOFF 50 ms later, every 2 s; 53 table empties in a minute)
       for name, it in pairs(P.status().items) do if it.state == "on" and name ~= "SNAP" and name ~= "GUARD" and not (keep and name == "GOODS") then again = true end end
     end
-    if not P.hostOff or again then P.hostOff = true; P.hostT = os.clock(); P.send("ALLOFF"); P.gOn = false; P.tOn = false; P.hOn = false; P.ndOn = false; log("host copy: ALLOFF (TOTALS: recount)") end
+    if not P.hostOff or again then P.hostOff = true; P.hostT = os.clock(); P.send("ALLOFF"); P.gOn = false; P.tOn = false; P.hOn = false; P.ndOn = false; P.tkOn = false; log("host copy: ALLOFF (TOTALS: recount)") end
     if keep then goodsStep(S, inWorld and not C.hold) end
   elseif S.role == "friend" then
     if inWorld and P.sentWorld ~= S.worlds then
@@ -688,7 +754,13 @@ local function step(S, inWorld)
       -- theft happens only on the host and the events module tells it (E T). A DLL older than 0.9.2 does not know the
       -- command and logs it as unknown: then the friend's own theft and banner stay (the events module logs that).
       P.send("NOTHEFT ON")
-      log("friend copy, world %d: NOKILL ON, NOROUT ON, NOREGION ON, NOTHEFT ON", S.worlds)
+      -- NOMOURN (lane 64, round 5): a friend's game no longer takes a day off a home's mourning at its own day change;
+      -- the days are the host's alone (the facts module writes each host value as it comes). Before, the friend's own
+      -- day step took a day off the value the host's line had already put right: one day less than the host for a
+      -- frame after a reload. A DLL older than 0.9.10 does not know the command: the facts module then keeps its
+      -- one-day rule (it asks P.noMourn).
+      P.send("NOMOURN ON")
+      log("friend copy, world %d: NOKILL ON, NOROUT ON, NOREGION ON, NOTHEFT ON, NOMOURN ON", S.worlds)
     end
     -- NOFINISH: on a friend's copy the game does not finish a building by itself; the host says when (the sites module
     -- calls FINISH). Each copy's builders pick their sites in their own order, so without this a friend could finish a
@@ -748,6 +820,16 @@ local function step(S, inWorld)
     holdStep(S, P.gOn == true and P.goodsOn() and not (P.test and P.test.holdOff))
     -- DIST (lane 42) follows GOODS too: the host's market goods of houses come in exact mode
     distStep(S, P.gOn == true and P.goodsOn() and not (P.test and P.test.distOff))   -- (lane 35: test switch distOff, like goodsOff)
+    -- TRK (lane 83, native 0.9.15; the time adds from 0.9.16) follows GOODS too: this copy's own villagers' work no longer goes into a building's
+    -- production log (the panel's goods made and yield status); the host's log is carried (coop_x_stats.lua, TRKSET).
+    -- TRKHOLD ON every second is the keepalive: without it for 5 s the native piece lets the game's calls through.
+    -- Off while a save loads, at a release, when the host goes silent (exact mode left). (test only: Coop.patch.test =
+    -- { trkOff = true } keeps it off: the control run)
+    do
+      local wantTK = P.gOn == true and P.goodsOn() and not (P.test and P.test.trkOff)
+      if wantTK and os.clock() - (P.tkT or -1e9) >= 1.0 then P.tkT = os.clock(); P.send("TRKHOLD ON"); if not P.tkOn then P.tkOn = true; log("friend copy: TRKHOLD ON (this copy's own production entries skipped; the host's carried)") end
+      elseif not wantTK and P.tkOn then P.tkOn = false; P.send("TRKHOLD OFF"); log("friend copy: TRKHOLD OFF") end
+    end
     -- NOREGION (the lead, 2026-11-13): the log says so whenever the native piece turned a null region away (each one
     -- would have closed this copy's game), and once when the item is not available
     if os.clock() - (P.nrT or 0) > 5.0 then

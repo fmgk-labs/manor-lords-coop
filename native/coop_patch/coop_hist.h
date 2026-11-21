@@ -60,6 +60,7 @@
 typedef void (*hadd_fn)(void *tracker, int good, int amount, void *worker);
 static struct { int avail; int hadd; int mapadd; char why[160], hwhy[160]; unsigned reads, files, calls, refused, bad, faults; } HST;
 static struct { unsigned sets, entries, shrunk, shorts, nokeys, grows, keyadds, expsets; } HTS;     /* TRKSET (lane 72, game run) */
+static volatile int g_trk_native;          /* (lane 83) set while this DLL itself calls the game's add routine: TRK's gate lets it through */
 
 static int hist_status(char *buf, size_t len)
 {
@@ -360,11 +361,13 @@ static void hist_tryadd(int argc, char **argv)
     if (!eng || !comp_sane((unsigned long long)(uintptr_t)eng, 0x10A8, why, sizeof(why))) { HST.bad++; log_line("HIST TRYADD refused: the owner's engine (+2E8h): %s", eng ? why : "none"); return; }
     if (!wm || !comp_sane((unsigned long long)(uintptr_t)wm, HS_WEATHER_DAY + 8, why, sizeof(why))) { HST.bad++; log_line("HIST TRYADD refused: the weather master (+118h): %s", wm ? why : "none"); return; }
     __try {
+        g_trk_native = 1;                                  /* (lane 83: TRK lets this DLL's own call through) */
         ((hadd_fn)(void *)(g_base + g_hit[S_HADD].rva))((void *)(uintptr_t)t, good, amount, NULL);
+        g_trk_native = 0;
         HST.calls++;
         log_line("HIST TRYADD %llX good %d amount %d: called", t, good, amount);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) { HST.faults++; log_line("HIST TRYADD: exception %08lX inside the game's add routine", GetExceptionCode()); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_trk_native = 0; HST.faults++; log_line("HIST TRYADD: exception %08lX inside the game's add routine", GetExceptionCode()); }
 }
 
 /* HIST TRKDUMP <tag> <tracker>[,<tracker>...]   hist_trk_<tag>.txt: each tracker's production log, read from its map
@@ -429,7 +432,7 @@ static int hist_hadd_sane(uint8_t *t)
     if (!eng || !comp_sane((unsigned long long)(uintptr_t)eng, 0x10A8, why, sizeof(why))) return 0;
     return wm && comp_sane((unsigned long long)(uintptr_t)wm, HS_WEATHER_DAY + 8, why, sizeof(why));
 }
-static void hist_hadd(uint8_t *t, int good) { ((hadd_fn)(void *)(g_base + g_hit[S_HADD].rva))((void *)t, good, 0, NULL); }
+static void hist_hadd(uint8_t *t, int good) { g_trk_native = 1; __try { ((hadd_fn)(void *)(g_base + g_hit[S_HADD].rva))((void *)t, good, 0, NULL); } __finally { g_trk_native = 0; } }   /* (lane 83: TRK lets this DLL's own call through) */
 
 static void hist_trkset(int argc, char **argv)
 {
@@ -640,14 +643,19 @@ static void hist_gridset(int argc, char **argv)
         queued += hist_gq_flush(e);
         if (!hist_grid(e, &g, &side)) { bad++; }
         else while (fgets(line, 8192, f)) {
-            int y, x0, x, k, pos = 0; char *s;
+            int y, x0, x, k, pos = 0, j, need; uint32_t mask; char *s;
             if (sscanf_s(line, "%d %d %n", &y, &x0, &pos) < 2 || pos <= 0 || y < 0 || y >= side || x0 < 0 || x0 + HS_GBLK > side || (x0 % HS_GBLK)) { bad++; continue; }
             s = line + pos;
-            if (strlen(s) < (size_t)HS_GBLK * 32) { bad++; continue; }
+            /* (lane 83) the masked form: "<mask 8 hex> <the cells of the set bits>"; else all 32 cells */
+            mask = 0xFFFFFFFFu; j = 0; need = HS_GBLK;
+            if (strlen(s) > 9 && s[8] == ' ' && hist_hex8(s, &mask)) { s += 9; need = 0; for (x = 0; x < HS_GBLK; x++) if ((mask >> x) & 1u) need++; }
+            if (strlen(s) < (size_t)need * 32) { bad++; continue; }
             for (x = 0; x < HS_GBLK; x++) {
                 uint32_t v[4]; int ok = 1, changed = 0; size_t idx = (size_t)y * (size_t)side + (size_t)(x0 + x);
                 uint32_t *c = (uint32_t *)(g + idx * HS_CELL);
-                for (k = 0; k < 4; k++) ok &= hist_hex8(s + x * 32 + k * 8, &v[k]);
+                if (!((mask >> x) & 1u)) continue;
+                for (k = 0; k < 4; k++) ok &= hist_hex8(s + j * 32 + k * 8, &v[k]);
+                j++;
                 if (!ok) { bad++; break; }
                 for (k = 0; k < 4; k++) if (c[k] != v[k]) changed = 1;
                 cells++;
@@ -669,6 +677,92 @@ static void hist_gridset(int argc, char **argv)
     HGS.sets += sets; HGS.cells += cells; HGS.queued += queued; HGS.full += full; HGS.bad += bad;
     hb_put(&b, "cells %u changed %u queued %u deferred %u bad %u pending %d\r\n", cells, sets, queued, full, bad, g_gpn);
     hb_write(&b, "gset", argv[3]);
+}
+
+/* ------------------------------------------------------------------ the fertility grid cell by cell (lane 83)
+ * A row the friend asks for usually differs in a few cells only: the friend sends a short hash of each cell of such a
+ * row and the host answers with the cells that differ, not the whole row (32 cells, 1 KB of text).
+ *   HIST GRIDCH <engine> <tag> <y>:<x0>,...      hist_gch_<tag>.txt "<y> <x0> <32 x 4 hex digits> R <row hash>": each
+ *                                                 cell's 16-bit hash (exact bits) of that row's 32 cells from x0, and the
+ *                                                 row's own hash (as GRIDROWS gives it)
+ *   HIST GRIDDIFF <engine> <tag>                 reads hist_gdin_<tag>.txt (lines as GRIDCH writes them, the other
+ *                                                 copy's), writes hist_gdiff_<tag>.txt "<y> <x0> <mask 8 hex> <cell hex
+ *                                                 for each set bit, x0 upward>" for each row whose mask is not 0; a row
+ *                                                 whose row hash differs while no cell hash does (a 16-bit collision)
+ *                                                 is sent whole (mask FFFFFFFF); last line "END rows cells whole bad"
+ *   GRIDSET also takes the masked form: "<y> <x0> <mask 8 hex> <cells of the set bits>". */
+static uint32_t hist_cellhash(const uint32_t *c) { uint32_t h = 2166136261u; int k; for (k = 0; k < 4; k++) h = hist_fnv(h, c[k]); return (h ^ (h >> 16)) & 0xFFFFu; }
+static void hist_gridch(int argc, char **argv)
+{
+    unsigned long long a; hbuf b = { 0 }; char *list, *tok, *ctx = NULL; int n = 0;
+    if (argc != 5 || !hist_tag(argv[3])) { HST.bad++; log_line("HIST refused: GRIDCH <engine> <tag> <y>:<x0>,..."); return; }
+    if (!hist_obj(argv[2], &a, HS_GQUEUE + 16, "GRIDCH engine")) return;
+    list = _strdup(argv[4]); if (!list) return;
+    __try {
+        uint8_t *g; int32_t side;
+        if (!hist_grid((uint8_t *)(uintptr_t)a, &g, &side)) { HST.bad++; hb_put(&b, "grid BAD\r\n"); }
+        else for (tok = strtok_s(list, ",", &ctx); tok && n < 4096; tok = strtok_s(NULL, ",", &ctx), n++) {
+            int y, x0, x; char *c = strchr(tok, ':');
+            if (!c) { hb_put(&b, "%s BAD\r\n", tok); continue; }
+            *c = 0;
+            if (!hist_num(tok, &y) || !hist_num(c + 1, &x0) || y < 0 || y >= side || x0 < 0 || x0 % HS_GBLK || x0 + HS_GBLK > side) { hb_put(&b, "%s:%s BAD\r\n", tok, c + 1); continue; }
+            hb_put(&b, "%d %d ", y, x0);
+            for (x = x0; x < x0 + HS_GBLK; x++) hb_put(&b, "%04X", hist_cellhash((const uint32_t *)(g + ((size_t)y * (size_t)side + (size_t)x) * HS_CELL)));
+            hb_put(&b, " R %08X\r\n", hist_rowhash(g, side, y, x0));
+        }
+        HST.reads++;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { HST.faults++; log_line("HIST GRIDCH: exception %08lX", GetExceptionCode()); hb_put(&b, "FAULT\r\n"); }
+    free(list);
+    hb_write(&b, "gch", argv[3]);
+}
+static int hist_hex4(const char *s, uint32_t *v)
+{
+    int i; uint32_t x = 0;
+    for (i = 0; i < 4; i++) { char c = s[i]; x <<= 4; if (c >= '0' && c <= '9') x |= (uint32_t)(c - '0'); else if (c >= 'A' && c <= 'F') x |= (uint32_t)(c - 'A' + 10); else if (c >= 'a' && c <= 'f') x |= (uint32_t)(c - 'a' + 10); else return 0; }
+    *v = x; return 1;
+}
+static void hist_griddiff(int argc, char **argv)
+{
+    unsigned long long a; wchar_t p[MAX_PATH]; FILE *f = NULL; hbuf b = { 0 }; char *line; unsigned rows = 0, cells = 0, whole = 0, bad = 0;
+    if (argc != 4 || !hist_tag(argv[3])) { HST.bad++; log_line("HIST refused: GRIDDIFF <engine> <tag>"); return; }
+    if (!hist_obj(argv[2], &a, HS_GQUEUE + 16, "GRIDDIFF engine")) return;
+    _snwprintf(p, MAX_PATH - 1, L"%shist_gdin_%S.txt", g_dir, argv[3]); p[MAX_PATH - 1] = 0;
+    if (_wfopen_s(&f, p, L"rb") != 0 || !f) { HST.bad++; log_line("HIST GRIDDIFF: no hist_gdin_%s.txt", argv[3]); return; }
+    line = (char *)malloc(1024); if (!line) { fclose(f); return; }
+    __try {
+        uint8_t *g; int32_t side;
+        if (!hist_grid((uint8_t *)(uintptr_t)a, &g, &side)) { bad++; }
+        else while (fgets(line, 1024, f)) {
+            int y, x0, x, k, pos = 0, okc = 1; char *s, *r; uint32_t mask = 0, other = 0, rh = 0; int haveR = 0;
+            if (sscanf_s(line, "%d %d %n", &y, &x0, &pos) < 2 || pos <= 0 || y < 0 || y >= side || x0 < 0 || x0 % HS_GBLK || x0 + HS_GBLK > side) { bad++; continue; }
+            s = line + pos;
+            if (strlen(s) < (size_t)HS_GBLK * 4) { bad++; continue; }
+            for (x = 0; x < HS_GBLK; x++) {
+                if (!hist_hex4(s + x * 4, &other)) { okc = 0; break; }
+                if (hist_cellhash((const uint32_t *)(g + ((size_t)y * (size_t)side + (size_t)(x0 + x)) * HS_CELL)) != other) mask |= 1u << x;
+            }
+            if (!okc) { bad++; continue; }
+            r = strstr(s + HS_GBLK * 4, "R ");
+            if (r && strlen(r) >= 10 && hist_hex8(r + 2, &rh)) haveR = 1;
+            if (mask == 0 && haveR && rh != hist_rowhash(g, side, y, x0)) { mask = 0xFFFFFFFFu; whole++; }
+            if (mask == 0) continue;
+            hb_put(&b, "%d %d %08X ", y, x0, mask); rows++;
+            for (x = 0; x < HS_GBLK; x++) {
+                const uint32_t *c;
+                if (!((mask >> x) & 1u)) continue;
+                c = (const uint32_t *)(g + ((size_t)y * (size_t)side + (size_t)(x0 + x)) * HS_CELL);
+                for (k = 0; k < 4; k++) hb_put(&b, "%08X", c[k]);
+                cells++;
+            }
+            hb_put(&b, "\r\n");
+        }
+        HST.reads++;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { HST.faults++; log_line("HIST GRIDDIFF: exception %08lX", GetExceptionCode()); bad++; }
+    fclose(f); free(line);
+    hb_put(&b, "END rows %u cells %u whole %u bad %u\r\n", rows, cells, whole, bad);
+    hb_write(&b, "gdiff", argv[3]);
 }
 
 /* HIST HSET <subsystem> <tag>   the region history written in place (lane 72, the region graphs, no hook). Reads
@@ -785,6 +879,8 @@ static void hist_cmd(int argc, char **argv)
     if (_stricmp(argv[1], "GRIDGET") == 0) { hist_gridget(argc, argv); return; }
     if (_stricmp(argv[1], "GRIDSET") == 0) { hist_gridset(argc, argv); return; }
     if (_stricmp(argv[1], "GRIDFLUSH") == 0) { hist_gridflush(argc, argv); return; }
+    if (_stricmp(argv[1], "GRIDCH") == 0) { hist_gridch(argc, argv); return; }
+    if (_stricmp(argv[1], "GRIDDIFF") == 0) { hist_griddiff(argc, argv); return; }
     if (_stricmp(argv[1], "HSET") == 0) { hist_hset(argc, argv); return; }
     if (_stricmp(argv[1], "MAPADD") == 0) { hist_mapadd_cmd(argc, argv); return; }
     HST.bad++; log_line("HIST refused: unknown '%.20s'", argv[1]);

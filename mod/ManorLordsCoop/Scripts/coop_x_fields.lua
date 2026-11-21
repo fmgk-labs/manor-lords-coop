@@ -71,6 +71,29 @@ local function send(line) A.send(line); bump("sent"); bump("bytes", #line + 20) 
 -- a building that is still in the game: valid, in the engine's list (the index is rebuilt every cfg.indexEvery s) and
 -- with a region (a demolished building stays a valid object for a while but has none: lanes/lane_s21_0/crash_demolish_site)
 local function live(b) local ok, r = pcall(function() return valid(b) and valid(b.Region) end); return ok and r end
+-- (lane 88) the session check's timing proof (a test tool, off for players): the field's row of the wide section fd
+-- (sown, unploughed, ready, yield ...) noted with the moment it is known here: on the host at the poll that sent its
+-- change (a friend shows exactly those values), on a friend right after it wrote the host's change. Without the
+-- note the host's rounds (every 0.2 s) missed values a harvest held for less than that, and the check counted the
+-- friend's value as one "the host never had" (r27m83: 22, r27cf: 17; every one lay between two host reads).
+-- The building is found by its place in the engine's list (a map address -> place, made again every second) and taken
+-- from the list in this tick (a fresh handle, checked against its address), never through a handle kept in the index.
+local function note(k)
+  local W = rawget(C, "world")
+  if not (W and W.cfg and W.cfg.proof and W.proofNote) then return end
+  local e = P.idx and P.idx[k]; if not (e and e.a) then return end
+  local S = C.s; if not (S and valid(S.eng)) then return end
+  local now = os.clock()
+  if not P.noteMapT or now - P.noteMapT >= 1.0 then     -- (made again every second, not at every note: run l88b, 16 to 20 ms a frame on the host)
+    P.noteMapT = now; P.noteMap = {}
+    local arr = S.eng.buildingArr; local n = #arr
+    for i = 1, n do local b = un(arr[i]); local a = valid(b) and addr(b); if a then P.noteMap[a] = i end end
+  end
+  local i = P.noteMap[e.a]; if not i then return end
+  local arr = S.eng.buildingArr; if i > #arr then return end
+  local b = un(arr[i])
+  if live(b) and addr(b) == e.a then if pcall(W.proofNote, b, nil, "fd") then bump("proofNotes") end else P.noteMapT = nil end   -- (moved in the list: the map again)
+end
 
 -- every building that has plants or is a field (type 39): key -> { b, a }. Built a few buildings a tick (a whole pass
 -- at once took up to 57 ms on the host: one hitch every 5 s); P.idx is the last complete pass. Returns true when a pass
@@ -205,7 +228,7 @@ local function friendValues(S, clock)
           local c = isB and (cur and 1 or 0) or cur
           if want[j] ~= nil and c ~= want[j] and (not nat or p == "forceHarvest") then
             if isB then e.b[p] = (want[j] == 1) else e.b[p] = want[j] end
-            bump("valFix"); bump("valFix_" .. p)
+            bump("valFix"); bump("valFix_" .. p); P.noteQ = P.noteQ or {}; P.noteQ[k] = true
           end
         end
       end)
@@ -258,7 +281,7 @@ local function hostTick(S, clock)
     local k = a and P.byA[a:upper()]
     if k then
       P.crc[k] = n .. " " .. crc
-      if ops ~= "-" then send(string.format("Y S %s %s %s", k, n, ops)); bump("lines") end
+      if ops ~= "-" then send(string.format("Y S %s %s %s", k, n, ops)); bump("lines"); note(k) end
     elseif a then bump("unknownField") end
   end
   if clock - (P.t.check or -99) >= P.cfg.checkEvery then
@@ -362,7 +385,7 @@ local function onLine(S, w)
       p.send("FIELD HOLD " .. tostring(e.a)); P.held[k] = e.a
       send("Y F " .. k); bump("askedWhole")                     -- this copy holds it from now on: the host sends it whole
     end
-    if what == "S" then p.send(string.format("FIELD SET %s %s %s", tostring(e.a), w[6], w[7])); bump("sets")
+    if what == "S" then p.send(string.format("FIELD SET %s %s %s", tostring(e.a), w[6], w[7])); bump("sets"); P.noteQ = P.noteQ or {}; P.noteQ[k] = true
     else p.send(string.format("FIELD CHECK %s %s %s", tostring(e.a), w[6], w[7])); bump("checks") end
     P.dirty = true
   elseif what == "B" then
@@ -382,6 +405,13 @@ local function tick(S, clock)
   local t0 = os.clock()
   if S.role == "host" then hostTick(S, clock) else friendTick(S, clock) end
   if P.dirty then P.dirty = false; local p = patch(); if p then p.tick() end end
+  if P.noteQ then local q = P.noteQ; P.noteQ = nil; for k in pairs(q) do note(k) end end   -- (lane 88) after the writes of this tick
+  -- (lane 88) and every field every 0.25 s (the check's rounds do not read fd: coop_world.lua cfg.proofNoted)
+  local Wn = rawget(C, "world")
+  if P.idx and Wn and Wn.cfg and Wn.cfg.proof and clock - (P.t.notes or -99) >= 0.25 then
+    P.t.notes = clock
+    for k in pairs(P.idx) do note(k) end
+  end
   local ms = (os.clock() - t0) * 1000
   bump("ticks"); bump("tickMs", ms); if ms > (P.stats.tickMax or 0) then P.stats.tickMax = ms end
   if clock - (P.t.log or -99) >= P.cfg.logEvery then P.t.log = clock; log("%s", P.status()) end
@@ -441,6 +471,12 @@ do
     local ok, r = pcall(chunk)
     if not ok then A.log("values: coop_x_values.lua failed: %s", tostring(r)) end
   elseif err and not tostring(err):find("No such file") then A.log("values: coop_x_values.lua cannot be read: %s", tostring(err)) end
+  -- (lane 88) the felled trees module (coop_x_trees.lua), the same way
+  local tchunk, terr = loadfile((here:match("^(.*)/[^/]*$") or ".") .. "/coop_x_trees.lua")
+  if tchunk then
+    local ok, r = pcall(tchunk)
+    if not ok then A.log("trees: coop_x_trees.lua failed: %s", tostring(r)) end
+  elseif terr and not tostring(terr):find("No such file") then A.log("trees: coop_x_trees.lua cannot be read: %s", tostring(terr)) end
 end
 
 return "coop_x_fields " .. P.version .. " loaded"

@@ -130,7 +130,15 @@ local function matsOf(c)
   pcall(function()
     for i = 0, c:GetNumMaterials() - 1 do
       local mt = c:GetMaterial(i); local p = "-"
-      if mt and mt:IsValid() then pcall(function() local s = mt:GetFullName():match("^%S+%s+(.+)$"); if s and not s:find("Transient", 1, true) then p = s end end) end
+      if mt and mt:IsValid() then
+        pcall(function()
+          local full = mt:GetFullName()
+          -- (lane 87, the cottage pieces) a dynamic material (made at run time, so of no path) names its parent: the
+          -- drawn-parts check (lane 83's dp83.lua) reads it so too; drawn with the parent on a friend
+          if full:match("^MaterialInstanceDynamic ") then local par = mt.Parent; if par and par:IsValid() then full = par:GetFullName() end end
+          local s = full:match("^%S+%s+(.+)$"); if s and not s:find("Transient", 1, true) then p = s end
+        end)
+      end
       t[#t + 1] = p
     end
   end)
@@ -143,7 +151,68 @@ end
 local function pieceOrigin(B)
   return rnd(B.X / 10) * 10, rnd(B.Y / 10) * 10, rnd(B.Z)
 end
--- a piece read in full: its record (text, hash, mesh path) or false (not to be counted: a ground-texture piece)
+-- a place, a turn and a scale as a piece's tail: cm from the building's origin, degrees, scale x100 (the last five only
+-- when they are not 0, 0, 100, 100, 100)
+local function tailOf(L, R, Sc, B)
+  local p, r = rnd(R.Pitch), rnd(R.Roll)
+  local sx, sy, sz = rnd(Sc.X * 100), rnd(Sc.Y * 100), rnd(Sc.Z * 100)
+  local bx, by, bz = pieceOrigin(B)
+  local tail = string.format("%d:%d:%d:%d", rnd(L.X) - bx, rnd(L.Y) - by, rnd(L.Z) - bz, rnd(R.Yaw) % 360)
+  if p ~= 0 or r ~= 0 or sx ~= 100 or sy ~= 100 or sz ~= 100 then tail = tail .. string.format(":%d:%d:%d:%d:%d", p, r, sx, sy, sz) end
+  return tail
+end
+-- (lane 87, the cottage pieces) A piece's actor can hold more mesh components than its root: run 21 of lane 83, the house
+-- 3@9531,7663, a cottage part (SM_MERGED_C_SG_Cottage_LV1_BPart_B_UBeam) with a door (UDoor_Poor_110x170_A) at 207.9,
+-- 114.3, 34.9 cm from the actor; a friend that lacks the part drew the host's with its root mesh only, no door; the
+-- upgraded cottage 8@9109,7551 25 meshes short (doors, stairs, bales, a bag, stones, grass, GroundBlenderA). Every
+-- other StaticMeshComponent of the actor that has a mesh, is visible and has no runtime virtual texture is part of the
+-- piece: its mesh and its own place, turn and scale from the building's origin (lane 87's read: the door sits at the same
+-- place on both copies, to the tenth). Sorted by their text, so the same piece reads the same on both copies. nx: how
+-- many other components with a mesh it has, visible or not (a piece with any is read again at its building's reads: the
+-- game may show or hide one).
+-- (lane 87, the cottage pieces; the advisor's review) a component that moves by itself on each copy (a door a villager
+-- opens, a tool in use: lane 83's rule, meshes UDoor_* and tool_*) is matched by its mesh, place and scale, not its
+-- turn: else a read that met a door half open would make a friend hide its own part and draw the host's, with the door
+-- frozen. Its whole tail (the turn of the read) still travels, for drawing.
+local function animates(m) local n = m:match("([^/%.]+)%.[^/%.]+$") or m:match("([^/]+)$") or m; return n:find("^UDoor_") ~= nil or n:find("^tool_") ~= nil end
+local function matchOf(m, tail)
+  if not animates(m) then return m .. ":" .. tail end
+  local x, y, z, rest = tail:match("^(%-?%d+):(%-?%d+):(%-?%d+):(.*)$")
+  if not x then return m .. ":" .. tail end
+  local sc = rest:match("^%-?%d+:%-?%d+:%-?%d+:(%-?%d+:%-?%d+:%-?%d+)$")       -- yaw, pitch, roll, then the scale
+  return m .. ":" .. x .. ":" .. y .. ":" .. z .. ":~" .. (sc and (":" .. sc) or "")
+end
+local SMC
+local function extrasOf(x, c, B)
+  SMC = SMC or StaticFindObject("/Script/Engine.StaticMeshComponent")
+  if not valid(SMC) then return nil, 0 end
+  local arr = x:K2_GetComponentsByClass(SMC)
+  local n = #arr
+  local t, nx = nil, 0
+  local ra = c:GetAddress()
+  for i = 1, n do
+    local k = un(arr[i])
+    if valid(k) and k:GetAddress() ~= ra then
+      local km = k.StaticMesh
+      if valid(km) then
+        nx = nx + 1
+        if k:IsVisible() and not k.bHiddenInGame then
+          local nv = 0; pcall(function() nv = #k.RuntimeVirtualTextures end)
+          local m2 = nv == 0 and meshPath(km) or nil
+          if m2 then
+            if Q.matsOf[m2] == nil then Q.matsOf[m2] = matsOf(k) end
+            local tl = tailOf(k:K2_GetComponentLocation(), k:K2_GetComponentRotation(), k:K2_GetComponentScale(), B)
+            t = t or {}; t[#t + 1] = { m = m2, t = tl, s = matchOf(m2, tl) }
+          end
+        end
+      end
+    end
+  end
+  if t then table.sort(t, function(a, b) return a.s < b.s end) end
+  return t, nx
+end
+-- a piece read in full: its record (text, hash, mesh path; x: its other mesh components, nx: how many it has) or false
+-- (not to be counted: a ground-texture piece)
 local function readRec(x, c, B)
   if not (valid(x) and valid(c)) then return nil end
   local nv = 0; pcall(function() nv = #c.RuntimeVirtualTextures end)
@@ -151,14 +220,12 @@ local function readRec(x, c, B)
   local mo = c.StaticMesh; if not valid(mo) then return nil end
   local m = meshPath(mo); if not m then return nil end
   if Q.matsOf[m] == nil then Q.matsOf[m] = matsOf(c) end
-  local L = x:K2_GetActorLocation(); local R = x:K2_GetActorRotation(); local Sc = x:GetActorScale3D()
-  local p, r = rnd(R.Pitch), rnd(R.Roll)
-  local sx, sy, sz = rnd(Sc.X * 100), rnd(Sc.Y * 100), rnd(Sc.Z * 100)
-  local bx, by, bz = pieceOrigin(B)
-  local tail = string.format("%d:%d:%d:%d", rnd(L.X) - bx, rnd(L.Y) - by, rnd(L.Z) - bz, rnd(R.Yaw) % 360)
-  if p ~= 0 or r ~= 0 or sx ~= 100 or sy ~= 100 or sz ~= 100 then tail = tail .. string.format(":%d:%d:%d:%d:%d", p, r, sx, sy, sz) end
+  local tail = tailOf(x:K2_GetActorLocation(), x:K2_GetActorRotation(), x:GetActorScale3D(), B)
   local s = m .. ":" .. tail
-  return { m = m, t = tail, s = s, h = strHash(s) }
+  local okX, xs, nx = pcall(extrasOf, x, c, B)                         -- (lane 87, the cottage pieces)
+  if not okX then xs, nx = nil, 0; bump("extraReadErr") end
+  if xs then for _, e in ipairs(xs) do s = s .. "|" .. e.s end; bump("extraRead", #xs) end   -- (e.s: the match form)
+  return { m = m, t = tail, s = s, h = strHash(s), x = xs, nx = nx }
 end
 
 -- read list place j of the building (x the actor there now): visibility only when the same actor stands there
@@ -186,6 +253,12 @@ local function readSlot(Bd, j, x, B, trust)
       local on = okV and v == true
       if on and slot.mine then local okH, h = pcall(hiddenOf, x); on = okH and h == false end
       slot.on = on
+      -- (lane 87, the cottage pieces) a piece with other mesh components is read again in full (the game may show or
+      -- hide one of them; its text then changes)
+      if (slot.rec.nx or 0) > 0 and not trust then
+        local okF, _, rec2 = pcall(fullOf, x, B)
+        if okF and rec2 and rec2.s ~= slot.rec.s then slot.rec = rec2; bump("extraChanged") end
+      end
     end
     Q.nFast = Q.nFast + 1; return
   end
@@ -216,20 +289,26 @@ local function numbered(m)
   return n
 end
 
--- counts of the drawn texts: { [text] = { n = count, m = mesh, t = tail } }
+-- counts of the drawn texts: { [text] = { n = count, m = mesh, t = tail, x = other components } }
 local function countsOf(Bd)
   local c = {}
   for j = 1, Bd.n do
     local s = Bd.slots[j]
-    if s and s.on and s.rec then local e = c[s.rec.s]; if e then e.n = e.n + 1 else c[s.rec.s] = { n = 1, m = s.rec.m, t = s.rec.t } end end
+    if s and s.on and s.rec then local e = c[s.rec.s]; if e then e.n = e.n + 1 else c[s.rec.s] = { n = 1, m = s.rec.m, t = s.rec.t, x = s.rec.x } end end
   end
   return c
+end
+-- a piece on the wire: "<mesh n>:<tail>", then "|<mesh n>:<tail>" for each of its other mesh components (lane 87)
+local function wireOf(e)
+  local it = numbered(e.m) .. ":" .. e.t
+  if e.x then for _, x in ipairs(e.x) do it = it .. "|" .. numbered(x.m) .. ":" .. x.t end end
+  return it
 end
 
 local function sendFull(key, cnt, z)
   local parts, buf, len = {}, {}, 0
   for _, e in pairs(cnt) do
-    local it = numbered(e.m) .. ":" .. e.t
+    local it = wireOf(e)
     for _ = 1, e.n do
       if len + #it + 1 > cfg.maxLine and #buf > 0 then parts[#parts + 1] = table.concat(buf, ";"); buf = {}; len = 0 end
       buf[#buf + 1] = it; len = len + #it + 1
@@ -246,10 +325,10 @@ local function sendDelta(key, old, cnt, total)
   local d, len = {}, 0
   for s, e in pairs(cnt) do
     local o = old[s]; local diff = e.n - (o and o.n or 0)
-    if diff ~= 0 then local it = numbered(e.m) .. ":" .. e.t; for _ = 1, math.abs(diff) do d[#d + 1] = (diff > 0 and "+" or "-") .. it; len = len + #it + 2 end end
+    if diff ~= 0 then local it = wireOf(e); for _ = 1, math.abs(diff) do d[#d + 1] = (diff > 0 and "+" or "-") .. it; len = len + #it + 2 end end
   end
   for s, o in pairs(old) do
-    if not cnt[s] then local it = numbered(o.m) .. ":" .. o.t; for _ = 1, o.n do d[#d + 1] = "-" .. it; len = len + #it + 2 end end
+    if not cnt[s] then local it = wireOf(o); for _ = 1, o.n do d[#d + 1] = "-" .. it; len = len + #it + 2 end end
   end
   if #d == 0 then return true end
   if len > cfg.maxLine or #d * 2 > total + 2 then return false end
@@ -319,6 +398,40 @@ local function newActor(S, mesh, L, R, sx, sy, sz)
   return a
 end
 
+-- (lane 87, the cottage pieces) A turn arrives in whole degrees. Drawn at a roll of exactly 180 or -180, or a pitch of
+-- exactly 90 or -90, the engine reads it back in another form: the roll's sign flipped, or yaw and roll traded at a
+-- pitch of 90. Session l87e, 119@10400,6880: a ladder and a log wall at roll -180 on the host read 180 on the friend,
+-- and a saw at pitch 90 was read with its yaw and roll traded. The same turn, but not the host's form to the drawn-parts
+-- check. A tenth of a degree off the edge keeps the host's form, and nothing a player can see changes.
+local function edgeOff(v, edge) if v == edge then return edge - 0.1 elseif v == -edge then return -edge + 0.1 end; return v end
+-- (lane 87, the cottage pieces) another mesh component of a host piece, on the friend's made actor a: its mesh and
+-- materials, its place, turn and scale (the tail: from the building's origin). Counted madeExtra or extraFail.
+local function addPart(a, B, m, tail)
+  local mesh = meshObj(m); if not mesh then bump("extraFail"); return false end
+  local mats = matsFor(m)
+  if not mats then bump("noMat"); bump("extraFail"); if not Q.saidMat[m] then Q.saidMat[m] = true; log("no materials for %s here: such a piece is not drawn", m) end; return false end
+  local x, y, z, yaw, p, r, sx, sy, sz = tail:match("^(%-?%d+):(%-?%d+):(%-?%d+):(%-?%d+):?(%-?%d*):?(%-?%d*):?(%-?%d*):?(%-?%d*):?(%-?%d*)$")
+  if not x then bump("extraFail"); return false end
+  local bx, by, bz = pieceOrigin(B)
+  SMC = SMC or StaticFindObject("/Script/Engine.StaticMeshComponent")
+  local ok, e = pcall(function()
+    local c = a:AddComponentByClass(SMC, false, { Rotation = { X = 0, Y = 0, Z = 0, W = 1 }, Translation = { X = 0, Y = 0, Z = 0 }, Scale3D = { X = 1, Y = 1, Z = 1 } }, false)
+    if not valid(c) then error("no component") end
+    c:SetMobility(2)
+    c:SetStaticMesh(mesh)
+    c:SetCollisionEnabled(0)
+    for i, mt in ipairs(mats) do if alive(mt) then c:SetMaterial(i - 1, mt) end end
+    c:K2_SetWorldLocationAndRotation({ X = bx + tonumber(x), Y = by + tonumber(y), Z = bz + tonumber(z) },
+      { Pitch = edgeOff(tonumber(p) or 0, 90), Yaw = tonumber(yaw), Roll = edgeOff(tonumber(r) or 0, 180) }, false, {}, true)
+    c:SetWorldScale3D({ X = (tonumber(sx) or 100) / 100, Y = (tonumber(sy) or 100) / 100, Z = (tonumber(sz) or 100) / 100 })
+  end)
+  if not ok then
+    bump("extraFail"); if not Q.saidExtra then Q.saidExtra = true; log("a piece's other mesh component could not be drawn: %s", tostring(e)) end
+    return false
+  end
+  bump("madeExtra")
+  return true
+end
 local function spawnPiece(S, B, m, tail)
   local mesh = meshObj(m); if not mesh then return nil end
   local mats = matsFor(m)
@@ -327,7 +440,7 @@ local function spawnPiece(S, B, m, tail)
   if not x then return nil end
   local bx, by, bz = pieceOrigin(B)
   local a = newActor(S, mesh, { X = bx + tonumber(x), Y = by + tonumber(y), Z = bz + tonumber(z) },
-    { Pitch = tonumber(p) or 0, Yaw = tonumber(yaw), Roll = tonumber(r) or 0 },
+    { Pitch = edgeOff(tonumber(p) or 0, 90), Yaw = tonumber(yaw), Roll = edgeOff(tonumber(r) or 0, 180) },
     (tonumber(sx) or 100) / 100, (tonumber(sy) or 100) / 100, (tonumber(sz) or 100) / 100)
   if a then
     bump("made")
@@ -364,7 +477,7 @@ local function plan(key, Bd)
     elseif have < wn then
       local need = wn - have
       for _, j in ipairs(hid[t] or {}) do if need == 0 then break end; acts[#acts + 1] = { "show", key, j }; need = need - 1 end
-      for _ = 1, need do acts[#acts + 1] = { "make", key, t, w.m, w.t } end
+      for _ = 1, need do acts[#acts + 1] = { "make", key, t, w.m, w.t, w.x } end
     end
   end
   for t in pairs(want) do one(t) end
@@ -389,7 +502,12 @@ local function doAct(S, act, spawns)
   local Bd = Q.B[key]
   if kind == "make" then
     local a = spawnPiece(S, B, act[4], act[5])
-    if a then local l = Q.made[key] or {}; Q.made[key] = l; l[#l + 1] = { a = a, s = act[3], h = strHash(act[3]) } end
+    if a then
+      -- (lane 87, the cottage pieces) the piece's other mesh components, on the made actor itself (as the host's piece
+      -- holds them: the drawn-parts check reads every component of an actor)
+      for _, x in ipairs(act[6] or {}) do addPart(a, B, x.m, x.t) end
+      local l = Q.made[key] or {}; Q.made[key] = l; l[#l + 1] = { a = a, s = act[3], h = strHash(act[3]) }
+    end
     return true
   end
   if b == true then return true end
@@ -560,7 +678,7 @@ local function work(S, clock)
     while #Q.acts > 0 and ms(t0) < budget do
       local act = Q.acts[1]
       if not doAct(S, act, spawns) then break end
-      if act[1] == "make" then spawns = spawns - 1 end
+      if act[1] == "make" then spawns = spawns - 1 - #(act[6] or {}) end     -- (lane 87: each component a spawn's worth)
       Q.lastWhat = "act " .. act[1] .. " " .. act[2]
       table.remove(Q.acts, 1)
     end
@@ -629,10 +747,52 @@ end
 -- ================================================================ 2. carts
 local function dropCart(a)
   Q.carts[a] = nil; Q.cartComp[a] = nil; Q.ownLast[a] = nil; Q.ownShown[a] = nil; Q.compHid[a] = nil; Q.cartId[a] = nil
+  Q.cartNames[a] = nil; if Q.compHidA then Q.compHidA[a] = nil end
+end
+-- (lane 64, task 64d; lane 74's question) A cart of this copy that this module hid (a host cart is drawn on its stand)
+-- and that the native look calls freed is dropped with the list of what was hidden. Were that answer ever wrong for a
+-- LIVING cart, the cart would stay hidden on its stand until the next load (its actor and the meshes this module hid:
+-- no list would name them any more). So before such a drop the cart is looked for once in the game's own list of
+-- handcarts (FindAllOf, by address only): found = still there (or a new cart took the address): its actor is shown
+-- and exactly the meshes this module hid are shown again (by their addresses, kept when they were hidden; a new cart
+-- at that address has other meshes and is left as the game made it); not found = gone, nothing to show. Never seen
+-- (the freed answers checked against that list: 46 of 46 in l64d3, 32 of 32 in l64d4); counters cartFreedShown and
+-- cartFreedGone.
+local function showIfAlive(a)
+  local hidA = Q.compHidA and Q.compHidA[a]
+  if not (hidA or Q.ownShown[a] == false) then return nil end
+  local x
+  for _, c in ipairs(FindAllOf("Resource_Handcart_C") or {}) do
+    local okA, ca = pcall(function() return c:GetAddress() end)
+    if okA and ca == a then x = c; break end
+  end
+  if not (x and valid(x)) then bump("cartFreedGone"); return false end
+  local shown = 0
+  pcall(function()
+    if Q.ownShown[a] == false then x:SetActorHiddenInGame(false) end
+    if hidA then
+      local want = {}; for _, ka in ipairs(hidA) do want[ka] = true end
+      local arr = x:K2_GetComponentsByClass(StaticFindObject("/Script/Engine.StaticMeshComponent"))
+      for i = 1, #arr do
+        local k = un(arr[i])
+        if valid(k) and want[k:GetAddress()] and k.bHiddenInGame then k:SetHiddenInGame(false, false); shown = shown + 1 end
+      end
+    end
+  end)
+  bump("cartFreedShown")
+  if (Q.stats.cartFreedShown or 0) <= 5 then log("a hidden cart of this copy that the native look called freed is still in the game's list: shown again (%d meshes) before it is dropped", shown) end
+  return true
+end
+local function trackCart(x)
+  if not valid(x) or x:IsActorBeingDestroyed() then return end
+  local a, name = x:GetAddress(), x:GetFName():ToString()
+  if Q.cartNames[a] ~= name then dropCart(a); Q.cartNames[a] = name end
+  Q.carts[a] = x
+  return a
 end
 local function cartFind(clock)
   Q.tFind = clock
-  pcall(function() for _, x in ipairs(FindAllOf("Resource_Handcart_C") or {}) do if x:IsValid() then Q.carts[x:GetAddress()] = x end end end)
+  for _, x in ipairs(FindAllOf("Resource_Handcart_C") or {}) do trackCart(x) end
   bump("cartFind")
 end
 if not rawget(_G, "__coopSceneNotify") then
@@ -644,7 +804,19 @@ if not rawget(_G, "__coopSceneNotify") then
   end)
   rawset(_G, "__coopSceneNotify", okN)
 end
-local function isValidCart(x) local ok, v = pcall(function() return x:IsValid() end); return ok and v == true end
+local function isValidCart(x) return valid(x) and not x:IsActorBeingDestroyed() end
+-- (lane 64, task 64d) a cart is kept from look to look (until it is no longer valid or is being destroyed) and carts
+-- are in no native table, so the guard of kept handles in valid() cannot know when the engine frees one. Before each
+-- look at the carts their addresses are looked up in the engine's object array (coop_snap.lua N.aliveNow: one native
+-- look for all of them); a freed cart is dropped without being touched (its components with it). Without a native
+-- answer: isValidCart, as before. (Measured, sittings l64d1 and l64d3: carts found freed at a look, 46 of 46 answers
+-- checked against the game's own list of handcarts.)
+local function cartsAlive()
+  local Ns = rawget(C, "snap"); if not (Ns and Ns.aliveNow) then return {} end
+  local list = {}; for a in pairs(Q.carts) do list[#list + 1] = a end
+  if #list == 0 then return {} end
+  return Ns.aliveNow(list)
+end
 
 -- the drawn mesh component of a cart (not the root: the root holds the same mesh, hidden in game by the game itself)
 -- and its world place, or { origin = true } for a spare at the world's origin, or nil
@@ -652,10 +824,15 @@ local function cartView(a, x)
   local r
   pcall(function()
     local c = Q.cartComp[a]
-    if not c then
-      local arr = x:K2_GetComponentsByClass(StaticFindObject("/Script/Engine.StaticMeshComponent"))
-      local root; pcall(function() root = x.RootComponent:GetAddress() end)
-      for i = 1, #arr do local k = arr[i]:get(); if k.StaticMesh:IsValid() and k:GetAddress() ~= root then c = k end end
+    if not valid(c) then
+      c = nil
+      local cls = StaticFindObject("/Script/Engine.StaticMeshComponent")
+      if not valid(x) or not valid(cls) then return end
+      local arr = x:K2_GetComponentsByClass(cls)
+      local root = x.RootComponent
+      if not valid(root) then return end
+      local addr = root:GetAddress()
+      for i = 1, #arr do local k = un(arr[i]); if valid(k) and k:GetAddress() ~= addr and valid(k.StaticMesh) then c = k end end
       if not c then return end
       Q.cartComp[a] = c
     end
@@ -668,9 +845,63 @@ local function cartView(a, x)
 end
 
 local function cartsTake(clock)
-  for _, x in ipairs(Q.newCarts) do pcall(function() local a = x:GetAddress(); dropCart(a); Q.carts[a] = x end) end
-  Q.newCarts = {}
+  -- (lane 64, task 64d) a new cart is kept in Q.newCarts from the engine's NotifyOnNewObject until this look (0.2 to
+  -- 0.4 s): a cart made and freed in that time is never touched (trackCart asks valid(), IsActorBeingDestroyed and its
+  -- name): its address is looked up first, with the same native look as the kept carts (one look for all of them)
+  local new = Q.newCarts; Q.newCarts = {}
+  local live
+  if #new > 0 then
+    local Ns = rawget(C, "snap")
+    if Ns and Ns.aliveNow then
+      local list = {}
+      for _, x in ipairs(new) do local ok, a = pcall(function() return x:GetAddress() end); if ok and a then list[#list + 1] = a end end
+      live = Ns.aliveNow(list)
+    end
+  end
+  for _, x in ipairs(new) do
+    local ok, a = pcall(function() return x:GetAddress() end)
+    if ok and a and live and live[a] == false then bump("cartFreedNew") else trackCart(x) end
+  end
   if clock - (Q.tFind or -1e9) >= cfg.cartFind then cartFind(clock) end
+end
+
+-- Read actual building membership, including a cart set down away from a building. An address
+-- here is used only during this game-thread call. The building's stable key goes over the link.
+local function cartBuildings(S)
+  local owner, listed = {}, {}
+  if not isValidCart(S.eng) then return owner,listed end
+  local buildings = S.eng.buildingArr
+  for i = 1, #buildings do
+    local b = un(buildings[i])
+    if valid(b) and not b:IsActorBeingDestroyed() then
+      local arr = b.Carts
+      if #arr > 0 then
+        local key = keyOf(b)
+        for j = 1, #arr do
+          local x = un(arr[j])
+          if isValidCart(x) then local a = x:GetAddress(); owner[a],listed[a] = key,x end
+        end
+      end
+    end
+  end
+  return owner,listed
+end
+
+local function cartNumber(a)
+  if not Q.cartId[a] then Q.nCart = Q.nCart + 1; Q.cartId[a] = Q.nCart end
+  return Q.cartId[a]
+end
+local function standText(id, x, l, owner)
+  local r = x:K2_GetActorRotation()
+  return string.format("%d:%d:%d:%d:%d:%d:%d:%s:%d", id, rnd(l.X), rnd(l.Y), rnd(l.Z),
+    rnd(r.Yaw) % 360, rnd(r.Pitch), rnd(r.Roll), owner or "-", tonumber(x.Type))
+end
+-- A pickup can start between two scene ticks. Name the exact stand in the start and in a retell.
+function Q.cartStart(x)
+  if Q.S ~= C.s or not Q.cartId or C.s.role ~= "host" or Q.world ~= C.s.worlds then return end
+  local a = trackCart(x)
+  if not a then return end
+  return standText(cartNumber(a), x, x:K2_GetActorLocation(), cartBuildings(C.s)[a])
 end
 
 local function hostCarts(S, clock)
@@ -678,15 +909,18 @@ local function hostCarts(S, clock)
   Q.tCart = clock
   cartsTake(clock)
   local t0 = os.clock()
-  local now, ch = {}, {}
+  local now, ch, physical = {}, {}, {}
+  local cartLive = cartsAlive()   -- (not "alive": that name is the module's IsValid helper, called below for materials)
+  local owner, listed = cartBuildings(S)
   for a, x in pairs(Q.carts) do
-    if not isValidCart(x) then dropCart(a); bump("cartGone")
+    if cartLive[a] == false then dropCart(a); bump("cartFreed")
+    elseif not isValidCart(x) then dropCart(a); bump("cartGone")
     else
       local v = cartView(a, x)
       local hidden = false
       if v and not v.origin then pcall(function() hidden = x.bHidden or v.c.bHiddenInGame or not v.c:IsVisible() end) end
       if v and not v.origin and not hidden then
-        local id = Q.cartId[a]; if not id then Q.nCart = Q.nCart + 1; id = Q.nCart; Q.cartId[a] = id end
+        local id = cartNumber(a)
         local last = Q.cartLast[id]
         local standing = (last and last.x == v.x and last.y == v.y and last.z == v.z) and 1 or 0
         local s = string.format("%d:%d:%d:%d:%d:%d:%d:%d", id, v.x, v.y, v.z, v.yaw, v.p, v.r, standing)
@@ -694,18 +928,43 @@ local function hostCarts(S, clock)
         if Q.cartSaid[id] ~= s then ch[#ch + 1] = s end
         Q.cartLast[id] = v
       end
+      if not listed[a] and v and not v.origin and not hidden then
+        local l = x:K2_GetActorLocation()
+        if math.abs(l.X) + math.abs(l.Y) > 100 then physical[#physical + 1] = standText(cartNumber(a), x, l, owner[a]) end
+      end
     end
   end
+  -- A building can also park a timber cart or a large cart. Only handcarts
+  -- participate in the existing mesh renderer. All real list entries travel.
+  for a,x in pairs(listed) do
+    if isValidCart(x) then
+      if not Q.carts[a] then
+        local name = x:GetFName():ToString()
+        if Q.listNames[a] ~= name then Q.cartId[a] = nil; Q.listNames[a] = name end
+      end
+      local l = x:K2_GetActorLocation()
+      if math.abs(l.X) + math.abs(l.Y) > 100 then physical[#physical+1] = standText(cartNumber(a),x,l,owner[a]) end
+    end
+  end
+  for a in pairs(Q.listNames) do if not listed[a] then Q.listNames[a] = nil; Q.cartId[a] = nil end end
+  if C.cartStands then C.cartStands.hostReturns(S,physical,listed,clock) end
   local gone = {}
   for id in pairs(Q.cartSaid) do if not now[id] then gone[#gone + 1] = tostring(id); Q.cartLast[id] = nil end end
+  table.sort(physical)
+  local roots = #physical > 0 and table.concat(physical, ";") or "-"
+  if C.cartStands then roots = roots .. "|" .. C.cartStands.hostCarriers() end   -- (lane 74) one snapshot: stands and carriers
+  local changed = Q.standsSaid ~= roots
   if Q.cartKey then
     Q.cartKey = nil
     local all = {}; for _, s in pairs(now) do all[#all + 1] = s end
-    A.send("Q K " .. (#all > 0 and table.concat(all, ";") or "-")); bump("sentK")
+    A.send("Q K " .. (#all > 0 and table.concat(all, ";") or "-") .. " " .. roots .. " " .. S.worlds); bump("sentK")
   else
     if #ch > 0 then local s = "Q C " .. table.concat(ch, ";"); A.send(s); bump("sentC"); bump("bytesC", #s + 20) end
-    if #gone > 0 then A.send("Q C - " .. table.concat(gone, ",")); bump("sentC") end
+    if #gone > 0 or changed then
+      A.send("Q C - " .. (#gone > 0 and table.concat(gone, ",") or "-") .. (changed and " " .. roots .. " " .. S.worlds or "")); bump("sentC")
+    end
   end
+  Q.standsSaid = roots
   Q.cartSaid = now
   local t = ms(t0); bump("msC", t); if t > (Q.stats.maxMsC or 0) then Q.stats.maxMsC = t end
 end
@@ -730,12 +989,13 @@ local function setOwnShown(a, x, want)
     -- only the components this module hid are shown again (the root is hidden in game by the game itself)
     if want then
       for _, k in ipairs(Q.compHid[a] or {}) do pcall(function() if k:IsValid() then k:SetHiddenInGame(false, false) end end) end
-      Q.compHid[a] = nil
+      Q.compHid[a] = nil; if Q.compHidA then Q.compHidA[a] = nil end
     else
       local l = Q.compHid[a] or {}
+      local la = (Q.compHidA and Q.compHidA[a]) or {}     -- (lane 64) the same meshes by address (showIfAlive)
       local arr = x:K2_GetComponentsByClass(StaticFindObject("/Script/Engine.StaticMeshComponent"))
-      for i = 1, #arr do local k = arr[i]:get(); if k:IsValid() and not k.bHiddenInGame then k:SetHiddenInGame(true, false); l[#l + 1] = k end end
-      Q.compHid[a] = l
+      for i = 1, #arr do local k = arr[i]:get(); if k:IsValid() and not k.bHiddenInGame then k:SetHiddenInGame(true, false); l[#l + 1] = k; la[#la + 1] = k:GetAddress() end end
+      Q.compHid[a] = l; Q.compHidA = Q.compHidA or {}; Q.compHidA[a] = la
     end
   end)
   if ok then
@@ -764,8 +1024,10 @@ local function friendCarts(S, clock)
   cartsTake(clock)
   local t0 = os.clock()
   local own = {}
+  local cartLive = cartsAlive()   -- (not "alive": that name is the module's IsValid helper, called below for materials)
   for a, x in pairs(Q.carts) do
-    if not isValidCart(x) then dropCart(a); bump("cartGone")
+    if cartLive[a] == false then showIfAlive(a); dropCart(a); bump("cartFreed")
+    elseif not isValidCart(x) then dropCart(a); bump("cartGone")
     else
       local v = cartView(a, x)
       if not v or v.origin then Q.ownLast[a] = nil; own[#own + 1] = { a = a, x = x, v = { x = 1e9, y = 1e9, z = 1e9, yaw = 0, st = false, c = v and v.c } }   -- a spare still lends its mesh (sitting s1: with every own cart a spare, no host cart could be drawn for 9 s)
@@ -830,9 +1092,28 @@ setHost = function(key, cnt)
   Q.pri[key] = true
 end
 
+-- (lane 87, the cottage pieces) one wire item: the root "<mesh n>:<tail>", then "|<mesh n>:<tail>" for each other
+-- component. Returns the text (mesh paths, as this copy reads its own pieces), the root's mesh and tail, the others
+-- ({ m, t, s }), or nil and the mesh numbers not known here.
+local function parseItem(item)
+  local s, m, t, x, miss
+  for part in item:gmatch("[^|]+") do
+    local n, tail = part:match("^(%d+):(.*)$")
+    local mp = n and Q.meshPath[tonumber(n)]
+    if not mp then miss = miss or {}; if n then miss[#miss + 1] = tonumber(n) end
+    elseif not m then m = mp; t = tail; s = mp .. ":" .. tail
+    else local ms = matchOf(mp, tail); x = x or {}; x[#x + 1] = { m = mp, t = tail, s = ms }; s = s .. "|" .. ms end
+  end
+  if miss or not m then return nil, miss or {} end
+  return s, m, t, x
+end
 local function onMessage(S, from, kind, w, line)
   if kind ~= "Q" then return false end
   local sub = w[4]
+  if (sub == "CA" and S.role == "host" and from ~= "host") or ((sub == "CS" or sub == "CR") and S.role == "friend" and from == "host") then
+    if C.cartStands then C.cartStands.receive(S,w) end
+    return true
+  end
   if S.role == "host" then
     if sub == "W" and from ~= "host" then
       for n in (w[5] or ""):gmatch("%d+") do Q.meshSaid[tonumber(n)] = nil end
@@ -854,10 +1135,9 @@ local function onMessage(S, from, kind, w, line)
     local body = w[8] or "-"
     if body ~= "-" then
       for item in body:gmatch("[^;]+") do
-        local n, tail = item:match("^(%d+):(.*)$")
-        local m = n and Q.meshPath[tonumber(n)]
-        if m then local s = m .. ":" .. tail; local e = acc.cnt[s]; if e then e.n = e.n + 1 else acc.cnt[s] = { n = 1, m = m, t = tail } end
-        else acc.bad = true; if n then Q.want[tonumber(n)] = true end end
+        local s, m, tail, x = parseItem(item)
+        if s then local e = acc.cnt[s]; if e then e.n = e.n + 1 else acc.cnt[s] = { n = 1, m = m, t = tail, x = x } end
+        else acc.bad = true; for _, n in ipairs(m or {}) do Q.want[n] = true end end
       end
     end
     if i == of then
@@ -868,15 +1148,16 @@ local function onMessage(S, from, kind, w, line)
     local key, nn = w[5], tonumber(w[6])
     local cur = key and Q.hostCnt[key]
     if not (cur and nn and w[7]) then if key then Q.wantKeys[key] = true end; bump("deltaLost"); return true end
-    local cnt = {}; for s, e in pairs(cur) do cnt[s] = { n = e.n, m = e.m, t = e.t } end
+    local cnt = {}; for s, e in pairs(cur) do cnt[s] = { n = e.n, m = e.m, t = e.t, x = e.x } end
     local ok, total = true, 0
     for it in w[7]:gmatch("[^;]+") do
-      local sign, n, tail = it:match("^([%+%-])(%d+):(.*)$")
-      local m = n and Q.meshPath[tonumber(n)]
-      if not m then ok = false; if n then Q.want[tonumber(n)] = true end
+      local sign, rest = it:match("^([%+%-])(.+)$")
+      local s, m, tail, x
+      if sign then s, m, tail, x = parseItem(rest) end
+      if not s then ok = false; for _, n in ipairs(m or {}) do Q.want[n] = true end
       else
-        local s = m .. ":" .. tail; local e = cnt[s]
-        if not e then e = { n = 0, m = m, t = tail }; cnt[s] = e end
+        local e = cnt[s]
+        if not e then e = { n = 0, m = m, t = tail, x = x }; cnt[s] = e end
         e.n = e.n + (sign == "+" and 1 or -1); if e.n < 0 then ok = false end
         if e.n == 0 then cnt[s] = nil end
       end
@@ -891,6 +1172,10 @@ local function onMessage(S, from, kind, w, line)
     -- a stall of this copy that was hidden because the host lacked it, and that the host has now: its own values come
     for k in pairs(Q.stallOwn) do if t[k] then Q.stallOwn[k] = nil; Q.hostCnt[k] = nil; Q.wantKeys[k] = true end end
   elseif sub == "C" or sub == "K" then
+    if C.cartStands then
+      if sub == "K" then C.cartStands.snapshot(S,w[6],w[1],w[7])
+      elseif w[5] == "-" and w[7] then C.cartStands.snapshot(S,w[7],w[1],w[8]) end
+    end
     if sub == "K" then Q.cartHost = {} end
     Q.cartHostSeen = true
     if w[5] == "-" and sub == "C" then
@@ -913,15 +1198,18 @@ local function fresh(S)
   Q.hostCnt = {}; Q.hostSum = {}; Q.hostN = {}; Q.hostZ = {}; Q.part = {}; Q.meshPath = Q.meshPath or {}
   Q.hostMats = Q.hostMats or {}; Q.want = {}; Q.wantKeys = {}; Q.made = {}; Q.acts = {}                  -- friend
   Q.hostStalls = nil; Q.stallOwn = {}; Q.ghostAt = {}; Q.stallSaid = nil; Q.tStall = nil
-  Q.carts = {}; Q.newCarts = {}; Q.cartComp = {}; Q.tFind = nil; Q.tCart = nil
+  Q.carts = {}; Q.newCarts = {}; Q.cartComp = {}; Q.cartNames = {}; Q.standsSaid = nil; Q.tFind = nil; Q.tCart = nil
+  Q.listNames = {}
+  if C.cartStands then C.cartStands.reset(S) end
   Q.cartId = {}; Q.nCart = Q.nCart or 0; Q.cartSaid = {}; Q.cartLast = {}; Q.cartKey = true              -- host
-  Q.cartHost = {}; Q.cartHostSeen = false; Q.cartDraw = {}; Q.ownLast = {}; Q.ownShown = {}; Q.compHid = {}   -- friend
+  Q.cartHost = {}; Q.cartHostSeen = false; Q.cartDraw = {}; Q.ownLast = {}; Q.ownShown = {}; Q.compHid = {}; Q.compHidA = {}   -- friend
   log("reset for world %d (%s)", S.worlds or 0, tostring(S.role))
 end
 
 local function tick(S, clock)
   if not (S and S.eng and S.p1) then return end
   fresh(S)
+  if C.cartStands and S.role == "friend" then C.cartStands.tick(S,clock) end
   if rawget(C, "hold") then return end
   -- the tick's own time, and whether the Lua collector ran in it (the heap shrank): a collector step lands in
   -- whatever code allocates at that moment, in any module, so a long tick with a collector step is counted apart

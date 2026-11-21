@@ -21,7 +21,11 @@
 --      flag of the site panel's pause button) inside the town module's quiet wrapper, so the pause is not sent to
 --      anybody. Only sites this module paused itself are resumed by it; a site the player paused is left alone.
 --   2. FINISHED here at once (the game's own finish routine, native: Coop.patch.finish) when the host says "built"
---      for it, and only then. That a site is missing from the host's list is never taken as "finished": the host may
+--      for it, and only then. (lane 87) "At once" is the tick the word arrives in (cfg.atOnce): the look is made in
+--      that tick. Before, the word waited for the next look, up to a second, and the host's stock line (the goods
+--      the finish used up) got in between: the site stood at half a bar (run p87a: 6 of 7 finishes, 0.3 to 0.4 s).
+--      The facts module asks for the same finish (B.finishNow) when the host's stock line itself says "built"
+--      (its item cn=1) and comes first. That a site is missing from the host's list is never taken as "finished": the host may
 --      not have it yet (this player's own placement on its way to the host), may name it differently, or it may be
 --      burning there. Such a site stays held and the host is asked.
 --   3. RELEASED when nothing has come from the host for 30 s: the native switch goes off and the sites this module
@@ -46,6 +50,7 @@ for k, v in pairs({
                          --     4 to 5 builders, so 0.75 to 0.93 takes several looks, and 0.93 to 1.0 many frames)
   askAfter = 3.0,        -- a site the host does not list: ask after this long ...
   askEvery = 5.0,        -- ... and again after twice this long (10 s), then every 20 s
+  atOnce = true,         -- (lane 87) friend: the host's "built" is carried out in the tick it arrives (false: at the next look)
   pauseFn = "setConstructionPaused",   -- measured (lane 7, session 3): 4 builders at work, 0 in the same frame, progress stands
                                        -- still. setSleep, the pause button's own call, writes the same flag but lets the
                                        -- builders finish what they are at (3, 2, 2, 2, 1, 0 over 5 s).
@@ -149,6 +154,7 @@ local function fresh(S)
   B.host = nil; B.heard = false; B.hostT = os.clock()        -- friend: the host's list; "last heard" starts with the world
   B.done = {}; B.retry = {}; B.unknown = {}; B.here = {}     -- friend: "built" said by the host / next try / not listed / the sites of the last look
   B.held = {}; B.mine = {}; B.hot = {}                       -- friend, holds: seen complete / paused by this module / near the end
+  B.now = nil
   B.nat = nil; B.natBad = nil; B.natSaid = nil; B.swSince = nil; B.swT = nil; B.offByUs = nil; B.staleSaid = nil; B.asked = nil; B.pauseErr = nil
 end
 
@@ -207,6 +213,10 @@ local function finishHere(clock, k, b)
   local P = C.patch
   local can = false; pcall(function() can = P.fn and P.finish and P.status().finish and true or false end)
   if can then
+    -- (lane 87) the parts of this site full and its hold ended, ahead of the FINISH of the same native tick (the
+    -- values module: SITEHP FILL), as the host's finished building has them
+    local Vv = rawget(C, "values")
+    if Vv and Vv.beforeFinish then pcall(function() Vv.beforeFinish(k, b:GetAddress()) end) end
     local ok, done, msg = pcall(P.finish, b)
     if ok and done then
       B.stats.finished = B.stats.finished + 1
@@ -302,8 +312,9 @@ function M.tick(S, clock)
       else local p = progress(b); if p >= B.cfg.holdAt then B.hot[k] = nil; if not asleep(b) then pause(clock, k, b, p) end end end
     end
   end
-  if clock - B.tPoll < B.cfg.poll then return end
-  B.tPoll = clock
+  -- (lane 87) B.now: the host's "built" came in this tick's lines (they are read before the modules' ticks): look now
+  if not B.now and clock - B.tPoll < B.cfg.poll then return end
+  B.tPoll = clock; B.now = nil
   local ok, e = pcall(S.role == "host" and hostPoll or friendPoll, S, clock)
   if not ok then B.lastErr = tostring(e) end
 end
@@ -327,6 +338,7 @@ function M.onMessage(S, from, kind, w, line)
         -- "built" counts only for a building that was a site here at the last look (a later site of the same name is another job)
         if st == "b" and B.here[k] then
           B.done[k] = true
+          if B.cfg.atOnce then B.now = true end              -- (lane 87) finished in this tick, not at the next look
           if u then log("sites: %s is not on the host's list; asked: it is finished on the host", k) end
         elseif st == "n" and u and not u.said then
           u.said = true
@@ -362,6 +374,29 @@ function B.ahead(S)
   end
   for _, b in pairs(B.mine or {}) do if valid(b) and asleep(b) and own(b) then n = n + 1 end end
   return n
+end
+
+-- (lane 87) The facts module's word: the host's stock line for this building says "built" (its item cn=1; it carries the
+-- goods as they are after the host's finish). The site is finished here before those goods are written, or it would
+-- stand at half a bar until B IS comes (run p87a: 1 of 7 finishes, 0.74 s). The same rules as for B IS: only a
+-- building that is a site in the game's list in this tick (the look is made now: no handle of an earlier tick is
+-- used) and that was a site here at the last look; one try in 10 s. Returns what was done, for the caller's count.
+function B.finishNow(k)
+  local S = C.s
+  if not S or S.role ~= "friend" or not (S.eng and valid(S.eng)) then return "not a friend in a world" end
+  fresh(S)
+  if C.hold then return "a join or resync" end
+  local ok, mine = pcall(sites, S)
+  local b = ok and mine and mine[k]
+  if not b or not valid(b) then return "not a site now" end           -- finished here already (B IS came first), or not here
+  if not B.here or not B.here[k] then return "new here" end           -- a site since less than a look: the caller waits
+  local clock = os.clock()
+  if clock < (B.retry[k] or 0) then return "tried a moment ago" end
+  B.done[k] = true
+  B.stats.byStock = (B.stats.byStock or 0) + 1
+  local n0 = B.stats.finished
+  finishHere(clock, k, b)
+  return B.stats.finished > n0 and "finished" or "could not be finished"
 end
 
 local function count(t) local n = 0; for _ in pairs(t or {}) do n = n + 1 end; return n end

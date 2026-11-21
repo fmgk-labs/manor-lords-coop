@@ -70,6 +70,9 @@
 --   F B <entry>;<entry>;...   entry = <bkey>|<item>,...  changed items  |  <bkey>!|<item>,...  the complete building
 --                             | <bkey>-  no longer sent (gone, burning, a site again)
 --                             item = <good number>=<amount>  or  <rule code>=<value>      bkey = <type>@<x/10>,<y/10>
+--                             (lane 87, exact mode) item cn=0: this building is not finished on the host (with the
+--                             keyframe and on change); cn=1: it was finished since the last entry, and the goods of
+--                             this entry are those AFTER the finish (sent once, never with a keyframe)
 --   F A <region tag> <role>=<count>,...          livestock of an owned region by kind (EUnitRole number; none = 0)
 --   F M <region tag> <i>:<cold>:<sickness>:<home bkey>;...     families by their place in the region's list
 -- Names used: registry.tsv SMBuildingMaster.addToInventory / IsConstructed / isStorageTypeBuilding /
@@ -94,6 +97,10 @@ local DEFAULT_ON = {
   families = true,        -- cold / sickness of families
   livestock = true,       -- animals per region and kind: a missing one is made here
   livestockRemove = true, -- ... and one too many is removed here (only an animal with no work: see liveApply)
+  liveFastMake = true,    -- (lane 64, task 64d2) exact mode: a missing animal of the player's own town is made after
+                          --   cfg.liveMakeSettle (0.5 s), not cfg.liveSettle (25 s); see liveMakeSettle
+  newAtOnce = true,       -- (lane 64, task 64d) exact mode: a new building is put into the list in the tick the native table
+                          --   shows it (host: and sent in that tick), not at the next build of the list (see addNew)
   hold = true,            -- the hold after a local action
   exact = true,           -- exact mode: every building's stock, written exactly, when the native switch GOODS can be used
   levels = true,          -- every building's level (SMBuildingMaster.lv) is the host's (lane 24: a burnt house's level is lost in the save)
@@ -101,6 +108,11 @@ local DEFAULT_ON = {
   rivalWorkers = true,    -- lane 39: ... and which families work in each of them (F W)
   dist = true,            -- lane 42: a house's market goods (distributedGoods) as the host has them (F D; native DIST)
   camps = true,           -- lane 42 round two: the stock of bandit camps too, in exact mode (their loot changed on each copy)
+  pileFast = true,        -- lane 76: a demolished building's pile comes and goes in the tick the host's word says so (see PILES)
+  bar = true,             -- lane 87: the host's entries say "not finished" / "finished now" (cn); a friend finishes its site
+                          --   before it writes the goods the host's finish left (see SITES)
+  wq = true,              -- lane 87 (cure 3): a site's entry also carries its work fraction of the same tick (wq); a friend
+                          --   holds it in the tick it writes that entry's goods (see SITES)
 }
 local DEFAULT_CFG = {
   budgetMs = 0.5,         -- work per tick: at least this (os.clock has 1 ms steps on Windows: a tick may reach about 1 ms) ...
@@ -125,12 +137,23 @@ local DEFAULT_CFG = {
   stockPct = 0.10,        -- ... or this part of the amount, whichever is larger
   liveEvery = 5.0,        -- livestock counts are read (host) and judged (friend) this often
   liveSettle = 25.0,      -- a livestock difference must last this long (ordered animals arrive at each copy's own time)
+  -- (lane 64, task 64d2) THE MAKING SIDE IN THE PLAYER'S OWN TOWN. An animal the host gained and this copy's own game
+  -- did not bring stood missing here for the 25 s above (sitting l64d1: a sheep made on the host, its stand-in here
+  -- 25.7 s later; the owner's bar is 3 s). In exact mode the player's town now makes a missing animal after
+  -- liveMakeSettle, as a rival town does (0.5 s, one more look). An animal this copy's own game brings a moment later
+  -- (an order carried to every copy, the same backyard upgrade) raises the count above the host's, and the stand-in is
+  -- taken out in that tick (liveWatch, liveTakeBack: lane 76's one owner of a town's count). Only the making side:
+  -- an animal too many here keeps the long wait, since the host's word of a death or of an animal gone without a body
+  -- (the events module, E AD and E AG) comes first. Switch: Coop.facts.on.liveFastMake = false gives the 25 s again.
+  liveMakeSettle = 0.5,
   famEvery = 5.0,         -- family marks are read (host) and judged (friend) this often
   logEvery = 60.0,        -- a line with counts and cost in the log this often
   exactEvery = 10.0,      -- exact mode: the host says "F X 1" this often ...
   exactStale = 30.0,      -- ... and a friend that has not heard it for this long leaves exact mode (its own game takes
                           --     the stock over again, as before): a player whose host is gone must not sit on frozen stock
   pileWait = 20.0,        -- exact mode: a pile the host has not named for this long is removed here
+  pileEmpty = 1.5,        -- lane 76, host: an emptied pile is not sent empty for this long (the game removes it at once)
+  pileTail = 12,          -- lane 76: a new pile is looked for among this many buildings at the end of the game's list
   exactIndexAge = 1.0,    -- exact mode: the number of buildings is looked at this often (a new building is registered at once)
   -- lane 42: in exact mode a value the host changed must reach a friend within the link's delay (the owner's bar: what
   -- players see is the same on every copy, a second or two apart). The floors and waits above made a friend show the
@@ -138,7 +161,13 @@ local DEFAULT_CFG = {
   -- 15 s, rival workers 2.2 s). In exact mode these are used instead:
   exactValuesEvery = 1.0, -- host: the rule values of houses and of rival buildings are read this often; a friend writes them
                           --   at once (no margin, no settle time)
-  exactFamEvery = 1.0,    -- host: family marks read this often (rival towns too); a friend writes them on the first look
+  exactFamEvery = 0.5,    -- host: family marks read this often (rival towns too); a friend looks as often (lane 76: was 1 s)
+  famWait = 0.4,          -- lane 76: a family mark one off the host's is written after this long (was the day rule's 3 s: with the
+                          --   host's read every second and the friend's look every second a mark stood 3.8 s and more behind,
+                          --   session l76k; lane 64 measured this copy's own day step 0.2 s after the host's)
+                          --   (task 76e round 2: 1.0 -> 0.4: session l7i, a rival family's hunger 2.86 s behind; this copy's own
+                          --   day step is set back to the host's word in the tick it comes, F.famDayNow, so the wait need only
+                          --   cover the 0.2 s by which this copy's day change follows the host's)
   rivalLiveSettle = 0.5,  -- friend: a rival town's livestock (its AI orders on the host only) is made equal after this long
   -- (lane 76) session l76i: a rival town's new animal stood on a friend 4.8 s and more after the host had it (four
   -- times in 18 minutes: "livestock zwei kind 12: 3 here, 4 on the host"). The host read the counts every 5 s, the
@@ -146,6 +175,15 @@ local DEFAULT_CFG = {
   -- region; the 13 calls per kind only when a total changed), a rival town waits 0.5 s (one more look) and every
   -- missing animal of a kind is made in that look (at most 4), not one a look.
   exactLiveEvery = 0.5,
+  -- (lane 76, task 76e) THE STOCK PATH in exact mode. Sessions l7c to l7e: 3 to 13 stock readings a session came
+  -- 3.0 to 3.35 s after the host. legs.py on l7e: host change to host send median 0.69 s (a pass once a second that
+  -- sends at its end), send to the friend's write median 0.14 s, worst 1.02 s (a quick pass waits while a full pass
+  -- is still being worked through); in the slow moments both copies stalled 0.25 to 0.5 s a tick.
+  exactPassEvery = 0.5,   -- host, exact mode: the whole pass this often (was passEvery, 1 s)
+  fastHost = true,        -- host, exact mode: a building whose record of the native table changed is sent in that tick
+  fastMax = 40,           --   at most this many buildings a tick (the rest go with the pass)
+  fastFriend = true,      -- friend, exact mode: a building the host has just sent is written in the tick its line came
+  rekey = true,           -- (round 3) exact mode: a building whose type changed in place is renamed in the list at once
   -- ... an animal the host has NOT (one too many here) keeps a long wait: an animal's death comes on the host's own
   -- word (the events module), and this rule must not take one away ahead of it. Before lane 76 it was the 2 s wait
   -- on looks 5 s apart, so 5 s and more; that is kept.
@@ -157,6 +195,7 @@ for k, v in pairs(DEFAULT_ON) do if F.on[k] == nil then F.on[k] = v end end
 F.cfg = F.cfg or {}
 for k, v in pairs(DEFAULT_CFG) do if F.cfg[k] == nil then F.cfg[k] = v end end
 F.stats = F.stats or {}
+F.unfin = F.unfin or {}                                   -- host (lane 87): names last seen unfinished (set anew per world in fresh)
 
 -- The generic part: reflected properties of a building, read on the host and written on a friend by name.
 --   c code in the line; p property; k kind (i number, b switch); margin and settle as above. Every rule value is sent
@@ -201,9 +240,13 @@ local function setRule(b, R, want)
   if R.set == "ao" then
     local cur = b[R.p]
     if type(cur) ~= "number" or cur == want then return end
-    b:changeActiveLivestockWorkers(want - cur)
+    -- (lane 81) inside the town module's quiet wrapper: its LSW hook (a relative action) must not send this write as the
+    -- player's own change
+    local T = C.town
+    local function q(n) if T and T.quiet then T.quiet(function() b:changeActiveLivestockWorkers(n) end) else b:changeActiveLivestockWorkers(n) end end
+    q(want - cur)
     local now = b[R.p]
-    if now ~= want and now == want - cur then b:changeActiveLivestockWorkers(want) end
+    if now ~= want and now == want - cur then q(want) end
     return
   end
   -- lane 71: sleep through the game's own setSleep inside the town module's quiet wrapper (its SLEEP hook must not
@@ -217,7 +260,8 @@ local function setRule(b, R, want)
   end
   if R.k == "b" then b[R.p] = (want == 1) else b[R.p] = want end
 end
-local FAM = { "cold", "sickness", "injured", "hunger" }   -- (hunger: lane 42 round two, a rival family 1 / 2 in spring, a6) Region.workerFamilies[i].ConsumptionStatus.<field> (injured: lane 36, the friend's own work accident showed 0 / 29)
+local FAM = { "cold", "sickness", "injured", "hunger", "garments", "footwear", "ale" }   -- (lane 76, task 76f: the last three; session l76k: garments 2 / 1 for over 3 s in a rival town, carried by nothing)
+local FAM_OLD = 4         -- a mark after this one that does not take the host's value is left alone; the item stays on   -- (hunger: lane 42 round two, a rival family 1 / 2 in spring, a6) Region.workerFamilies[i].ConsumptionStatus.<field> (injured: lane 36, the friend's own work accident showed 0 / 29)
 local ROLE_MIN, ROLE_MAX, ROLE_HARE = 9, 22, 20      -- EUnitRole: chicken 9 ... calf 22 (lane 8 census); hares are wild
 
 -- ---------------------------------------------------------------- small helpers
@@ -308,6 +352,19 @@ local function stockOf(b, g)
 end
 -- exact mode, this copy's side of it (see EXACT MODE at the top)
 local function patch() return rawget(C, "patch") end
+local pileThere, friendPiles, hostOne      -- (lane 76; defined with the piles' fast path; hostOne further down)
+local evalExactF, doOpF           -- (lane 76: evalExact and doOp, defined further down, for the piles' fast path)
+local put                         -- (the write itself: addToInventory, defined with doOp)
+-- lane 76: the timing proof (coop_world.lua, a test tool, off for players) is told of a stock read or write
+local function proofNote(b, fromSnap)
+  local Wd = rawget(C, "world")
+  if Wd and Wd.cfg and Wd.cfg.proof and Wd.proofNote then pcall(Wd.proofNote, b, fromSnap) end
+end
+-- ... and of a building that is gone (task 76g): the host in the tick it says so, a friend in the tick it removes it
+local function proofGone(k)
+  local Wd = rawget(C, "world")
+  if Wd and Wd.cfg and Wd.cfg.proof and Wd.proofGone then pcall(Wd.proofGone, k) end
+end
 local function hostExact()        -- host: the stock of every building is sent
   local P = patch()
   if not (F.on.exact and F.on.stock and P ~= nil and type(P.goodsAvail) == "function") then return false end
@@ -381,17 +438,19 @@ local function fresh(S)
   F.S = S; F.world = S.worlds
   F.jobs = {}; F.idx = nil; F.trade = nil; F.me = nil
   F.sent = {}; F.sentA = {}; F.sentM = {}; F.sentL = {}   -- host: everything is sent again (a keyframe)
+  F.unfin = {}                                            -- host (lane 87): names last seen unfinished (kept through a keyframe)
+  F.workDue = {}                                          -- host (lane 87, cure 3): sites whose work moved, for the fast step
   F.hostL = {}; F.lvSaid = {}                             -- friend: the host's building levels
   F.hostW = {}; F.wSince = {}                             -- friend: the host's workers of rival buildings (lane 39)
   F.hostD = {}; F.dDirty = {}; F.dGen = nil               -- friend: the host's market goods of houses (lane 42)
   F.host = { b = {}, a = {}, m = {} }; F.dirty = {}       -- friend: the host's values; stale after a load, dropped
   F.catchMourning = {}; F.rejoining = nil; F.gap0 = S and S.clockGap   -- (the clock gap of before this load: not a measure of this world)
   F.holds = {}; F.holdR = {}; F.heldSaid = {}; F.last = {}; F.made = {}; F.liveSince = {}; F.famSince = {}; F.famDay = {}; F.refused = {}
-  F.liveTot = {}; F.liveFull = {}; F.passNo = 0
+  F.liveTot = {}; F.liveFull = {}; F.liveSeen = {}; F.liveHold = {}; F.passNo = 0
   F.t = { pass = 0, apply = 0, quick = 0, index = -1e9, live = 0, fam = 0, log = os.clock(), miss = 0, prune = 0 }
   F.wasHold = nil
   -- exact mode: nothing is known of the new world; the host says "F X 1" again with its first complete pass
-  F.exact = false; F.sentX = nil; F.regd = {}; F.pileGone = {}; F.dumpSeen = {}; F.exactAt = nil
+  F.exact = false; F.sentX = nil; F.regd = {}; F.pileGone = {}; F.dumpSeen = {}; F.exactAt = nil; F.pileWant = {}; F.pileN = nil; F.pileRetry = nil
   setHostExact(nil)
   log("reset for world %d", S.worlds)
 end
@@ -399,6 +458,28 @@ end
 -- ---------------------------------------------------------------- the lord's buildings (both roles)
 -- list of { b, k (name), t (type), x, y, store, res, reg (region address), dump, dup }, a map by name and the storage
 -- buildings by region. Built a building per step, every cfg.indexAge seconds.
+-- One building's entry, or nil for a building the list does not carry (another lord's when rivals are off, nobody's).
+-- (lane 64, task 64d) the build of the list and addNew below make it the same way
+local function entryOf(b, lords)
+  local op = b.ownerPawn
+  local rival, camp = false, false
+  if not mine(op) then
+    if F.on.rivals and lords and lords[addr(op) or 0] then rival = true
+    -- lane 42 round two: a bandit camp's stock (owner B) is carried in exact mode like a rival's, stock only
+    elseif F.on.camps and valid(op) and op.isBandit then camp = true
+    else return nil end
+  end
+  local k, x, y = keyOf(b)
+  local e = { b = b, k = k, t = A.btype(b), x = x, y = y, rival = rival or nil, camp = camp or nil }
+  -- lane 42 round two: a market stall (EBuildingFunction 3) gets its distributedGoods from the region's distribution
+  -- as a house does (4c3c490 walks the region's market list, houses and stalls: READ), so DIST carries it too
+  pcall(function() e.stall = tonumber(b.buildingFunction) == 3 or nil end)
+  e.dump = b:GetType() == 88                          -- the pile a demolished building leaves: each copy's carriers empty it
+  local okS, s = pcall(function() return b:isStorageTypeBuilding() end); e.store = okS and s == true
+  local okH, h = pcall(function() return b:isResidentialBuilding() or b.needsRefueling end); e.res = okH and h == true
+  e.reg = addr(b.Region)
+  return e
+end
 local function indexJob(st)
   local arr = F.S.eng.buildingArr
   if not st.list then
@@ -415,31 +496,18 @@ local function indexJob(st)
     local b = un(arr[st.i])
     if valid(b) then
       pcall(function()
-        local op = b.ownerPawn
-        local rival, camp = false, false
-        if not mine(op) then
-          if F.on.rivals and st.lords and st.lords[addr(op) or 0] then rival = true
-          -- lane 42 round two: a bandit camp's stock (owner B) is carried in exact mode like a rival's, stock only
-          elseif F.on.camps and valid(op) and op.isBandit then camp = true
-          else return end
-        end
-        local k, x, y = keyOf(b)
-        local e = { b = b, k = k, t = A.btype(b), x = x, y = y, rival = rival or nil, camp = camp or nil }
-        -- lane 42 round two: a market stall (EBuildingFunction 3) gets its distributedGoods from the region's distribution
-        -- as a house does (4c3c490 walks the region's market list, houses and stalls: READ), so DIST carries it too
-        pcall(function() e.stall = tonumber(b.buildingFunction) == 3 or nil end)
-        e.dump = b:GetType() == 88                          -- the pile a demolished building leaves: each copy's carriers empty it
-        local okS, s = pcall(function() return b:isStorageTypeBuilding() end); e.store = okS and s == true
-        local okH, h = pcall(function() return b:isResidentialBuilding() or b.needsRefueling end); e.res = okH and h == true
-        e.reg = addr(b.Region)
+        local e = entryOf(b, st.lords); if not e then return end
+        local k = e.k
         if st.map[k] then st.map[k].dup = true; e.dup = true else st.map[k] = e end      -- two buildings with one name: neither is written
         st.list[#st.list + 1] = e
-        if e.store and e.reg and not e.dump and not rival and not camp then local L = st.store[e.reg] or {}; st.store[e.reg] = L; L[#L + 1] = e end
+        if e.store and e.reg and not e.dump and not e.rival and not e.camp then local L = st.store[e.reg] or {}; st.store[e.reg] = L; L[#L + 1] = e end
       end)
     end
     return false
   end
-  F.idx = { list = st.list, map = st.map, store = st.store, t = os.clock(), n = #arr }
+  local dumps = {}
+  for _, e in ipairs(st.list) do if e.dump then dumps[#dumps + 1] = e end end
+  F.idx = { list = st.list, map = st.map, store = st.store, t = os.clock(), n = #arr, dumps = dumps, lords = st.lords }
   return true
 end
 -- The list is built again when the number of buildings in the world changed (looked at every cfg.indexAge seconds),
@@ -455,15 +523,93 @@ local function needIndex(clock, force)
   end
   if due and addJob("index", indexJob, {}) then F.t.index = clock; if force then F.t.miss = clock end end
 end
+-- (lane 76, task 76e round 3) A BUILDING WHOSE TYPE CHANGED IN PLACE (an upgrade that makes another building of it:
+-- a rival's storehouse 72 becomes 99, a house that grows). Its name (type@x,y) changes while the object stays. Before,
+-- both copies waited for the whole list to be built again (one building per step, behind the running jobs): session
+-- l7p, in a slow minute (two frames a second) the host's first line of the new name went 5.4 s after the change and
+-- the friend, whose list still had the old name, wrote nothing for 11 s more: its numStoredGeneric stayed at 135 while
+-- the host went 135, 134, 133, 134, 135 (one reading a value the host had not had for 3 s). So the entry is renamed in
+-- place the moment the new name is seen (the host: its read of the building; the friend: a name the host sent that
+-- the list does not have, looked for at the same place). The whole list is still built again afterwards.
+local function rekey(e)
+  local X = F.idx; if not (X and e and valid(e.b)) then return nil end
+  local ok, k, x, y = pcall(keyOf, e.b)
+  if not ok or type(k) ~= "string" or k == e.k then return nil end
+  -- only a new type AT THE SAME PLACE: a removed building's actor is cleared (type 0 at 0,0) and is not renamed
+  if not (e.x and x and math.abs(x - e.x) <= 1 and math.abs(y - e.y) <= 1) then return nil end
+  local nt = tonumber(k:match("^(%d+)@")); if not nt or nt <= 0 then return nil end
+  if X.map[k] and X.map[k] ~= e then return nil end         -- the new name is taken: the rebuilt list decides
+  local old = e.k
+  if X.map[old] == e then X.map[old] = nil end
+  e.k = k; e.x = x; e.y = y; e.t = A.btype(e.b)
+  pcall(function() e.stall = tonumber(e.b.buildingFunction) == 3 or nil end)
+  local okS, s = pcall(function() return e.b:isStorageTypeBuilding() end); e.store = okS and s == true
+  local okH, h = pcall(function() return e.b:isResidentialBuilding() or e.b.needsRefueling end); e.res = okH and h == true
+  e.gone = nil; e.live = nil; e.liveAt = nil; e.upg = nil
+  X.map[k] = e
+  bump("rekeyed"); log("a building changed its type in place: %s is now %s (renamed in the list at once)", old, k)
+  return old
+end
+F.rekey = rekey
+-- (lane 64, task 64d: l64pin20's bw row, sitting l64d8) A NEW BUILDING IN THE LIST IN THE TICK THE NATIVE TABLE SHOWS
+-- IT. The list was built again only at the count look (the host: every cfg.indexAge, 5 s; a friend in exact mode every
+-- 1 s) and then one building a step: in l64d8 the host's first line for a rival's new building went 1.2 to 5.5 s after
+-- it was placed, the friend's list had it 1.0 to 3.6 s after, and a site whose priority the rival's AI set at once
+-- (91@9249,7403: 2; 93@9260,7421: 1) stood at the game's own 4 on the friend for 1.25 and 2.10 s. Now an address of the
+-- native table's changed records (coop_snap.lua N.takeChanged: a new building is a new record) that the list does not
+-- hold is made an entry at once, the way the build makes it (entryOf), and appended; the build of the list still
+-- comes as before and replaces the whole list. A name already in the list: the old entry is replaced when it is no
+-- longer a building of the list (its object gone, or gone from the list), else both are marked two of one name, as
+-- the build does. An address the list does not carry (another owner) is looked at on three changes of its record (an
+-- owner that is not final in the first tick gets another look), then not again until the next build.
+-- (lane 87's site entry, cn=0 and wq, goes from its first tick on with it: its HW P gives way sooner, as its design
+-- says, research/.../lane_s21_87/design_cures.txt.) Off: Coop.facts.on.newAtOnce = false.
+local function addNew(X, a)
+  if not (F.on.newAtOnce and X and X.list and a) then return nil end
+  if not X.byAddr then
+    X.byAddr = {}
+    for _, e in ipairs(X.list) do local ea = valid(e.b) and addr(e.b); if ea then X.byAddr[ea] = e end end
+  end
+  if X.byAddr[a] then return nil end
+  X.skip = X.skip or {}
+  if (X.skip[a] or 0) >= 3 then return nil end
+  local N = rawget(C, "snap")
+  local b
+  pcall(function() local r = N and N.building and N.building(a); if r and N.obj then b = N.obj(r) end end)
+  if not (b and valid(b)) then return nil end            -- not this tick's object of that address: the next change says it again
+  local okE, e = pcall(entryOf, b, X.lords)
+  if not okE or not e then X.skip[a] = (X.skip[a] or 0) + 1; return nil end
+  local old = X.map[e.k]
+  if old then
+    local oldLives = valid(old.b) and not old.gone and addr(old.b) ~= a
+    if oldLives then old.dup = true; e.dup = true          -- two buildings with one name: neither is written (as the build)
+    else X.map[e.k] = e end                                -- the old one is no building of the list now: the name is the new one's
+  else X.map[e.k] = e end
+  e.new = true
+  X.list[#X.list + 1] = e; X.byAddr[a] = e
+  if e.store and e.reg and not e.dump and not e.rival and not e.camp and X.store then local L = X.store[e.reg] or {}; X.store[e.reg] = L; L[#L + 1] = e end
+  if e.dump and X.dumps then X.dumps[#X.dumps + 1] = e end
+  bump(F.S and F.S.role == "host" and "newAtOnce" or "newFriend")
+  return e
+end
 -- the building with that name on this copy (exact, else a neighbour within 10 cm: a rounding edge), alive and unique
 local function byKey(k)
   local X = F.idx; if not X then return nil end
   local e = X.map[k]
+  local t, x, y
   if not e then
-    local t, x, y = parseKey(k); if not t then return nil end
+    t, x, y = parseKey(k); if not t then return nil end
     for dx = -1, 1 do for dy = -1, 1 do
       if not e then e = X.map[string.format("%d@%d,%d", t, x + dx, y + dy)] end
     end end
+  end
+  if not e and t and F.cfg.rekey then                       -- (task 76e) the same object at that place under its old name
+    for _, c in ipairs(X.list) do
+      if not c.dup and c.x and math.abs(c.x - x) <= 1 and math.abs(c.y - y) <= 1 and c.t ~= t and valid(c.b) then
+        local okT, ct = pcall(A.btype, c.b)
+        if okT and ct == t and rekey(c) then e = c; break end
+      end
+    end
   end
   if not e or e.dup or not valid(e.b) then return nil end
   return e
@@ -502,19 +648,187 @@ local function partnerOk(p)
   return ok and good
 end
 
+-- ---------------------------------------------------------------- PILES, fast (lane 76; both roles, exact mode)
+-- Session l76k, two piles of the player's: (1) the host's pile came 0.27 s after the demolition with 2 logs; the
+-- friend's pile stood empty 3.4 s (the host's next pass after its list of buildings was built again, then the
+-- friend's own list). (2) the host's carriers took the last log and the pile was gone; the friend showed an empty
+-- pile for 2.6 s and had it 3.4 s longer than the host. An empty pile is a state the host never shows.
+-- Now: both copies look at the end of the game's list of buildings in every tick in which the number of buildings
+-- changed or a demolition is under way, and take a new pile into their list at once. The host sends a new pile's
+-- complete stock in that tick, never sends an emptied pile's zeros, and says "no longer sent" in the tick its pile is
+-- gone. A friend writes a pile's stock in the tick the host's line and its own pile are both there, and removes its
+-- pile in the tick the host's word comes.
+pileThere = function(e)
+  if not valid(e.b) then return false end
+  local ok, k = pcall(keyOf, e.b)
+  return ok and k == e.k
+end
+-- new piles at the end of the game's list (a new building is put at the end), taken into this copy's list
+local function newPiles(S)
+  local X = F.idx; local out = {}
+  if not X then return out end
+  local arr = S.eng.buildingArr; local n = #arr
+  for i = n, math.max(1, n - F.cfg.pileTail + 1), -1 do
+    local b = un(arr[i])
+    if valid(b) then
+      pcall(function()
+        if b:GetType() ~= 88 then return end
+        local k, x, y = keyOf(b)
+        local old = X.map[k]
+        if old and valid(old.b) and (addr(old.b) == addr(b) or pileThere(old)) then return end    -- known, or two with one name
+        local op = b.ownerPawn
+        local rival, camp = false, false
+        if not mine(op) then
+          if F.on.rivals and X.lords and X.lords[addr(op) or 0] then rival = true
+          elseif F.on.camps and valid(op) and op.isBandit then camp = true
+          else return end
+        end
+        local e = { b = b, k = k, t = 88, x = x, y = y, rival = rival or nil, camp = camp or nil, dump = true, store = false, res = false, direct = true }
+        e.reg = addr(b.Region)
+        X.map[k] = e; X.list[#X.list + 1] = e; X.dumps[#X.dumps + 1] = e
+        out[#out + 1] = e
+      end)
+    end
+  end
+  return out
+end
+-- true in a tick in which a new pile may have come: the number of buildings changed, or a demolition was sent or
+-- applied here in the last 3 s (coop_x_jobs J.gone marks the building; its pile can come as the building goes)
+local function pileLook(S, clock)
+  local X = F.idx; if not X then return false end
+  local okN, n = pcall(function() return #S.eng.buildingArr end)
+  if not okN then return false end
+  local look = n ~= F.pileN
+  F.pileN = n
+  local G = C.goneB
+  if not look and G then for _, t in pairs(G) do if clock - t < 3.0 then look = true; break end end end
+  return look
+end
+-- host: a new pile's complete stock goes out in this tick; a pile that is gone is told in this tick
+local function hostPiles(S, clock)
+  local X = F.idx; if not X or not X.dumps then return end
+  if pileLook(S, clock) or F.pileRetry then
+    F.pileRetry = nil
+    newPiles(S)
+  end
+  local st = { clock = clock, n = F.passNo or 0, entries = {}, seen = {}, exact = true }
+  -- every pile this host has sent: still in the list, and still there? (the list may have been built again since)
+  for k in pairs(F.sent) do
+    if k:sub(1, 3) == "88@" then
+      local e = X.map[k]
+      if not e or not pileThere(e) then st.entries[#st.entries + 1] = k .. "-"; F.sent[k] = nil; bump("pileGoneFast"); proofGone(k) end
+    end
+  end
+  for _, e in ipairs(X.dumps) do
+    if not e.goneTold then
+      if not pileThere(e) then e.goneTold = true
+      elseif e.direct and not F.sent[e.k] and not e.dup then
+        -- a new pile: sent when its goods are in it (read from the game itself: the native table is of the frame's start)
+        local okI, inv = pcall(invOf, e.b)
+        if okI and next(inv) ~= nil then
+          local ok, err = pcall(hostOne, st, e)
+          if not ok then fail("read new pile " .. e.k, err) else bump("pileNewFast") end
+        else
+          e.seenAt = e.seenAt or clock
+          if clock - e.seenAt < 1.0 then F.pileRetry = true end
+        end
+      end
+    end
+  end
+  if #st.entries > 0 then bump("entries", #st.entries); sendList("F B ", st.entries, ";") end
+end
+-- friend: the host's stock of pile k is written now (the pile and the host's complete line are both here)
+local function pileNow(k, clock)
+  local H = F.host.b[k]; if not (H and H.full and F.exact) then return false end
+  local X = F.idx; local e = X and X.map[k]
+  if not (e and e.dump and not e.dup and pileThere(e)) then return false end
+  local st = { ops = {} }
+  evalExactF(st, k, H, e)
+  for _, op in ipairs(st.ops) do
+    local ok, err = pcall(doOpF, op, clock)
+    if not ok then fail("write pile " .. k .. " good " .. tostring(op.g), err) end
+  end
+  if #st.ops > 0 then bump("pileWriteFast"); proofNote(e.b) end
+  return true
+end
+-- friend: new piles are taken in and filled; a pile the host's line named before this copy had it is filled as it comes
+friendPiles = function(S, clock)
+  local X = F.idx; if not X or not X.dumps then return end
+  local look = pileLook(S, clock)
+  if look or (F.pileWant and next(F.pileWant) ~= nil) then
+    for _, e in ipairs(newPiles(S)) do
+      bump("pileSeenFast")
+      -- the pile holds what this copy's own game put into it (native rule "pilefree"). It is registered now (a write
+      -- of amount 0), so this copy's carriers cannot take from it before the host's stock is written. An empty pile is
+      -- not touched (the game's count after a write removes an empty pile).
+      -- (task 76e round 2) ALSO when the host's line is here already: a new pile whose goods are the host's gets no
+      -- write of its amounts, so without this it was never registered (session l7j, day 361: a rival's new pile
+      -- 88@10000,6520 lost a large good on the friend for 0.67 s, a state the host never had)
+      local okI, inv = pcall(invOf, e.b)
+      if okI and next(inv) ~= nil then
+        local a = addr(e.b)
+        if a and not F.regd[a] and pcall(put, e.b, 16, 0) then F.regd[a] = true; bump(pileNow(e.k, clock) and "pileRegFastHost" or "pileRegFast") end
+      end
+    end
+  end
+  if F.pileWant then
+    for k, t in pairs(F.pileWant) do
+      if pileNow(k, clock) or clock - t > 5.0 then F.pileWant[k] = nil end
+    end
+  end
+end
+
+-- ---------------------------------------------------------------- SITES (lane 87; exact mode)
+-- Run p87a (the player's sites, 7 of 7 finishes): a friend showed its site at HALF a bar for 0.4 to 1.4 s after the
+-- host's had finished. The host's game takes the needed goods out of the Inventory at the finish; the stock line
+-- with those goods gone was written into the friend's site while that site was still unfinished (its bar is half
+-- goods, half work: goods 0, work 1). The host's "built" word (the sites module's B IS) travels apart from the stock.
+-- Now the stock line itself says it: an unfinished building's entry carries cn=0, and the entry of the pass that
+-- first sees it finished carries cn=1 beside the goods after the finish. A friend finishes its site (the sites
+-- module's own finish, B.finishNow) before it writes those goods. cn=1 is sent once, on the host's own change from
+-- unfinished to finished, never with a keyframe: a keyframe's "finished" could meet a new job a player has just
+-- begun on that building here.
+-- Is this building finished on this copy now? From the native building table of this frame (the record the stock
+-- comes from: one moment), else, when asked (must), by the reflected read. nil: not known.
+local function consHost(b, must)
+  local N = rawget(C, "snap")
+  if N and N.buildings and N.building and N.buildings() then
+    local r = N.building(addr(b) or 0)
+    if r then return r.cons == true end
+  end
+  if not must then return nil end
+  local ok, c = pcall(function() return b.Data.constructed end)
+  if ok then return c == true end
+  return nil
+end
+
 -- ---------------------------------------------------------------- host: read and send
 -- Reading costs about 25 us per property (measured: 10 ms for 38 buildings each second), so not everything is read
 -- on every pass: whether the building is finished and not burning every 4th pass; the rule values every 2 s (their
 -- floor); a building whose stock has not changed on 6 passes in a row only every 4th pass (a house, an idle
 -- workshop), until it changes again.
-local function hostOne(st, e)
+hostOne = function(st, e)
   local b = e.b
   local exact = st.exact                                    -- exact mode: the stock of every building, whatever it is
   if e.rival and not exact then return end                  -- lane 39: a rival's building only in exact mode
   if e.camp and not exact then return end                   -- lane 42: a bandit camp's stock only in exact mode
+  -- (task 76e) exact mode: a type changed in place is seen at this read (not at every 4th pass) and the entry renamed
+  -- at once; the new name goes whole in this line, the old one is told "no longer sent" in the same line
+  if exact and F.cfg.rekey and not e.dump and not e.gone then
+    local okT, t = pcall(A.btype, b)
+    if okT and t ~= e.t then
+      local old = rekey(e)
+      if old then
+        if F.sent[old] then F.sent[old] = nil; st.entries[#st.entries + 1] = old .. "-" end
+        st.stale = true                                     -- the whole list is still built again
+      end
+    end
+  end
   if e.store and not e.res and not exact then return end    -- nothing of a plain storage building is sent from here
   local clock = st.clock
   local L = F.sent[e.k]
+  -- (lane 76) a pile the game has taken away is not read again: its actor stays readable for a while, cleared
+  if e.dump and F.on.pileFast and not pileThere(e) then st.stale = true; return end
   if e.liveAt == nil or st.n - e.liveAt >= 4 then
     local live = (not b.onFire) and b:IsConstructed() and true or false
     local t = A.btype(b)
@@ -531,19 +845,82 @@ local function hostOne(st, e)
   -- (exact mode reads every building on every pass: a change must not wait up to 4 s for its turn)
   if not full and not exact and L.quiet >= 6 and (st.n + L.phase) % 4 ~= 0 then return end
   local items = {}
+  -- (lane 87, cure 3) A SITE'S GOODS AND ITS WORK FROM ONE MOMENT. The bar is half goods, half work; the goods went out
+  -- in this entry, the work in the values module's HW P (its POLL every 0.5 s), and a friend wrote each in the tick it
+  -- came: for up to half a second a pair the host never had at one moment (C4: 13 readings at two decimals in session
+  -- l87c). Now a site's entry carries the work fraction of this tick (wq: its bits, a whole number, from a SITEHP POLL
+  -- of this tick), and its goods are read through reflection in this same tick (the native table can be up to 0.1 s
+  -- older). Finished or not from this moment too (the building's own word): a building the table shows unfinished, or
+  -- one last sent unfinished. siteNow: true = a site now, false = finished now (it was a site), nil = not this path.
+  local siteNow = nil
+  if exact and F.on.bar and F.on.wq ~= false and F.on.stock and not e.dump and F.S and F.S.role == "host" then
+    local was = L.v.cn == 0 or F.unfin[e.k] == true
+    local tab = consHost(b, false)                          -- the table's word (nil: no table, or not in it)
+    if was or tab == false or (tab == nil and not e.live) then
+      local okC, c = pcall(function() return b.Data.constructed end)
+      if okC and type(c) == "boolean" then siteNow = (c == false) end
+    end
+  end
   if F.on.stock and (exact or not e.store) then
-    local inv = invHost(b); local n0 = #items
+    local refl = e.direct or siteNow ~= nil
+    local inv = refl and invOf(b) or invHost(b); local n0 = #items
+    -- (lane 76, task 76h) A building the game has just taken away (demolished) stays readable for a while, cleared:
+    -- its list reads empty. Sent as "every good 0" it emptied a friend's building, which a friend still has until
+    -- the people module removes it: session l76t, 8 demolitions of a rival's buildings on the host: the friend
+    -- showed the building EMPTY for 0.28 to 1.2 s before it was gone there (a state the host never had: the host's
+    -- building goes with its goods in it, in one tick). So a building whose goods are all gone at once is looked
+    -- at first: still that building at that place? If not, nothing of it is sent; "no longer sent" follows with
+    -- the host's next list. (A pile has its own rule above.)
+    if not e.dump and L and next(inv) == nil and next(L.g) ~= nil and not pileThere(e) then
+      st.stale = true; e.gone = true; bump("goneNotRead"); return
+    end
+    -- (lane 76) a pile whose last goods were just taken: the game removes it within a moment. Its empty state is not
+    -- sent (session l76k: a friend showed the empty pile 2.6 s); "no longer sent" follows in the tick it is gone.
+    -- A pile that stays empty for cfg.pileEmpty s is sent empty after all.
+    if e.dump and F.on.pileFast and L and next(inv) == nil and next(L.g) ~= nil then
+      L.emptyAt = L.emptyAt or clock
+      if clock - L.emptyAt < F.cfg.pileEmpty then bump("pileEmptyHeld"); return end
+    elseif L then L.emptyAt = nil end
     for g, a in pairs(inv) do if full or L.g[g] ~= a then items[#items + 1] = g .. "=" .. num(a) end end
     if not full then for g in pairs(L.g) do if inv[g] == nil then items[#items + 1] = g .. "=0" end end end
     L.g = inv
     if #items > n0 and not full then L.quiet = 0 else L.quiet = L.quiet + 1 end
     -- lane 41 (scene module): the shown goods follow the stock; a building whose stock changed is read again there
     if #items > n0 then local Qs = rawget(C, "scene"); if Qs and Qs.stockSeen then pcall(Qs.stockSeen, e.k) end end
+    -- lane 76 (timing proof, a test tool): the stock row as it is at this read, dated. Every amount a friend writes
+    -- is one this pass read, so the host's kept reads then hold every value a friend can show.
+    if #items > n0 then proofNote(b, not refl) end         -- (task 76e: and the native table's row it was sent from; lane 87: not for a site's reflected read)
+  end
+  -- (lane 87) finished or not, in the entry that carries the stock of that moment (see SITES)
+  if exact and F.on.bar and F.on.stock and not e.dump then
+    local was = L.v.cn == 0 or F.unfin[e.k] == true
+    local cons
+    if siteNow ~= nil then cons = not siteNow else cons = consHost(b, was or not e.live) end     -- (lane 87, cure 3)
+    if cons == false then
+      F.unfin[e.k] = true
+      if full or L.v.cn ~= 0 then items[#items + 1] = "cn=0"; L.v.cn = 0 end
+      -- (lane 87, cure 3) the work fraction of this tick (a fraction of 1 is right here: every part full, goods missing)
+      if siteNow == true then
+        local Vv = rawget(C, "values")
+        local okU, u = false, nil
+        if Vv and Vv.fracNow then okU, u = pcall(Vv.fracNow, e.k, addr(b)) end
+        if okU and type(u) == "number" and (full or L.v.wq ~= u) then items[#items + 1] = "wq=" .. string.format("%d", u); L.v.wq = u; bump("wqSent") end
+      end
+    elseif cons == true and was then
+      F.unfin[e.k] = nil; L.v.cn = 1; L.v.wq = nil
+      items[#items + 1] = "cn=1"; bump("builtSent")
+    end
   end
   -- lane 42: in exact mode every 1 s (exactValuesEvery), and a rival's own settings (build priority, fuel) also on his
   -- sites and upgrades: his AI sets a site's priority on the host only (measured: 4 sites 1 / 4, 2 / 4, 3 / 4)
+  -- (task 76e round 3) a house's or a rival building's own animal count (its animals list), for a friend's choice of
+  -- which animal goes when its town has more than the host's (liveOne)
+  if exact and (e.res or e.rival) and not e.dump and F.on.livestock then
+    local okA, na = pcall(function() return #b.animals end)
+    if okA and type(na) == "number" and (full or L.na ~= na) then L.na = na; items[#items + 1] = "an=" .. na end
+  end
   local vEvery = exact and F.cfg.exactValuesEvery or F.cfg.valuesEvery
-  if F.on.values and (e.res or e.rival) and (e.live or e.upg or (e.rival and exact and not e.dump)) and (full or clock - L.tR >= vEvery) then
+  if F.on.values and (e.res or e.rival) and (e.live or e.upg or (e.rival and exact and not e.dump)) and (full or clock - L.tR >= vEvery or (F.vNow ~= nil and L.tR < F.vNow)) then
     L.tR = clock
     for _, R in ipairs(F.rules) do
       if R.on ~= false and (not R.rival or e.rival) and (R.rival or e.res) and (e.live or R.rival or (e.upg and not R.rival)) then
@@ -566,7 +943,11 @@ local function hostOne(st, e)
   elseif #items > 0 then st.entries[#st.entries + 1] = e.k .. "|" .. table.concat(items, ",") end
   -- lane 39: which families work in a rival's building (its AI assigns them on the host only), every 2 s and with the
   -- keyframe: <bkey>=<family ids rising, or ->/<active families>
-  if e.rival and F.on.rivalWorkers and e.live and not e.dump and (full or clock - (L.tW or -1e9) >= vEvery) then
+  -- (lane 64, task 64d3) also while the building is being upgraded (exact mode, e.upg): a rival house's artisan change
+  -- keeps its family at work on the host (assignedFamilyIDs 1 through the conversion), and with the line held back
+  -- for the whole conversion a friend stood at 0 for 28 to 33 s (sessions l64pin17, l64pin18: 8@9605,7353 and
+  -- 8@9639,7581, the audit's item 6), until the conversion was finished on the host's word
+  if e.rival and F.on.rivalWorkers and (e.live or e.upg) and not e.dump and (full or clock - (L.tW or -1e9) >= vEvery) then
     L.tW = clock
     local ids = {}; local a = b.assignedFamilyIDs
     for j = 1, #a do local v = a[j]; if type(v) ~= "number" then v = un(v) end; v = math.tointeger(tonumber(v)); if v then ids[#ids + 1] = v end end
@@ -595,7 +976,7 @@ local function hostPassJob(st)
     return false
   end
   if st.stale then needIndex(st.clock, true) end           -- a building of the list is gone or has another type: build the list again
-  for k in pairs(F.sent) do if not st.seen[k] then st.entries[#st.entries + 1] = k .. "-"; F.sent[k] = nil end end
+  for k in pairs(F.sent) do if not st.seen[k] then st.entries[#st.entries + 1] = k .. "-"; F.sent[k] = nil; if F.unfin then F.unfin[k] = nil end end end
   if #st.entries > 0 then bump("entries", #st.entries); sendList("F B ", st.entries, ";") end
   if st.workers and #st.workers > 0 then bump("workersSent", #st.workers); sendList("F W ", st.workers, ";") end
   if st.dist and #st.dist > 0 then bump("distSent", #st.dist); sendList("F D ", st.dist, ";") end      -- lane 42
@@ -718,6 +1099,53 @@ function F.keyframe()
   return "keyframe queued"
 end
 
+-- (task 76e) host, exact mode: the buildings whose record of the native table changed (coop_snap.lua N.takeChanged,
+-- ten times a second) are read and sent in this tick, not at the end of the next pass. A building the running pass has
+-- already read goes out with that pass's entry first, in the same line, so a friend never gets an older entry after a
+-- newer one. A building never sent yet waits for the pass (it goes whole).
+-- (lane 87, cure 3; session l87f) a site whose work moved (the values module's poll): sent in the next fast step with
+-- its goods and that work (wq), as a building whose native record changed is
+F.workDue = F.workDue or {}
+function F.workSeen(a) if type(a) == "number" and F.S and F.S.role == "host" then F.workDue[a] = true end end
+local function hostFast(S, clock)
+  local N = rawget(C, "snap"); if not (N and N.takeChanged) then return end
+  local ch = N.takeChanged()
+  if next(F.workDue) ~= nil then ch = ch or {}; for a in pairs(F.workDue) do ch[a] = true end; F.workDue = {}; bump("workFast") end
+  if not (ch and F.cfg.fastHost) then return end
+  local X = F.idx; if not X then return end
+  if not X.byAddr then
+    X.byAddr = {}
+    for _, e in ipairs(X.list) do local a = valid(e.b) and addr(e.b); if a then X.byAddr[a] = e end end
+  end
+  local run
+  for _, j in ipairs(F.jobs) do if j.name == "hostPass" and j.st.entries then run = j.st end end
+  local st = { entries = {}, seen = {}, clock = clock, n = F.passNo or 0, exact = true }
+  local n = 0
+  for a in pairs(ch) do
+    local e = X.byAddr[a]
+    if not e then e = addNew(X, a) end                       -- (lane 64, task 64d) a new building: in the list now, sent now
+    if e and not e.dup and (F.sent[e.k] or e.new) and valid(e.b) then
+      if run then                                            -- the running pass's entry of this building goes first
+        local head1, head2 = e.k .. "|", e.k .. "!|"
+        for i = #run.entries, 1, -1 do
+          local x = run.entries[i]
+          if x:sub(1, #head1) == head1 or x:sub(1, #head2) == head2 then st.entries[#st.entries + 1] = x; table.remove(run.entries, i) end
+        end
+      end
+      local ok, err = pcall(hostOne, st, e)
+      if not ok then fail("fast " .. e.k, err) end
+      -- (round 3) a name this read gave (a rename) is one the running pass has seen: its end must not tell it
+      -- "no longer sent" when the pass had read the building under its old name already
+      if run and run.seen and st.seen[e.k] then run.seen[e.k] = true end
+      n = n + 1; if n >= F.cfg.fastMax then break end
+    end
+  end
+  if st.stale then needIndex(clock, true) end
+  if #st.entries > 0 then bump("fastEntries", #st.entries); bump("fastTicks"); sendList("F B ", st.entries, ";") end
+  if st.workers and #st.workers > 0 then sendList("F W ", st.workers, ";") end
+  if st.dist and #st.dist > 0 then sendList("F D ", st.dist, ";") end
+end
+
 local function hostTick(S, clock)
   local cfg = F.cfg
   -- a join or resync: friends drop every line while they load. When it ends, everything is sent complete again.
@@ -733,10 +1161,21 @@ local function hostTick(S, clock)
     end
   elseif F.sentX == true then F.sentX = false; send("F X 0"); log("exact mode ended on the host") end
   needIndex(clock, false)
+  if ex and F.on.pileFast and F.on.stock and F.idx then timed("hostPiles", hostPiles, S, clock) end      -- lane 76
   if F.on.levels and F.idx and clock - (F.t.lv or -1e9) >= 2.0 then F.t.lv = clock; timed("hostLevels", hostLevels, clock) end
-  if (F.on.stock or F.on.values) and F.idx and clock - F.t.pass >= cfg.passEvery then
+  -- (lane 64, round 5) the host's day change: the game's day step has just changed the counts of days (a home's
+  -- mourning, its market days). A friend whose own game no longer counts mourning (NOMOURN) shows the host's old
+  -- value until the new one arrives, so the rule values of every building are read in a pass that starts now, not
+  -- at their next turn (up to 2 s: the pass every second, a building's values at most once a second).
+  local okD, dayN = pcall(function() return S.eng:getDaysTotal() end)
+  if okD and dayN ~= F.hostDay then
+    if F.hostDay ~= nil then F.vNow = clock; F.t.pass = -1e9; bump("dayPush") end
+    F.hostDay = dayN
+  end
+  if (F.on.stock or F.on.values) and F.idx and clock - F.t.pass >= (ex and cfg.exactPassEvery or cfg.passEvery) then
     if addJob("hostPass", hostPassJob, {}) then F.t.pass = clock end
   end
+  if ex and F.on.stock and F.idx then timed("hostFast", hostFast, S, clock) end                       -- (task 76e)
   if F.on.livestock and clock - F.t.live >= (hostExact() and cfg.exactLiveEvery or cfg.liveEvery) then F.t.live = clock; timed("hostLive", hostLive, S, clock) end
   if F.on.families and clock - F.t.fam >= (hostExact() and cfg.exactFamEvery or cfg.famEvery) then   -- lane 42: 1 s in exact mode
     local key = clock - (F.t.famKey or -1e9) >= cfg.keyEvery
@@ -822,6 +1261,7 @@ local function evalExact(st, k, H, e)
   end
 end
 
+evalExactF = evalExact
 -- lane 42: a rival's site or upgrade (not finished, or being upgraded): only his own settings (the rival rules: build
 -- priority, fuel setting), as the host has them, at once, as plain values (the construction panel's own priority
 -- arrows write buildPriority the same way, coop_town.lua PRIO). Only a building that is still in this copy's building
@@ -854,6 +1294,22 @@ local function evalBuilding(st, k)
   local e = byKey(k)
   if not e then bump("noBuilding"); st.miss = true; return end
   local b = e.b
+  -- (lane 87) the host's entry said "finished now" (cn=1) and carries the goods after the finish: this copy's site is
+  -- finished first (the sites module's own finish; it takes the building from the game's list itself). A site that is
+  -- newer here than the sites module's last look waits up to 2 s for that look, its goods unwritten.
+  if st.exact and H.cnT and F.on.bar then
+    local Bs = rawget(C, "sites")
+    local okF, r = false, nil
+    if Bs and Bs.finishNow then okF, r = pcall(Bs.finishNow, k) end
+    if okF and r == "new here" and os.clock() - H.cnT < 2.0 then bump("siteWaits"); F.dirty[k] = true; return end
+    H.cnT = nil
+    if okF and r == "finished" then bump("siteFinished")
+    elseif okF and r == "not a site now" then bump("siteAlready")
+    else
+      bump("siteNotFinished")
+      if not F.siteSaid then F.siteSaid = true; log("site %s is finished on the host (its stock line said so) and could not be finished here first (%s): its goods are written; the sites module's word finishes it", k, tostring(r)) end
+    end
+  end
   if st.exact then evalExact(st, k, H, e) end              -- stock of every building, sites and piles too; below: the rule values
   if e.dump then return end
   local clock, paused = st.clock, st.paused
@@ -907,9 +1363,13 @@ local function evalBuilding(st, k)
           if H.new[code] then H.new[code] = nil; seen("val", d, R.margin) end
           -- lane 42: in exact mode the host's value is written at once (no margin, no settle time)
           local mg, stl = R.margin, R.settle; if st.exact and not R.daily then mg, stl = 0, 0.0 end
+          -- (lane 64, round 5) mourning days this copy's game no longer counts itself (NOMOURN): the host's value at
+          -- once, in exact mode or not; no day of this copy's own can come between
+          local hostOnly = code == "mp" and F.ownMourning ~= nil and not F.ownMourning()
+          if hostOnly then mg, stl = 0, 0.0 end
           -- counted once per value the host sent: its lower value came before this copy's own day change (the case
           -- that ran a day ahead), or its higher one after it (harmless)
-          if st.exact and R.daily and d ~= 0 and math.abs(d) <= mg and H.sinceV[code] == nil then bump(d < 0 and "val_dayHeldLower" or "val_dayHeldHigher") end
+          if st.exact and R.daily and not hostOnly and d ~= 0 and math.abs(d) <= mg and H.sinceV[code] == nil then bump(d < 0 and "val_dayHeldLower" or "val_dayHeldHigher") end
           if due(H.sinceV, code, d, mg, stl, clock, paused) then
             -- (lane 42: a house being upgraded gets its house values too; a rival's own settings then go by rivalSiteRules)
             e.live = liveNow(e); local can = e.live or (e.upg and not R.rival and upgNow(e))
@@ -953,7 +1413,7 @@ local function evalStorage(st)
   end
 end
 
-local function put(b, g, d) b:addToInventory({ Type = g, amt = d }) end
+put = function(b, g, d) b:addToInventory({ Type = g, amt = d }) end
 
 -- one correction. The difference is read again (ticks have passed since it was planned).
 local function doOp(op, clock)
@@ -961,6 +1421,8 @@ local function doOp(op, clock)
   if not same(e) then bump("stale"); return end
   local b = e.b
   if op.exact then                                          -- exact mode: the amount itself, with the game's own addToInventory
+    -- (task 76e) the host's amount as it stands now: a newer line may have come since this write was planned
+    local H = F.host.b[op.k]; if H and H.full and H.g then op.want = H.g[op.g] or 0 end
     local have = stockOf(b, op.g); local d = op.want - have
     if d == 0 then return end
     put(b, op.g, d)
@@ -1018,8 +1480,22 @@ local function doOp(op, clock)
   end
 end
 
+doOpF = doOp
 -- st.quick: only the buildings the host has just sent new values for (a large difference is then corrected within a
 -- fraction of a second); everything else is the business of the full pass
+-- (lane 87, cure 3) the work fraction (wq) of the host's latest entry for this building, held now: called in the tick
+-- that entry's goods are written (friendFast, the pass's step of that building), and for an entry without goods to
+-- write at the end of the pass. The values module finds the building itself (its own rule for a site of this tick).
+local function wqHold(k)
+  local H = F.host.b[k]
+  if not (H and H.wqNew) then return end
+  H.wqNew = nil
+  local Vv = rawget(C, "values")
+  if H.v and type(H.v.wq) == "number" and Vv and Vv.factsHold and F.on.bar then
+    local ok, r = pcall(Vv.factsHold, k, H.v.wq)
+    if ok and r then bump("wqHeld") elseif not ok then bump("wqErr") end
+  end
+end
 local function friendPassJob(st)
   if not st.keys then
     st.keys = {}
@@ -1046,16 +1522,34 @@ local function friendPassJob(st)
     -- (exact mode: storage buildings come complete from the host like every other building; nothing to do here)
     if not st.exact and not st.quick and (st.paused or st.n % 3 == 0) then local ok, err = pcall(evalStorage, st); if not ok then fail("storage", err) end end
     -- what is too much goes to storage first, so that what is short can come out of storage in the same pass
-    table.sort(st.ops, function(a, b) return a.d < b.d end)
+    -- (lane 76) exact mode: by building, so that all goods of one building are written in one step (see below)
+    if st.exact then table.sort(st.ops, function(a, b) if a.k ~= b.k then return a.k < b.k end; if a.g ~= b.g then return a.g < b.g end; return a.d < b.d end)
+    else table.sort(st.ops, function(a, b) return a.d < b.d end) end
     st.plan = true; st.j = 0
     if st.miss then needIndex(st.clock, true) end
     return false
   end
   st.j = st.j + 1
   local op = st.ops[st.j]
-  if not op then bump(st.quick and "quickPasses" or "passes"); return true end
+  if not op then
+    for _, k in ipairs(st.keys or {}) do wqHold(k) end        -- (lane 87, cure 3) entries without goods to write
+    bump(st.quick and "quickPasses" or "passes"); return true
+  end
   local ok, err = pcall(doOp, op, st.clock)
   if not ok then fail("write " .. op.k .. " good " .. op.g, err) end
+  -- (lane 76) exact mode: every good of this building in the same tick. One good a tick showed a state the host
+  -- never had between two ticks (two goods changed in one pass of the host: one written, the other not yet).
+  if op.exact then
+    local nx = st.ops[st.j + 1]
+    while nx and nx.exact and nx.e == op.e do
+      st.j = st.j + 1
+      local ok2, err2 = pcall(doOp, nx, st.clock)
+      if not ok2 then fail("write " .. nx.k .. " good " .. nx.g, err2) end
+      nx = st.ops[st.j + 1]
+    end
+    proofNote(op.e.b)                                       -- (timing proof: this copy's row, dated at the write)
+    wqHold(op.k)                                            -- (lane 87, cure 3) its work in the same tick
+  end
   return false
 end
 
@@ -1108,6 +1602,7 @@ local function pilesStep(S, clock)
         local ok, msg = P.pilegone(e.b)
         F.pileGone[e.k] = nil; F.dumpSeen[e.k] = nil
         bump(ok and "pilesGone" or "pilesFailed")
+        if ok then proofGone(e.k) end
         log("exact mode: pile %s removed here (%s): %s", e.k, why, tostring(msg))
         needIndex(clock, true)
       end
@@ -1150,7 +1645,7 @@ local function liveOne(S, r, k, role, have, n, clock)
     if not pos then return end
     local ok, u = pcall(function() return S.eng:SpawnLivestock(role, pos, r) end)
     if ok and valid(u) then
-      F.made[#F.made + 1] = { u = u, role = role, k = k }; bump("liveMade")
+      F.made[#F.made + 1] = { u = u, role = role, k = k, r = r }; bump("liveMade"); F.liveSeen[k] = nil
       log("livestock %s kind %d: %d here, %d on the host: one made", k, role, have, n)
     else bump("liveFailed"); log("livestock %s kind %d: could not be made (%s)", k, role, tostring(u)) end
   elseif F.on.livestockRemove then
@@ -1160,11 +1655,39 @@ local function liveOne(S, r, k, role, have, n, clock)
       if not valid(m.u) or m.u.dead then table.remove(F.made, i)
       elseif not victim and m.role == role and m.k == k and m.u.currentUnitRole == role then victim = m.u; table.remove(F.made, i) end   -- (not by currentRegion: that is where it stands, and one made beside another region's building never matched)
     end
+    -- (lane 76, task 76e round 3) WHICH ANIMAL GOES. Lane 88's session l88e: a rival house lost its chicken coop on the
+    -- host (its three hens with it), the friend still had them, and this step removed three free hens: from ANOTHER
+    -- house, which kept its three on the host. That house then showed 2, then 1, the whole session (133 readings a
+    -- value the host never had). So the host now sends each house's and rival building's own animal count (F B
+    -- item an=), and an animal of a building that has more here than on the host goes first; an animal of a building
+    -- that has no more than the host's is never taken.
+    local surplus, keep = nil, {}
+    if not victim and F.idx then
+      for _, e in ipairs(F.idx.list) do
+        local H = F.host.b[e.k]; local hn = H and H.v and H.v.an
+        if hn and valid(e.b) then
+          local okA, arr = pcall(function() return e.b.animals end)
+          local n = okA and arr and #arr or 0
+          for j = 1, n do
+            local u = arr[j]; if type(u) ~= "table" and type(u) ~= "userdata" then u = nil end
+            if u and valid(u) then
+              local okR, ro = pcall(function() return u.currentUnitRole end)
+              if okR and ro == role then
+                local ua = addr(u)
+                if n > hn and not surplus then surplus = u elseif ua then keep[ua] = true end
+              end
+            end
+          end
+        end
+      end
+      if surplus then victim = surplus; bump("liveSurplusHouse") end
+    end
     if not victim then
       for i = #list, 1, -1 do
         local u = list[i]
         local ok, free = pcall(function() return not valid(u.animalAssignedTo) and not valid(u.chosenPasture) and #u.Tasks == 0 end)
-        if ok and free then victim = u; break end
+        local ua = addr(u)
+        if ok and free and not (ua and keep[ua]) then victim = u; break end
       end
     end
     if not victim then bump("liveNoVictim"); return end
@@ -1173,6 +1696,64 @@ local function liveOne(S, r, k, role, have, n, clock)
     else bump("liveFailed"); log("livestock %s kind %d: could not be removed (%s)", k, role, tostring(e)) end
   end
 end
+-- (lane 76, task 76h) ONE OWNER OF A TOWN'S ANIMAL COUNT: this step. Sessions l76q and l76s: a rival house got its
+-- goats (upgrade 28: two animals of kind 13) or pigs (upgrade 27: two of kind 19) on the host; this step made the two
+-- missing animals after 0.5 s, and 0.05 to 0.6 s later the people module started the same upgrade here, whose own
+-- game brought two more: 4 where the host had 2, for 5 s and 10 s (values the host never had). When the people module
+-- came first (l76s, upgrade 28) nothing was wrong. The upgrade's animals are the real ones (they are in the house's
+-- own animal list), so the animals this step made are STAND-INS (F.made): the moment the town's count rises above
+-- the host's by another maker (the people module's upgrade, a finished backyard, an ordered animal arriving), the
+-- stand-ins of that kind are taken out, in the same tick: liveTakeBack. The people module calls it right after its
+-- upgrade call; the tick below calls it when a town with stand-ins counts more animals than at the tick before.
+-- Only stand-ins are taken, never an animal of the game's own; a count that is too high because the HOST lost an
+-- animal keeps its wait (the host's word of the death comes first: the events module, E AD).
+local function liveTakeBack(S, r, k, why)
+  local want = F.host.a[k]; if not want or not valid(r) then return 0 end
+  local have, taken = nil, 0
+  for i = #F.made, 1, -1 do
+    local m = F.made[i]
+    if not valid(m.u) or m.u.dead then table.remove(F.made, i)
+    elseif m.k == k and m.u.currentUnitRole == m.role then
+      have = have or liveCounts(r)
+      if (have[m.role] or 0) > (want[m.role] or 0) then
+        local n = have[m.role]
+        local ok = pcall(function() S.eng:destroyUnit(m.u) end)
+        if ok then
+          have[m.role] = n - 1; table.remove(F.made, i); taken = taken + 1; bump("liveTakenBack")
+          log("livestock %s kind %d: %d here, %d on the host (%s): one made here before is taken out at once", k, m.role, n, want[m.role] or 0, tostring(why))
+        end
+      end
+    end
+  end
+  if taken > 0 then F.liveSeen[k] = nil end
+  return taken
+end
+-- every tick, one call per town that has stand-ins: did its count rise?
+local function liveWatch(S)
+  local done = {}
+  for i = #F.made, 1, -1 do
+    local m = F.made[i]
+    if m and not done[m.k] and m.r and valid(m.r) and F.host.a[m.k] then
+      done[m.k] = true
+      local tot = m.r:getTotalLivestockCount()
+      local seen = F.liveSeen[m.k]
+      F.liveSeen[m.k] = tot
+      if seen and tot > seen then
+        local wantTot = 0; for _, n in pairs(F.host.a[m.k]) do wantTot = wantTot + n end
+        if tot > wantTot then liveTakeBack(S, m.r, m.k, "this copy's own game brought animals") end
+      end
+    end
+  end
+end
+-- for the people module: right after an upgrade it started on a building of region <r>
+function F.liveUpgraded(S, r)
+  if S.role ~= "friend" or not F.on.livestock or #F.made == 0 or not valid(r) then return 0 end
+  local k = rkey(r); if not k then return 0 end
+  return liveTakeBack(S, r, k, "the upgrade started here brought its own")
+end
+-- for the events module: the host said that an animal of this kind died in region <k>, and it died here. The host's
+-- count line may still show the count of before for a moment: no animal is made for that kind for 1.5 s.
+function F.liveDied(k, role) F.liveHold[tostring(k) .. ":" .. tostring(role)] = os.clock() end
 local function liveApply(S, clock)
   local T = C.town
   for _, R in ipairs(liveRegions(S, F.exact == true)) do
@@ -1195,11 +1776,17 @@ local function liveApply(S, clock)
           else
             F.liveSince[id] = F.liveSince[id] or clock
             -- lane 42: a rival town waits less (lane 76: 0.5 s for an animal to make, 5 s for one to take away)
-            if clock - F.liveSince[id] >= ((R.rival and F.exact) and (n > have[role] and F.cfg.rivalLiveSettle or F.cfg.rivalLoseSettle) or F.cfg.liveSettle) then
+            -- (lane 64, task 64d2) the player's own town too, for an animal to make, in exact mode (F.on.liveFastMake)
+            local make = n > have[role]
+            local fast = F.exact and make and (R.rival or F.on.liveFastMake)
+            if make and clock - (F.liveHold[id] or -1e9) < 1.5 then bump("liveHeldDeath")   -- (the host's word of a death just came: see F.liveDied)
+            elseif clock - F.liveSince[id] >= (fast and (R.rival and F.cfg.rivalLiveSettle or F.cfg.liveMakeSettle) or ((R.rival and F.exact) and F.cfg.rivalLoseSettle or F.cfg.liveSettle)) then
               F.liveSince[id] = clock
-              -- (lane 76) a rival town in exact mode: every animal the host has more, in this look (at most 4)
-              local times = (R.rival and F.exact and n > have[role]) and math.min(n - have[role], 4) or 1
+              -- (lane 76) a rival town in exact mode: every animal the host has more, in this look (at most 4); (lane 64) the
+              -- player's town as well
+              local times = fast and math.min(n - have[role], 4) or 1
               for j = 1, times do liveOne(S, R.r, R.k, role, have[role] + j - 1, n, clock) end
+              if fast and not R.rival then bump("liveFastMade", times) end
             end
           end
         end
@@ -1234,13 +1821,15 @@ local function friendFamJob(st)
         -- own day step (F.dayRule): the marks are counted by each copy's daily step too (hunger and cold go down a
         -- day without food or fuel, sickness and an injury run out by days).
         local go
-        if F.exact then go = F.dayRule(F.famDay, id, w - cur, os.clock(), st.paused); if not go then bump("fam_dayHeld") end
+        if F.famOff and F.famOff[p] then go = false
+        elseif F.exact then go = due(F.famDay, id, w - cur, 1, F.cfg.famWait, os.clock(), st.paused); if not go then bump("fam_dayHeld") end
         else go = st.paused or F.famSince[id] end
         if go then
           F.famSince[id] = nil
           if isB then cs[p] = (w == 1) else cs[p] = w end
           local back = f.ConsumptionStatus[p]; if type(back) == "boolean" then back = back and 1 or 0 end
           if back == w then bump("famFix"); if F.cfg.verbose then log("family %s %d %s %s -> %s", R.k, i, p, tostring(cur), tostring(w)) end
+          elseif j > FAM_OLD then F.famOff = F.famOff or {}; F.famOff[p] = true; bump("err"); log("family mark %s is left alone from now: family %d did not take %s (%s)", p, i, tostring(w), tostring(back))
           else F.on.families = false; bump("err"); log("item families switched off: %s of family %d did not take %s (%s)", p, i, tostring(w), tostring(back)) end
         else F.famSince[id] = st.clock end
       else F.famSince[id] = nil; F.famDay[id] = nil end
@@ -1306,6 +1895,31 @@ end
 -- A single load restores the save's morning while the host keeps playing. Use
 -- the mourning value read on the host's stated day, including across the local
 -- day step that will otherwise subtract the same day twice.
+-- (lane 64, round 5) does this copy's own game still take a day off a home's mourning at its day change? Not when
+-- the native piece holds that step (coop_patch item NM, NOMOURN, on a friend): then the days are the host's alone,
+-- its value is written the moment its line comes, and nothing here has to work around this copy's own count.
+-- Asked at most once a second (the answer is the native piece's status file).
+local function ownMourning()
+  local clock = os.clock()
+  if F.nmT == nil or clock - F.nmT >= 1.0 then
+    F.nmT = clock
+    local P = rawget(C, "patch"); local ok, st = pcall(function() return P and P.noMourn and P.noMourn() end)
+    local held = ok and st == "on"
+    if held ~= F.nmHeld then log("mourning days: %s", held and "this copy's game no longer counts them (NOMOURN on): the host's value is written as it comes" or "this copy's game counts them itself: the one-day rule applies") end
+    F.nmHeld = held
+  end
+  return not F.nmHeld
+end
+F.ownMourning = ownMourning
+local function mournNow(k, value)
+  local e = byKey(k)
+  if not e and not F.idx and C.town and C.town.findB then
+    local t, x, y = parseKey(k)
+    local b = C.town.findB(t, x * 10, y * 10, 10)
+    if valid(b) then e = {b = b, k = k} end
+  end
+  if e and same(e) and (liveNow(e) or upgNow(e)) and e.b.mourningPeriod ~= value then e.b.mourningPeriod = value; bump("mourningNow") end
+end
 local function restoreMourning(k, day)
   local m = F.catchMourning[k]
   if day > m.day then F.catchMourning[k] = nil; return end
@@ -1333,7 +1947,11 @@ local function onLine(S, w)
       if k then
         if rest == "-" then
           F.host.b[k] = nil; F.dirty[k] = nil; F.catchMourning[k] = nil
-          if k:sub(1, 3) == "88@" then F.pileGone[k] = clock end      -- the host's pile is gone (exact mode: pilesStep)
+          do local Vv = rawget(C, "values"); if Vv and Vv.factsEnd then pcall(Vv.factsEnd, k) end end   -- (lane 87, cure 3) the key back to HW P
+          if k:sub(1, 3) == "88@" then
+            F.pileGone[k] = clock                              -- the host's pile is gone (exact mode: pilesStep)
+            if F.on.pileFast then F.t.piles = -1e9; if F.pileWant then F.pileWant[k] = nil end end   -- lane 76: in the next tick
+          end
         else
           local full = rest:sub(1, 1) == "!"; local body = rest:match("|(.*)$") or ""
           local H = F.host.b[k]
@@ -1347,14 +1965,26 @@ local function onLine(S, w)
               v = math.tointeger(v) or v
               if g then H.g[g] = v; H.new[g] = true
               elseif code == "md" then day = v
-              else H.v[code] = v; H.new[code] = true; if code == "mp" then mourning = v end end
+              else
+                H.v[code] = v; H.new[code] = true; if code == "mp" then mourning = v end
+                if code == "cn" then H.cnT = (v == 1) and clock or nil end     -- (lane 87) the host's building was finished now
+                if code == "wq" then H.wqNew = true end                           -- (lane 87, cure 3) held with this entry's goods
+                if code == "cn" and v == 1 then local Vv = rawget(C, "values"); if Vv and Vv.factsEnd then pcall(Vv.factsEnd, k) end end
+              end
               bump("items")
             end
           end
+          -- lane 76: a pile's stock is written in the next tick (and a pile this copy does not have yet as it comes)
+          if F.on.pileFast and k:sub(1, 3) == "88@" then F.pileWant = F.pileWant or {}; F.pileWant[k] = clock end
           if mourning and day and F.on.values and RULE.mp.on ~= false and (F.rejoining or F.catchMourning[k])
-              and not C.hold and valid(S.eng) then
+              and not C.hold and valid(S.eng) and ownMourning() then
             F.catchMourning[k] = { value = mourning, day = day }
             restoreMourning(k, S.eng:getDaysTotal())
+          elseif mourning and F.on.values and RULE.mp.on ~= false and not C.hold and valid(S.eng) and not ownMourning() then
+            -- (lane 64, round 5) NOMOURN: the host's days are written the moment the line is read, also a replayed
+            -- line right after a load, before the building pass has its index (sitting rl7: the save's value, a
+            -- day old by then, stood for 1.2 s until the pass wrote the host's)
+            mournNow(k, mourning)
           end
           -- lane 41 (scene module): this stock is written here soon; the friend's own shown goods follow it
           if body ~= "" then local Qs = rawget(C, "scene"); if Qs and Qs.stockSeen then pcall(Qs.stockSeen, k) end end
@@ -1412,6 +2042,134 @@ exactSwitch = function(clock)
   return ex
 end
 
+-- (lane 76, task 76e) friend, exact mode: the buildings the host has just sent (F.dirty) are written in this tick, all
+-- goods of a building in one step, instead of by a quick pass that waits while a full pass is being worked through.
+-- The full pass still looks at every building every second; a write it planned before takes the host's amount as it
+-- stands when it writes (doOp).
+local function friendFast(clock)
+  local st = { keys = {}, ops = {}, clock = clock, paused = A.isPaused() and true or false, exact = true, quick = true, n = 1, i = 0 }
+  for k in pairs(F.dirty) do st.keys[#st.keys + 1] = k end
+  F.dirty = {}
+  for _, k in ipairs(st.keys) do
+    local ok, err = pcall(evalBuilding, st, k)
+    if not ok then fail("fast apply " .. k, err) end
+  end
+  table.sort(st.ops, function(x, y) if x.k ~= y.k then return x.k < y.k end; if x.g ~= y.g then return x.g < y.g end; return x.d < y.d end)
+  for _, op in ipairs(st.ops) do
+    local ok, err = pcall(doOp, op, clock)
+    if not ok then fail("fast write " .. op.k .. " good " .. op.g, err) end
+  end
+  for _, k in ipairs(st.keys) do wqHold(k) end               -- (lane 87, cure 3) the work of each entry, in this tick
+  if st.miss then needIndex(clock, true) end
+  bump("fastApplied", #st.keys)
+end
+-- (lane 76, task 76e) A BUILDING'S STORAGE COUNTERS AFTER AN UPGRADE STARTED HERE. Sessions l76w and l76y, the same
+-- rival storehouse twice (72 becomes 99): the people module's BeginUpgrade here left numStoredGeneric at 127 and 161,
+-- values the host never had (the host: 126 then 125; 162 then 160), with every good equal, until this module's next
+-- write to it 1.8 s and 0.44 s later (a write recounts). The upgrade's use of materials ends in no recount here (the
+-- native switch puts the goods back). So a building whose upgrade starts on this copy (the people module for a
+-- rival's, the town module for a player's) gets the same write of amount 0 the registration makes (the game's
+-- addToInventory recounts the three counters from the goods as they stand) in that tick and in every tick for 2 s;
+-- after a town action of the upgrade kinds every building being upgraded here is taken in for 2 s. Writes no amount.
+F.recountList = F.recountList or {}
+function F.recountSoon(b, secs)
+  if not (F.exact and F.S and F.S.role == "friend") or not valid(b) then return false end
+  local a = addr(b); if not a then return false end
+  -- (task 76e round 3) an upgrade started here can change the building's type (72 becomes 99): its list entry is
+  -- renamed in this tick and the host's values under the new name, if they came already, are written in this tick
+  -- (probe k76a: without it the friend waited for its next pass, 0.75 s after its own change)
+  if F.cfg.rekey and F.idx then
+    for _, e in ipairs(F.idx.list) do
+      if e.b == b or addr(e.b) == a then
+        if rekey(e) and F.host.b[e.k] then F.dirty[e.k] = true end
+        break
+      end
+    end
+  end
+  local x = F.recountList[a]
+  if not x then x = { b = b, n = 0 }; F.recountList[a] = x end
+  x.untilC = math.max(x.untilC or 0, os.clock() + (secs or 2.0))
+  local ok = pcall(put, b, 16, 0)
+  if ok then x.n = x.n + 1; bump("upgRecount") else bump("upgRecountFailed") end
+  return ok
+end
+function F.recountUpgrading(secs)
+  if not (F.exact and F.S and F.S.role == "friend") then return false end
+  F.recountScanUntil = math.max(F.recountScanUntil or 0, os.clock() + (secs or 2.0))
+  return true
+end
+-- (lane 76, task 76e) A FAMILY'S MARKS AT THIS COPY'S OWN DAY CHANGE. Sessions l76w to l76b: 11 to 18 readings of a
+-- rival family's hunger a session (fc ConsumptionStatus.hunger, "stale"): at the day sample the friend showed 2 where
+-- the host had had 1 for the whole day; 0.13 s later the facts module wrote 1. This copy's own day step had changed
+-- the mark (a day without food here), the host's had not. The rule for a difference of one (F.dayRule, lane 64) waits
+-- because this copy's day step may still come; at this copy's own day change it HAS come and will not come again that
+-- day. So in the tick this copy's day changes every followed family (the player's and, in exact mode, the rivals')
+-- gets the host's last word for each mark at once. A host whose own step changed the mark too sends it within 0.5 s;
+-- until then the friend shows the host's value of before its day change (held by the host until a moment ago).
+local function famDayChange(S, clock)
+  local okD, day = pcall(function() return S.eng:getDaysTotal() end)
+  if not okD or type(day) ~= "number" then return end
+  local last = F.famDayLast; F.famDayLast = day
+  if not last or last == day or (F.famOff and F.famOff.all) then return end
+  local n, w0 = 0, 0
+  for _, R in ipairs(liveRegions(S, F.exact == true)) do
+    local M = F.host.m[R.k]
+    if M and valid(R.r) then
+      local fams = R.r.workerFamilies
+      for i = 1, #fams do
+        local want = M[i]; local f = fams[i]
+        if want and f then
+          local home = "-"; local h = f.familyHome
+          if valid(h) then local ok, hk = pcall(keyOf, h); if ok then home = hk end end
+          if home == want.home then
+            local cs = f.ConsumptionStatus
+            for j, p in ipairs(FAM) do
+              local w = want.v[j]
+              if w and not (F.famOff and F.famOff[p]) then
+                local cur = cs[p]; local isB = type(cur) == "boolean"; if isB then cur = cur and 1 or 0 end
+                if type(cur) == "number" and cur ~= w then
+                  if isB then cs[p] = (w == 1) else cs[p] = w end
+                  local id = R.k .. ":" .. i .. ":" .. p
+                  F.famSince[id] = nil; F.famDay[id] = nil; n = n + 1
+                  if math.abs(w - cur) > 1 then w0 = w0 + 1 end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  if n > 0 then bump("famDayFix", n); log("families: %d mark(s) set back to the host's at this copy's day change (day %d; %d by more than one)", n, day, w0) end
+end
+-- (task 76e) for the world module, at the start of its tick on a friend: the same, before any of its reads (session
+-- l7d: two readings showed this copy's own day step in the one read the world module made before the facts module)
+function F.famDayNow(S)
+  if not (S and S.role == "friend" and F.on.families and next(F.host.m) ~= nil and F.S == S) then return end
+  timed("famDayChange", famDayChange, S, os.clock())
+end
+local function recountStep(S, clock)
+  if F.recountScanUntil and clock < F.recountScanUntil then
+    local arr = S.eng.buildingArr
+    for i = 1, #arr do
+      local b = un(arr[i])
+      if valid(b) then
+        local ok, u = pcall(function() return b.isBeingUpgraded end)
+        local a = ok and u and addr(b)
+        if a and not F.recountList[a] then F.recountList[a] = { b = b, n = 0, untilC = clock + 2.0 } end
+      end
+    end
+  elseif F.recountScanUntil then F.recountScanUntil = nil end
+  for a, x in pairs(F.recountList) do
+    if clock > x.untilC or not valid(x.b) or not F.exact then
+      if x.n > 0 then bump("upgRecountDone") end
+      F.recountList[a] = nil
+    else
+      local ok = pcall(put, x.b, 16, 0)
+      if ok then x.n = x.n + 1; bump("upgRecount") else bump("upgRecountFailed") end
+    end
+  end
+end
 local function friendTick(S, clock)
   if rawget(C, "hold") then return end                     -- a join or repair is loading a save
   local cfg = F.cfg
@@ -1431,8 +2189,22 @@ local function friendTick(S, clock)
   --  the next day's mourning waited out the 3 s day rule: 2.986 s behind the host. Only a gap measured in this world counts.)
   if F.rejoining and not S.replay and S.clockGap and S.clockGap ~= F.gap0 and math.abs(S.clockGap) <= 0.02 then F.rejoining = nil end
   if next(F.catchMourning) and valid(S.eng) then
-    local day = S.eng:getDaysTotal()
-    for k in pairs(F.catchMourning) do restoreMourning(k, day) end
+    if not ownMourning() then F.catchMourning = {}       -- (NOMOURN came on meanwhile: nothing to work around)
+    else
+      local day = S.eng:getDaysTotal()
+      for k in pairs(F.catchMourning) do restoreMourning(k, day) end
+    end
+  end
+  -- (lane 64, task 64d) a new building in the list in the tick the native table shows it (see addNew): the host's values
+  -- for it, when they came first, are written in this tick (friendFast)
+  if ex and F.idx and F.on.newAtOnce then
+    local Ns = rawget(C, "snap"); local ch = Ns and Ns.takeChanged and Ns.takeChanged()
+    if ch then
+      for a in pairs(ch) do
+        local e = addNew(F.idx, a)
+        if e and not e.dup and F.host.b[e.k] then F.dirty[e.k] = true end
+      end
+    end
   end
   if ex and F.idx and clock - (F.t.idxN or 0) >= cfg.exactIndexAge then        -- a new building: seen within a second
     F.t.idxN = clock
@@ -1443,6 +2215,8 @@ local function friendTick(S, clock)
   if ex and F.idx and (F.regIdx ~= F.idx or clock - (F.t.reg or 0) >= 5.0) then
     if addJob("register", regJob, {}) then F.regIdx = F.idx; F.t.reg = clock end
   end
+  if ex and F.on.pileFast and F.idx then timed("friendPiles", friendPiles, S, clock) end                 -- lane 76
+  if ex and (F.recountScanUntil or next(F.recountList)) then timed("recount", recountStep, S, clock) end   -- (task 76e)
   if ex and clock - (F.t.piles or 0) >= 1.0 then F.t.piles = clock; timed("piles", pilesStep, S, clock) end
   if clock - F.t.prune >= 2.0 then
     F.t.prune = clock
@@ -1450,6 +2224,7 @@ local function friendTick(S, clock)
     F.holds = keep
     for k, t in pairs(F.holdR) do if clock - t > 10.0 then F.holdR[k] = nil end end
   end
+  if ex and cfg.fastFriend and F.on.stock and F.idx and next(F.dirty) ~= nil then timed("friendFast", friendFast, clock) end   -- (task 76e)
   if (F.on.stock or F.on.values) and F.idx and next(F.host.b) ~= nil then
     if clock - F.t.apply >= cfg.applyEvery then
       if addJob("friendPass", friendPassJob, {}) then F.t.apply = clock; F.t.quick = clock end
@@ -1457,10 +2232,12 @@ local function friendTick(S, clock)
       if addJob("friendPass", friendPassJob, { quick = true }) then F.t.quick = clock end
     end
   end
+  if F.on.livestock and #F.made > 0 and next(F.host.a) ~= nil then local okW, eW = pcall(liveWatch, S); if not okW then bump("liveWatchErr"); F.lastErr = tostring(eW) end end
   if F.on.livestock and next(F.host.a) ~= nil and clock - F.t.live >= (F.exact == true and cfg.exactLiveEvery or cfg.liveEvery) then F.t.live = clock; timed("friendLive", liveApply, S, clock) end
   if F.on.levels and F.idx and F.hostL and next(F.hostL) ~= nil and clock - (F.t.lv or -1e9) >= 1.0 then F.t.lv = clock; timed("friendLevels", friendLevels, clock) end
   if ex and F.on.dist and F.idx and F.hostD and next(F.hostD) ~= nil and clock - (F.t.dist or -1e9) >= 0.25 then F.t.dist = clock; timed("friendDist", friendDist) end   -- lane 42
   if ex and F.on.rivalWorkers and F.idx and F.hostW and next(F.hostW) ~= nil and clock - (F.t.wk or -1e9) >= 0.5 then F.t.wk = clock; timed("friendWorkers", friendWorkers, clock) end
+  if F.on.families and next(F.host.m) ~= nil then timed("famDayChange", famDayChange, S, clock) end   -- (task 76e)
   if F.on.families and next(F.host.m) ~= nil and clock - F.t.fam >= (F.exact and cfg.exactFamEvery or cfg.famEvery) then   -- lane 42: 1 s in exact mode
     if addJob("friendFam", friendFamJob, { clock = clock, paused = A.isPaused() and true or false }) then F.t.fam = clock end
   end

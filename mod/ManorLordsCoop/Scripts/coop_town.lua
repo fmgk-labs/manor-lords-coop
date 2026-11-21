@@ -23,10 +23,23 @@
 --   * pawn hooks (playBuildEffects, commitRoad, addCommitFieldRequest, removeRoad, deselectBuilding, add*Request): only calls
 --     made on the LOCAL lord (S.p1) count. Replays go through the helper lord (or straight to a building), so their hooks,
 --     whether they fire in the same call or a few ticks later, are ignored.
---   * object hooks (building and region setters): T.depth > 0 while a replay runs blocks the same-call echo; afterwards the
---     replay's target is "touched" for 0.75 s and an identical absolute setter call on it within 3 s is dropped (T.expect).
+--   * object hooks (building and region setters): T.depth > 0 while a replay runs blocks the same-call echo. After it, an
+--     echo is told apart from a player's action by WHAT it is, never by time alone (lane 81): an absolute value (a setter
+--     that is not relative, a panel-written field, MAINT, TRAINREG) has a "slot" (kind, target, and the arguments that
+--     pick the value, e.g. the good; selVal). A replay writes the value it applied into T.expect[slot] for 3 s; a
+--     local record for that slot with the SAME value is the echo and is dropped; a record with ANOTHER value is the
+--     player's and is sent, and it ends the expectation (so the player going back to the replayed value is sent too).
+--     Until lane 81 every record on a target replayed in the last 0.75 s was dropped: a player's change to a region
+--     setting inside 0.75 s of the other player's change to that region was lost (known issue G22, lane 80: host 34,
+--     friend 33 for 44 s). Relative actions and actions caught on the local lord have no value to compare: the depth
+--     marker and the local-lord test are their only guards, as they are the only thing that can make such a call.
 --     Records for buildings or regions the local lord does not own are dropped too.
 --   * other modules that call these setters to correct state must wrap the call: Coop.town.quiet(function() ... end).
+--   * ORDER (lane 81): the host applies lines in the order they reach it and every copy must end with the host's last
+--     value. A friend ignores its own line coming back from the host; so when another player's line for the same slot
+--     is applied here AFTER this friend sent its own (the two crossed), the host applied this friend's line last, and
+--     the friend puts its own value back when its own line comes back (T.ownSlot; decided in the apply queue, in the
+--     host's order: ownBack). A sent local record also ends every echo expected on its target, of any kind.
 --
 -- STATUS (each action's def carries it; "live" and "live1" actions are on by default; Coop.town.enable(name, true) switches one on)
 --   live   = SEE point and replay recipe both run live (README sessions given per action)
@@ -85,9 +98,15 @@ local CFG_DEFAULT = {
   tolR = 300,            -- road end points match within this (lane_t1 T5b)
   maxQueue = 200,        -- hook records kept at most (a stopped tick must not grow memory)
   payCost = true,        -- place types with a treasury cost through the helper, funding it first (see HAZARDS); off = refuse them
+  placeGate = "refuse",  -- (lane 81) host: a friend's building on a place already taken here is refused ("log": only logged; "off")
+  areaGate = "refuse",   -- (lane 81) the same for a friend's field, pasture, market or burgage plots (by the outline its line carries):
+                         -- refused only for the kinds in areaRefuse (their undo proven in the game), logged for the others; "off": no check
+  areaRefuse = { FIELD = true, PASTURE = true },
   moveCost = true,       -- T14 on the host: charge the lord the cost of a helper placement (friends: the host's treasury push rules)
   fieldClockwise = false,-- also write borderIsClockwise after a field replay (lane_t1 T3, static)
   retryS = 3.0,          -- a replay whose target is not there yet (BUILD then SLEEP) is retried this long
+  reqWait = true,        -- (lane 76, round 4) the host's UPGRADE / EXT / ARTISAN line waits for its own game's pump
+  reqRefuse = true,      -- (lane 76, round 5) ... and is not sent when its game did not carry the request out
 }
 if T.cfgVer ~= 2 then T.cfg.payCost = nil; T.cfgVer = 2 end          -- the payCost default changed after a live confirmation
 for k, v in pairs(CFG_DEFAULT) do if T.cfg[k] == nil then T.cfg[k] = v end end
@@ -302,13 +321,20 @@ function T.addRoad(r, id)
 end
 function T.findRoad(ax, ay, bx, by)
   local tol = T.cfg.tolR
-  for _, e in pairs(T.ridx) do
-    if sameEnds(e, ax, ay, bx, by, tol) and valid(e.obj) then
-      local ok, id = pcall(rident, e.obj)
-      if ok and id and sameEnds(id, ax, ay, bx, by, tol) then return e.obj end
+  -- (lane 64, task 64d) the index's road handles are kept up to one pass of the slices (seconds), and roads are in no
+  -- native table: the guard of kept handles in valid() cannot know when a removed road is freed. So an entry is used
+  -- only with the handle of the engine's road list of THIS tick at the same address (the list is read by address
+  -- only: GetAddress does not touch a road); a road removed since the index saw it is never touched
+  local arr = C.s.eng.roads
+  local live = {}
+  for i = 1, #arr do local r = un(arr[i]); local a = addrOf(r); if a then live[a] = r end end
+  for a, e in pairs(T.ridx) do
+    local r = live[a]
+    if r and sameEnds(e, ax, ay, bx, by, tol) and valid(r) then
+      local ok, id = pcall(rident, r)
+      if ok and id and sameEnds(id, ax, ay, bx, by, tol) then e.obj = r; return r end
     end
   end
-  local arr = C.s.eng.roads
   for i = 1, #arr do
     local r = un(arr[i])
     if valid(r) then local ok, id = pcall(rident, r); if ok and id and sameEnds(id, ax, ay, bx, by, tol) then T.addRoad(r, id); return r end end
@@ -330,7 +356,7 @@ function T.reset()
   T.bidx = {}; T.bcache = {}; T.bpos = 1; T.bgen = 1
   T.ridx = {}; T.rpos = 1; T.rgen = 1
   T.rcache = {}
-  T.touched = {}; T.expect = {}; T.recentDem = {}
+  T.touched = {}; T.expect = {}; T.recentDem = {}; T.ownSlot = {}; T.goneB = {}; T.olCache = {}; T.undoQ = {}
   T.p1addr = nil
   T.reassignW = nil; T.wareaB = nil      -- (lane 59) a villager / a building noted by a hook (REASSIGN: watched for 90 s; WAREA): not kept past a load
 end
@@ -416,7 +442,7 @@ end
 -- name buildings in other positions too. A disconnected train endpoint is explicitly "-".
 local firstBuilding = { BUILD=true, MOVE=true, DEMOLISH=true, EXTEND=true, UPGRADE=true, EXT=true, ARTISAN=true,
   ADDW=true, REMW=true, FAMS=true, MAINT=true, WAREA=true, TRAINREG=true, TRAINCON=true, ANAME=true,
-  GATE=true, PLAN=true, PLANWALL=true, PLANSEL=true, PLANMOVE=true, PLANWPTS=true }
+  GATE=true, PLAN=true, PLANWALL=true, PLANSEL=true, PLANMOVE=true, PLANWPTS=true, PLANJOIN=true }
 local function wireBuilding(key)
   if not key then return false end
   local fields = split(key, ",")
@@ -451,17 +477,42 @@ function T.emitAction(S, act, fields)
   -- remember our own recent actions by tag, so a refusal from the host can be undone by name (see the NAK branch)
   T.own = T.own or {}; T.ownList = T.ownList or {}
   local tag = S.name .. ":" .. T.seq
-  T.own[tag] = { act = act, f1 = tostring(fields):match("^(%S+)"), t = os.clock() }
+  T.own[tag] = { act = act, f1 = tostring(fields):match("^(%S+)"), all = tostring(fields), t = os.clock() }   -- (lane 81) the whole line: an undo of a drawn kind needs all of it
+  -- (lane 81) a friend's absolute value: noted by its slot until the host's copy of the line comes back (the order rule)
+  if S.role ~= "host" then
+    local slot = T.lineSlot(act, fields)
+    if slot then T.ownSlot = T.ownSlot or {}; T.ownSlot[slot] = tag; T.own[tag].slot = slot; T.own[tag].fields = fields end
+  end
   T.ownList[#T.ownList + 1] = tag
   if #T.ownList > 200 then T.own[table.remove(T.ownList, 1)] = nil end
   stat(S, "t_sent")
   A.log("TOWN sent %s %d %s %s", S.name, T.seq, act, fields:sub(1, 160))
+  T.proofDense()
   return T.seq
 end
 
+-- (lane 76, task 76e) the timing proof (coop_world.lua, a test tool, off for players) dates every building that comes
+-- or goes in the next 1.5 s within one frame: a town action changes buildings on this copy now
+function T.proofDense()
+  local Wd = rawget(C, "world")
+  if Wd and Wd.cfg and Wd.cfg.proof and Wd.proofDense then pcall(Wd.proofDense, 1.5) end
+end
 -- a replay is done: host passes it on (or refuses it); everyone logs it
 function T.finish(S, job, status, fwd, extra)
   local ok = status == "ok"
+  -- (lane 81) a demolish of a building this copy had removed a moment before: nothing to do, nothing refused, not passed on
+  if status == "already gone" then
+    T.results[job.origin .. ":" .. job.n] = status; stat(S, "t_alreadyGone")
+    A.log("TOWN APPLIED %s %s:%s (from %s, waited %.0f ms): already gone here (removed by this copy a moment before): nothing to do, not refused", job.act, job.origin, tostring(job.n), tostring(job.from), (vnow() - job.t) * 1000)
+    return
+  end
+  if ok then T.proofDense() end
+  -- (lane 76, task 76e) an upgrade carried out here: the storage counters of every building being upgraded are
+  -- recounted for 2 s (coop_facts.lua F.recountUpgrading; the counters after an upgrade end in no recount here)
+  if ok and (job.act == "UPGRADE" or job.act == "EXTEND" or job.act == "EXT" or job.act == "ARTISAN") then
+    local Fm = rawget(C, "facts")
+    if Fm and Fm.recountUpgrading then pcall(Fm.recountUpgrading, 2.0) end
+  end
   local tag = job.origin .. ":" .. job.n
   T.results[tag] = status
   stat(S, ok and "t_applied" or "t_failed")
@@ -489,10 +540,45 @@ function T.quiet(fn, ...)
   return table.unpack(r, 2, r.n)
 end
 
+-- (lane 81) an absolute value's slot: what picks the value (all arguments but the last of a setter with two or more,
+-- e.g. the good of a trade limit) and the value itself (the last argument; the whole text for one argument or a field)
+local function selVal(d, v)
+  v = tostring(v or "-")
+  if d and d.argt and #d.argt >= 2 then
+    local sel, val = v:match("^(.*),([^,]*)$")
+    if sel then return sel, val end
+  end
+  return "", v
+end
+local function isAbs(d) return d ~= nil and not d.rel and d.abs == true end   -- setters that are not relative, fields, MAINT, TRAINREG
+-- the slot as a line names it (target key, value): the same on every copy, used for the order rule (T.ownSlot)
+function T.lineSlot(act, fields)
+  local d = T.defs[act]; if not isAbs(d) then return nil end
+  local f1, f2 = tostring(fields or ""):match("^(%S+)%s+(%S+)")
+  if not f1 then return nil end
+  local sel = selVal(d, f2)
+  return act .. " " .. f1 .. " " .. sel
+end
+-- a replay applied value v of kind d on obj: the same value seen locally for that slot within 3 s is its echo
 local function touch(obj, d, argstr)
   local a = addrOf(obj); if not a then return end
-  T.touched[a] = os.clock()
-  if d and not d.rel and argstr then T.expect[d.name .. "@" .. a .. ":" .. argstr] = os.clock() + 3.0 end
+  T.touched[a] = os.clock()             -- still read by coop_realm.lua and coop_x_build.lua (their own watchers)
+  if isAbs(d) and argstr then
+    local sel, val = selVal(d, argstr)
+    T.expect[d.name .. "@" .. a .. ":" .. sel] = { v = val, t = os.clock() + 3.0 }
+  end
+end
+-- is a local record (kind name, target address, value text) the echo of a replay? Another value ends the expectation.
+function T.isEcho(name, a, argstr)
+  local d = T.defs[name]
+  local sel, val = selVal(d, argstr)
+  local k = name .. "@" .. tostring(a) .. ":" .. sel
+  local e = T.expect[k]
+  if not e then return false end
+  if e.t < os.clock() then T.expect[k] = nil; return false end
+  if e.v == val then return true end
+  T.expect[k] = nil                     -- the player set another value: what follows on this slot is the player's
+  return false
 end
 
 -- ---------------------------------------------------------------- actions and hooks
@@ -613,6 +699,8 @@ hook(BP_PAWN .. "playBuildEffects", { "BUILD", "MOVE", "PLAN" }, function(self, 
     local m = p.plannerModeBld
     local pos = a1 and a1:get(); local rr = p.bbox.RelativeRotation
     if not pos then return { k = "_note", msg = "planner placement without a position: not sent, copies now differ" } end
+    -- (lane 83) a part placed on a wall splits the wall on every copy (the PLAN replay does the same): not sent as PLANWPTS
+    local XB = T.xbuild; if XB and XB.mark then XB.mark(m) end
     -- (the record's field "t" is its time, set by onHook: the part's type is "bt")
     return { k = "PLAN", obj = m, bt = int(p.placeBuilding), x = pos.X, y = pos.Y, z = pos.Z, yaw = rr and rr.Yaw or 0, n0 = #m.blueprints }
   end
@@ -727,6 +815,151 @@ end
 -- status: proven live (README sessions 7b and 8: placeBuilding, bbox, requestBuild on the helper; session 8 relayed it);
 -- costed types with the funded helper: proven live on one copy (README session 14) and on two copies in both directions
 -- (lane 2, session 2: "helper paid 50, lord charged 50" on the host, "lord charged 0" on the friend, both treasuries equal)
+-- (lane 81, case A of the own-click rule) a friend's building on a place the HOST already has a building on. The
+-- friend's own game checked the place against ITS world, where the place was still free (the host built there a
+-- moment earlier); the helper's placement does not check at all (live ca: a saw pit placed on a finished lodge, and
+-- one 2 m from a site 0.3 s old, both "ok"). The host asks the engine whether the new building's centre lies inside
+-- another building's border (RTSMultiEngineCPP:pointCollidesWithBuildingBorder: true on a finished building, on a
+-- site at once, false 6 m away), and counts it only when a building other than a pile (type 88) stands within 15 m:
+-- the point check is true on a pile too, and a player may build where a pile lies. Not caught: an overlap of the
+-- edges with the centre outside every border (the footprint is not read).
+function T.placeBlocked(S, e)
+  local ok, hit = pcall(function() return S.eng:pointCollidesWithBuildingBorder({ X = e.x + 0.0, Y = e.y + 0.0, Z = (e.z or 0) + 0.0 }) end)
+  if not (ok and hit) then return nil end
+  local arr = S.eng.buildingArr
+  for i = 1, #arr do
+    local b = un(arr[i])
+    if valid(b) then
+      local okT, t = pcall(function() return A.btype(b) end)
+      if okT and t ~= 88 then
+        local l = b:K2_GetActorLocation()
+        if not far(l.X, l.Y, e.x, e.y, 1500) then return string.format("type %d at %.0f,%.0f", t, l.X, l.Y) end
+      end
+    end
+  end
+  return nil
+end
+-- (lane 81) THE OUTLINE RULE (edges too). Every building has its outline (finalBorder, 4 to 60 points). A new
+-- building's outline is the outline of a building of the same type already in the world (any owner), turned and moved
+-- to the new place; the rule then asks how much of the smaller outline the two share (sampled on a 50 cm grid).
+-- Calibrated on the clean save (lane_s21_81 out ovl): of 17 overlapping pairs, the market stalls in their marketplace
+-- (91, 93 in 13: 100 %) and stall against stall (14 %), and a rival's type 115 against 115 (11 to 13 %) are how the
+-- game lays them out; every other pair overlaps at most 0.1 % (0.2 m2). So: taken when the shared part is at least
+-- OUTLINE_SHARE of the smaller outline and OUTLINE_M2 square metres, against a building that is not a pile and not a
+-- pair the game lays out together. No building of the type in the world: the centre rule (T.placeBlocked) instead.
+local OUTLINE_SHARE, OUTLINE_M2 = 0.05, 2.0
+local TOGETHER = { [91] = { [13] = true, [91] = true, [93] = true }, [93] = { [13] = true, [91] = true, [93] = true },
+                   [13] = { [91] = true, [93] = true }, [115] = { [115] = true } }
+T.OUTLINE_SHARE, T.OUTLINE_M2, T.TOGETHER = OUTLINE_SHARE, OUTLINE_M2, TOGETHER
+local function outlineOf(b)
+  local o = {}
+  pcall(function() local a = b.finalBorder; local n = #a; for i = 1, n do local p = a[i]; o[#o + 1] = { p.X, p.Y } end end)
+  return o
+end
+local function inPoly(x, y, P) local c = false; local j = #P; for i = 1, #P do local a, b = P[i], P[j]; if ((a[2] > y) ~= (b[2] > y)) and (x < (b[1] - a[1]) * (y - a[2]) / (b[2] - a[2]) + a[1]) then c = not c end; j = i end; return c end
+local function boxOf(P) local x0, y0, x1, y1 = 1e18, 1e18, -1e18, -1e18; for _, p in ipairs(P) do if p[1] < x0 then x0 = p[1] end; if p[2] < y0 then y0 = p[2] end; if p[1] > x1 then x1 = p[1] end; if p[2] > y1 then y1 = p[2] end end; return x0, y0, x1, y1 end
+local function areaOf(P) local s2 = 0; for i = 1, #P do local a, b = P[i], P[i % #P + 1]; s2 = s2 + a[1] * b[2] - b[1] * a[2] end; return math.abs(s2) / 2 end
+-- the shared area (cm2) of two outlines, sampled on a grid over the overlap of their boxes: 50 cm, coarser for a big
+-- overlap box so that a pair never costs more than about 600 samples (live: a 50 cm grid over a big outline held the
+-- game thread for minutes; at 2,500 a lodge beside the manor's 16,000 m2 outline took 5 ms); each sample is tested
+-- against the outline with fewer points first
+local function sharedArea(A, B, step)
+  local ax0, ay0, ax1, ay1 = boxOf(A); local bx0, by0, bx1, by1 = boxOf(B)
+  local x0, y0, x1, y1 = math.max(ax0, bx0), math.max(ay0, by0), math.min(ax1, bx1), math.min(ay1, by1)
+  if x0 >= x1 or y0 >= y1 then return 0 end
+  step = math.max(step or 50, math.sqrt((x1 - x0) * (y1 - y0) / 600))
+  if #B < #A then A, B = B, A end
+  local hit = 0
+  local y = y0 + step / 2
+  while y < y1 do local x = x0 + step / 2; while x < x1 do if inPoly(x, y, A) and inPoly(x, y, B) then hit = hit + 1 end; x = x + step end; y = y + step end
+  return hit * step * step
+end
+T.outline = { of = outlineOf, inPoly = inPoly, shared = sharedArea, area = areaOf }
+-- the outline a building of type t would have at x,y turned to yaw (degrees): a building of that type, moved and
+-- turned; nil when none is in the world. skip = a building not to take (the one being moved). Not for the drawn
+-- kinds: a burgage plot (3), its house (8), a field (5), a pasture (10), a marketplace (13) each has its own shape
+-- (calibration: another plot's outline moved onto a plot shares 9 to 17 %, a house's 9 to 18 %, a market's 7 %)
+local DRAWN = { [3] = true, [5] = true, [8] = true, [10] = true, [13] = true }
+T.DRAWN = DRAWN
+function T.outlineAt(S, t, x, y, yaw, from)
+  if DRAWN[t] and not from then return nil end
+  local src = from
+  if not src then
+    local arr = S.eng.buildingArr
+    for i = 1, #arr do local b = un(arr[i]); if valid(b) then local ok, bt = pcall(function() return A.btype(b) end); if ok and bt == t then src = b; break end end end
+  end
+  if not valid(src) then return nil end
+  local P = outlineOf(src); if #P < 3 then return nil end
+  local l = src:K2_GetActorLocation(); local okR, r = pcall(function() return src:K2_GetActorRotation() end)
+  local d = math.rad((yaw or 0) - ((okR and r and r.Yaw) or 0)); local c, sn = math.cos(d), math.sin(d)
+  local o = {}
+  for i, p in ipairs(P) do local dx, dy = p[1] - l.X, p[2] - l.Y; o[i] = { x + dx * c - dy * sn, y + dx * sn + dy * c } end
+  return o
+end
+-- the first building (not a pile, not a pair the game lays out together, not skip) whose outline shares enough of
+-- the outline P (of a building of type t); a text naming it, or nil
+-- each building's outline, box and area, kept by address and read again only when the building moved, turned or
+-- changed type (reading 4 to 60 points through the scripting layer per building per check was most of a check's time)
+T.olCache = T.olCache or {}
+local function olEntry(b, a, bt)
+  local l = b:K2_GetActorLocation()
+  local e = T.olCache[a]
+  if e and e.t == bt and e.x == l.X and e.y == l.Y then return e end
+  local Q = outlineOf(b)
+  local x0, y0, x1, y1 = boxOf(Q)
+  e = { t = bt, x = l.X, y = l.Y, P = Q, x0 = x0, y0 = y0, x1 = x1, y1 = y1, a = (#Q >= 3) and areaOf(Q) or 0 }
+  T.olCache[a] = e
+  return e
+end
+function T.outlineTaken(S, t, P, skip, share, m2)
+  share = share or OUTLINE_SHARE; m2 = m2 or OUTLINE_M2
+  if not P or #P < 3 then return nil end
+  local aP = areaOf(P); if aP <= 0 then return nil end
+  local px0, py0, px1, py1 = boxOf(P)
+  local sa = skip and addrOf(skip)
+  local arr = S.eng.buildingArr
+  for i = 1, #arr do
+    local b = un(arr[i])
+    local a = addrOf(b)
+    -- far away by the town index's own record of the building: no further read (most buildings of a check)
+    local ix = a and T.bidx[a]
+    local near = not ix or (ix.x > px0 - 8000 and ix.x < px1 + 8000 and ix.y > py0 - 8000 and ix.y < py1 + 8000)
+    if a and a ~= sa and near and valid(b) then
+      local okT, bt = pcall(function() return A.btype(b) end)
+      if okT and bt ~= 88 and not (TOGETHER[t] and TOGETHER[t][bt]) then
+        local e = olEntry(b, a, bt)
+        if #e.P >= 3 and e.x0 < px1 and px0 < e.x1 and e.y0 < py1 and py0 < e.y1 then
+          local sh = sharedArea(P, e.P)
+          local small = math.min(aP, e.a)
+          if small > 0 and sh >= share * small and sh >= m2 * 10000 then
+            return string.format("type %d at %.0f,%.0f (%.0f %% of the smaller outline, %.1f m2)", bt, e.x, e.y, 100 * sh / small, sh / 10000)
+          end
+        end
+      end
+    end
+  end
+  return nil
+end
+-- (lane 81) a friend's drawn area (field, pasture, market: their corners; burgage plots: each lot's corners) by the
+-- outline rule, on the host only. Refused (the friend removes its area by name, the NAK branch) for the kinds in
+-- cfg.areaRefuse: FIELD and PASTURE, their undo proven in the game (u10b: 3 of 3 each, the friend at the host's state
+-- 0.14 to 0.25 s after its line); a MARKET and burgage plots (HOUSE, EXTEND) are logged and built until theirs is.
+-- Time per check in the game: median 1 to 3 ms, worst 7 ms (fields of 30 to 200 m over the manor and the town).
+-- Returns the refusal or nil.
+function T.areaTaken(S, job, t, pts)
+  if S.role ~= "host" or job.origin == S.name or T.cfg.areaGate == "off" then return nil end
+  local P = {}; for i, p in ipairs(pts or {}) do P[i] = { p.X, p.Y } end
+  if #P < 3 then return nil end
+  -- a drawn area's own edges may lie over a neighbour a little: calibration on the clean save (26 fields, pastures,
+  -- markets and plots by their corners) gave one pair at 7 % / 11.2 m2 (a rival's plot over a rival's type 68), all
+  -- others below 0.1 %: the area tolerance is 10 % of the smaller outline and 4 m2
+  local ok, taken = pcall(T.outlineTaken, S, t, P, nil, 0.10, 4.0)
+  if not (ok and taken) then return nil end
+  stat(S, "t_areaTaken")
+  if T.cfg.areaGate == "refuse" and T.cfg.areaRefuse and T.cfg.areaRefuse[job.act] then return "the place is taken on the host (" .. taken .. ")" end
+  A.log("TOWN %s %s:%s: the place is taken on the host (%s): built anyway (areaGate log)", tostring(job.act), tostring(job.origin), tostring(job.n), taken)
+  return nil
+end
 def { name = "BUILD", status = "live", ref = "README s7b, s8, s14", helper = true, wait = 1,
   ready = function(S, rec)
     if valid(rec.obj) then T.addB(rec.obj) end
@@ -737,6 +970,16 @@ def { name = "BUILD", status = "live", ref = "README s7b, s8, s14", helper = tru
     -- types 100 and 483 would belong to the pawn that places them (lane_t1 T14, READ 4b9b100): refuse rather than give the helper a building
     if e.t == 100 or e.t == 483 then return "type " .. e.t .. " cannot be placed through the helper" end
     if T.findB(e.t, e.x, e.y) then return "ok" end                  -- already there (a repeated line)
+    if S.role == "host" and job.origin ~= S.name and T.cfg.placeGate ~= "off" then   -- (lane 81) never on a friend
+      local P = T.outlineAt(S, e.t, e.x, e.y, e.yaw)
+      local taken
+      if P then taken = T.outlineTaken(S, e.t, P) else taken = T.placeBlocked(S, e) end
+      if taken then
+        stat(S, "t_placeTaken")
+        if T.cfg.placeGate == "refuse" then return "the place is taken on the host (" .. taken .. ")" end
+        A.log("TOWN BUILD %s:%s: the place is taken on the host (%s): built anyway (placeGate log)", job.origin, tostring(job.n), taken)
+      end
+    end
     local cost, why = costGate(S, e.t); if not cost then return why end
     local h = A.helper(); if not valid(h) then return "no helper" end
     if not clearMoved(h) then return "helper still holds a moved building" end
@@ -755,7 +998,15 @@ def { name = "MOVE", status = "console2", ref = "lane_t1 T8d; lane 2 runs s3, s4
     local o, e = decB(job.f[1]), decB(job.f[2]); if not (o and e) then return "bad fields" end
     if e.t == 100 or e.t == 483 then return "type " .. e.t .. " cannot be placed through the helper" end
     local old = T.findB(o.t, o.x, o.y)
-    if not old then if T.findB(e.t, e.x, e.y) then return "ok" end; return "retry:old building not found" end
+    -- (lane 81) the host removed the moved building itself a moment ago (its own demolish, or one still draining in
+    -- its pawn's list): the friend's move is refused with this reason, and the friend removes its moved copy at the
+    -- new place (the undo, as for a refused building). Without it the helper moved a building being demolished.
+    if old then local oa = addrOf(old); if oa and T.recentDem[oa] and os.clock() - T.recentDem[oa] < 5 then return "moved building gone on the host" end end
+    if not old then
+      if T.findB(e.t, e.x, e.y) then return "ok" end
+      if T.wasGone(o) then return "moved building gone on the host" end
+      return "retry:old building not found"
+    end
     local cost, why = costGate(S, e.t); if not cost then return why end   -- a move runs build() too, so it charges the same way (READ)
     local h = A.helper(); if not valid(h) then return "no helper" end
     if not clearMoved(h) then return "helper still holds a moved building" end
@@ -901,6 +1152,8 @@ local function applyField(plotType, t)
     local workers = int(job.f[3]); local smooth, corners = decPts(job.f[4]), decPts(job.f[5])
     if not c or #smooth < 3 then return "bad fields" end
     if T.findB(t, c.X, c.Y) then return "ok" end
+    local taken = T.areaTaken(S, job, t, #corners >= 3 and corners or smooth)
+    if taken then return taken end
     local h = A.helper(); if not valid(h) then return "no helper" end
     h.placeBuilding = 0
     h:setFieldMode(true, plotType)
@@ -1003,6 +1256,10 @@ local function applyHouse(S, job, first, ext)
     if #lots == 0 then return "no lots" end
     local tr = lots[1].primaryBuildingTransform.Translation
     if T.findB(3, tr.X, tr.Y) then return "ok" end
+    for _, l in ipairs(lots) do
+      local taken = T.areaTaken(S, job, 3, (#l.corners >= 3) and l.corners or l.smoothBorder)
+      if taken then return taken end
+    end
     local h = A.helper(); if not valid(h) then return "no helper" end
     h.placeBuilding = 0
     h:setFieldMode(true, 3)
@@ -1016,15 +1273,39 @@ local function applyHouse(S, job, first, ext)
     h:commitField()
     h:setFieldMode(false, 0)
     noExt()
-    local made = 0; local got = {}
-    for _, l in ipairs(lots) do
-      local t2 = l.primaryBuildingTransform.Translation; local b = findNew(S, 3, t2.X, t2.Y, n0)
-      if b then made = made + 1; T.addB(b); touch(b); got[#got + 1] = #b.FieldPoints .. "/" .. #b.fieldBorderPoints .. " of " .. #l.smoothBorder .. "/" .. #l.corners end
+    -- (lane 81, lane 87's l87g) the game can make a plot's house a few frames after commitField: the lots are looked
+    -- for again each tick for up to HOUSE_WAIT s (a pending helper job), not once. Before, a house made a moment later
+    -- was "made 0 of 1 lots" (FAILED: no hold of the values module on the new site, so this copy's own carriers
+    -- brought it a timber 22.7 s before the host had one), and the house still stood.
+    local found = {}
+    local function look()
+      local made, got = 0, {}
+      for i, l in ipairs(lots) do
+        local t2 = l.primaryBuildingTransform.Translation
+        local b = found[i] or findNew(S, 3, t2.X, t2.Y, n0)
+        if b then
+          if not found[i] then found[i] = b; T.addB(b); touch(b) end
+          made = made + 1; got[#got + 1] = #b.FieldPoints .. "/" .. #b.fieldBorderPoints .. " of " .. #l.smoothBorder .. "/" .. #l.corners
+        end
+      end
+      return made, got
     end
-    A.log("TOWN house lots: %d of %d made, written as %s, border and corner points on the new houses: %s", made, #lots, table.concat(how, ","), table.concat(got, "; "))
-    if made ~= #lots then return string.format("made %d of %d lots (%s)", made, #lots, table.concat(how, ",")) end
-    return "ok"
+    local made, got = look()
+    local function done(m, g, waited)
+      A.log("TOWN house lots: %d of %d made%s, written as %s, border and corner points on the new houses: %s", m, #lots,
+        waited and string.format(" (after %.2f s)", waited) or "", table.concat(how, ","), table.concat(g, "; "))
+      if m ~= #lots then return string.format("made %d of %d lots (%s)", m, #lots, table.concat(how, ",")) end
+      return "ok"
+    end
+    if made == #lots then return done(made, got) end
+    T.pend = { kind = "house", job = job, t0 = vnow(), check = function(S2, Pd, h2, waited)
+      local m, g = look()
+      if m == #lots or waited >= T.HOUSE_WAIT then return done(m, g, waited) end
+      return nil
+    end }
+    return "pending"
 end
+T.HOUSE_WAIT = 3.0
 def { name = "HOUSE", status = "console2", ref = "lane_t1 T4; lane 2 run s6", helper = true, wait = 3,
   ready = readyHouse, apply = function(S, job) return applyHouse(S, job, 1, nil) end }
 -- EXTEND <the house the draft extends> <lots as HOUSE>   (lane 29; see the addCommitFieldRequest hook above)
@@ -1074,17 +1355,72 @@ end)
 -- status: static read only (lane_t1 T5: the building is appended to the helper's demolishRequests, which the helper's Tick
 -- drains with demolish(b, refund=true) - the same path as the click. A direct building:demolish() is never used: it was in
 -- the script that crashed first in session 14.)
-def { name = "DEMOLISH", status = "static", ref = "lane_t1 T5", helper = true,
+-- (lane 81, the own-click rule) two players demolish the same building within a moment: the host removed it first, the
+-- friend's line finds nothing. That is no refusal (the friend wants it gone, and it is gone): "already gone", told in
+-- the log, neither refused (a refusal made the friend reload every copy) nor passed on. Only a building THIS copy removed
+-- in the last T.GONE_FOR s counts; a building the host never had is still refused.
+T.GONE_FOR = 30.0
+function T.noteGone(e)
+  if not (e and e.t and e.x and e.y) then return end
+  T.goneB = T.goneB or {}
+  local now = os.clock()
+  for i = #T.goneB, 1, -1 do if now - T.goneB[i].c > T.GONE_FOR then table.remove(T.goneB, i) end end
+  T.goneB[#T.goneB + 1] = { t = e.t, x = e.x, y = e.y, c = now }
+end
+function T.wasGone(e)
+  local now = os.clock()
+  for _, g in ipairs(T.goneB or {}) do
+    if g.t == e.t and now - g.c <= T.GONE_FOR and not far(g.x, g.y, e.x, e.y, T.cfg.tolB) then return true end
+  end
+  return false
+end
+-- (lane 76, task 76e round 3) A DEMOLISH ON THE HOST. Session l7p: the host's line went at the confirm, the host's
+-- own game took the building out of its list a moment later (its pawn Tick drains demolishRequests), while the friend
+-- removed it as soon as the line came: the friend showed the building gone 0.16 s before the host had it gone. So on
+-- the host the line waits until the building has left the host's own building list, at most DEM_WAIT s (then it goes
+-- as before). The checks of the first call (the job board, the duplicate) are made once.
+local DEM_WAIT = 1.0
+local function demStillThere(S, rec)
+  local b = rec.obj
+  if not valid(b) then return false end
+  local okD, dying = pcall(function() return b.bActorIsBeingDestroyed end)
+  if okD and dying == true then return false end
+  local ok, there = pcall(function()
+    local arr = S.eng.buildingArr; local a = rec.addr
+    for i = 1, #arr do if addrOf(un(arr[i])) == a then return true end end   -- (the length first: no read past the end)
+    return false
+  end)
+  return ok and there == true
+end
+T.demStillThere = demStillThere
+def { name = "DEMOLISH", status = "static", ref = "lane_t1 T5", helper = true, wait = DEM_WAIT + 1.0,
   ready = function(S, rec)
-    local now = os.clock()
-    if valid(rec.obj) and C.jobs and C.jobs.gone then pcall(C.jobs.gone, { rec.obj }, "demolish_own") end   -- (lane 35) this player's own demolish
-    if rec.addr and T.recentDem[rec.addr] and now - T.recentDem[rec.addr] < 5 then return nil, "duplicate" end
-    if rec.addr then T.recentDem[rec.addr] = now end
-    return bkeyOf(rec.snap)
+    if not rec.demKey then
+      local now = os.clock()
+      if valid(rec.obj) and C.jobs and C.jobs.gone then pcall(C.jobs.gone, { rec.obj }, "demolish_own") end   -- (lane 35) this player's own demolish
+      if rec.addr and T.recentDem[rec.addr] and now - T.recentDem[rec.addr] < 5 then return nil, "duplicate" end
+      if rec.addr then T.recentDem[rec.addr] = now end
+      T.noteGone(rec.snap)                                               -- (lane 81) this copy's own removal
+      rec.demKey = bkeyOf(rec.snap)
+      if not rec.demKey then return nil, "no name" end
+    end
+    if S.role == "host" and rec.addr and vnow() - rec.t < DEM_WAIT and demStillThere(S, rec) then return "wait" end
+    return rec.demKey
   end,
   apply = function(S, job)
     local e = decB(job.f[1]); if not e then return "bad fields" end
-    local b = T.findB(e.t, e.x, e.y); if not b then return "building not found" end
+    local b = T.findB(e.t, e.x, e.y)
+    -- (lane 81) this copy's own demolish of it is under way (the pawn drains its list in its own tick): a second one
+    -- here would demolish it twice (live r5c: two piles on the friend, the host one)
+    -- A building that IS here is skipped only when it is that same object (its address) this copy asked to remove
+    -- a moment ago; the place alone never says so: a building of the same type put up again at that place since is a
+    -- new one and is demolished (the advisor's case: build, demolish, build again, demolish within 30 s)
+    if b then
+      local ra = addrOf(b)
+      if ra and T.recentDem[ra] and os.clock() - T.recentDem[ra] < 5 then return "already gone" end
+    elseif T.wasGone(e) then return "already gone"
+    else return "building not found" end
+    T.noteGone(e)                                                        -- (lane 81) removed here by this replay
     local h = A.helper(); if not valid(h) then return "no helper" end
     if not T.requestDemolish(h, b) then return "could not add the building to the helper's demolishRequests" end
     T.pend = { kind = "demolish", job = job, e = e, t0 = vnow() }
@@ -1127,29 +1463,107 @@ def { name = "ROADDEL", status = "static", ref = "lane_t1 T5b", helper = true,
 -- {buildingMaster, upgradeID, slot} (lane_t1 T8, struct READ). The engine pump applies them for playerRef only, so the
 -- other copies call the building's own function, which charges the building's owner and region (READ 4d0aaa0).
 -- "Order oxen/horse/mule/hound/pig/goat" are upgrades too (ids 13, 19, 21, 26, 27, 28) and reach orderLivestock natively.
+-- (lane 76, task 76e round 3) AN ANIMAL ORDERED ON THE HOST. Probe o76a: an ox ordered at the player's stable reached
+-- the friend 0.60 s BEFORE the host had it: the hook sends the line at the request, the host's own game carries the
+-- request out in its pump a moment later, while a friend calls BeginUpgrade at once (and the animal comes inside that
+-- call). So on the host an order's line waits until the order's region counts more animals than at the request, at
+-- most ORDER_WAIT s (then it goes as before).
+local ANIMAL_ORDER = { [13] = true, [19] = true, [21] = true, [26] = true, [27] = true, [28] = true }
+local ORDER_WAIT = 2.0
+local function animalsOf(b) local ok, n = pcall(function() return b.Region:getTotalLivestockCount() end); if ok and type(n) == "number" then return n end end
+-- (lane 76, task 76e round 5) what a request can change on the building, read by property only (no game call: this
+-- runs in the hook too): the upgrades done, being upgraded, the artisan job, the extensions' types
+local function reqState(b)
+  local ok, s = pcall(function()
+    local t = {}
+    local a = b.upgradesDone; for i = 1, #a do local v = a[i]; if type(v) ~= "number" then v = un(v) end; t[#t + 1] = tostring(v) end
+    local e = {}; local ex = b.Extensions; for i = 1, #ex do local x = ex[i]; local okT, ty = pcall(function() return x.Type end); e[#e + 1] = okT and tostring(ty) or "?" end
+    return table.concat(t, ",") .. "|" .. tostring(b.isBeingUpgraded) .. "|" .. tostring(b.artisanJob) .. "|" .. table.concat(e, ",")
+  end)
+  return ok and s or nil
+end
+T.reqState = reqState
+-- how often the request's own id stands in upgradesDone (UPGRADE: its id; EXT and ARTISAN: 100 + the type, the game's
+-- own count of them, as gateId below)
+local function reqGid(rec) local id = rec.id or -1; if rec.k ~= "UPGRADE" and id < 100 then return id + 100 end; return id end
+local function idCount(b, gid)
+  local ok, n = pcall(function()
+    local c = 0; local a = b.upgradesDone
+    for i = 1, #a do local v = a[i]; if type(v) ~= "number" then v = un(v) end; if tonumber(v) == gid then c = c + 1 end end
+    return c
+  end)
+  return ok and n or nil
+end
+T.reqGid, T.idCount = reqGid, idCount
 local function seeRequest(kind)
   return function(self, req)
     local p = self:get(); if not isLocal(p) then return nil end
     local q = req:get(); local b = q.buildingMaster
     if not valid(b) then return nil end
-    return { k = kind, obj = b, addr = addrOf(b), id = int(q.upgradeID), slot = int(q.slot) }
+    local rec = { k = kind, obj = b, addr = addrOf(b), id = int(q.upgradeID), slot = int(q.slot) }
+    if kind == "UPGRADE" and ANIMAL_ORDER[rec.id] then rec.n0 = animalsOf(b) end
+    rec.pre = reqState(b); rec.preN = idCount(b, reqGid(rec))
+    return rec
   end
 end
 hook(P .. "PawnCPP:addUpgradeRequest", { "UPGRADE" }, seeRequest("UPGRADE"))
 hook(P .. "PawnCPP:addExtensionChangeRequest", { "EXT" }, seeRequest("EXT"))
 hook(P .. "PawnCPP:addArtisanChangeRequest", { "ARTISAN" }, seeRequest("ARTISAN"))
 
+-- (lane 76, task 76e round 4) EVERY REQUEST OF THE KIND ON THE HOST. The animal order above was one case of a class:
+-- the hook sees add*Request, the request only waits on the lord (its flag upgradeRequestPending,
+-- extensionChangeRequestPending or artisanChangeRequestPending is set) until the pawn's pump carries it out, while a
+-- friend calls BeginUpgrade / ChangeExtension / changeArtisanType at once when the line comes. So on the host the line
+-- waits while the lord's flag of that kind is still set, at most REQ_WAIT s (then it goes as before).
+local REQ_WAIT = 1.0
+local REQ_GRACE = 0.3   -- (round 5) after the pump: the change of a request comes in that frame or the next (q76c)
+local PENDING = { UPGRADE = "upgradeRequestPending", EXT = "extensionChangeRequestPending", ARTISAN = "artisanChangeRequestPending" }
+local function reqPending(S, kind)
+  local f = PENDING[kind]; if not f then return false end
+  local ok, v = pcall(function() return S.p1[f] end)
+  return ok and v == true
+end
+T.reqPending = reqPending
 local function readyRequest(S, rec)
+  if rec.k == "UPGRADE" and rec.n0 and S.role == "host" and valid(rec.obj) and vnow() - rec.t < ORDER_WAIT then
+    local n = animalsOf(rec.obj)
+    if n and n <= rec.n0 then return "wait" end
+  end
+  if S.role == "host" and T.cfg.reqWait and vnow() - rec.t < REQ_WAIT and reqPending(S, rec.k) then
+    rec.waitedPending = true; return "wait"
+  end
+  -- (lane 76, task 76e round 5) A REQUEST THE HOST'S GAME DID NOT CARRY OUT. The pump clears the flag also when it did
+  -- nothing with the request (q76a: a request with no valid building: flag set and cleared, no change); the line went
+  -- all the same and a friend did it (its apply checks only "already has it"). So on the host, once its pump has run
+  -- (the flag clear), a request whose building is unchanged after REQ_GRACE s is NOT sent: the host's game refused it.
+  -- An animal order is judged by its animals above. A flag still set after REQ_WAIT: sent as before (not known).
+  if S.role == "host" and T.cfg.reqRefuse and not rec.n0 and rec.pre and not reqPending(S, rec.k) then
+    -- carried out: this request's own id came into upgradesDone (two requests in one frame: each judged by its own);
+    -- an id the building had already (a backyard built again): the building changed at all
+    local done
+    local n = valid(rec.obj) and rec.preN and idCount(rec.obj, reqGid(rec))
+    if n and rec.preN == 0 then done = n > 0
+    else local cur = valid(rec.obj) and reqState(rec.obj); done = cur ~= rec.pre end
+    if not done then
+      rec.sameSince = rec.sameSince or vnow()
+      if vnow() - rec.sameSince < REQ_GRACE then return "wait" end
+      stat(S, "t_reqRefused")
+      return nil, "the host's own game did not carry it out (not seen " .. string.format("%.1f", vnow() - rec.sameSince) .. " s after its pump): refused here, not sent"
+    end
+  end
   local key = bkeyOf(rec.snap)
   if rec.k == "EXT" then return key .. " " .. rec.slot .. " " .. rec.id end
   return key .. " " .. rec.id
 end
+-- (lane 87, cure 1) on a friend, an upgrade begun here (the host's, or this player's own) has the host's work fraction
+-- held in this tick when it is here already (coop_x_values.lua V.begun)
+local function begun(S, b) if S.role ~= "friend" then return end; local Vv = rawget(C, "values"); if Vv and Vv.begun then pcall(Vv.begun, b) end end
 -- status: static read only (lane_t1 T8a: b:BeginUpgrade(id); BeginUpgrade does not check canUpgrade, so the host checks)
 -- Animal orders (ox 13, horse 19, mule 21, hound 26, pig 27, goat 28) can be given again and again, and hasUpgrade stays
 -- true after the first one. The "already has it" skip must not apply to them (session 21, panel press: a second ox
 -- ordered at a stable was logged "ok" and never ordered on the other copy; the next order was refused and forced a resync).
 local REPEATABLE = { [13] = true, [19] = true, [21] = true, [26] = true, [27] = true, [28] = true }
-def { name = "UPGRADE", status = "static", ref = "lane_t1 T8a", ready = readyRequest,
+def { name = "UPGRADE", status = "static", ref = "lane_t1 T8a", ready = readyRequest, wait = ORDER_WAIT + 1.0,
   apply = function(S, job)
     local b = findBkey(job.f[1]); if not b then return "retry:building not found" end
     local id = int(job.f[2])
@@ -1159,7 +1573,7 @@ def { name = "UPGRADE", status = "static", ref = "lane_t1 T8a", ready = readyReq
       local okC, can = pcall(function() return b:canUpgrade(id, {}) end)
       if okC and can == false then return "cannot upgrade on the host" end
     end
-    b:BeginUpgrade(id); touch(b)
+    b:BeginUpgrade(id); touch(b); begun(S, b)
     return "ok"
   end }
 -- EXT and ARTISAN have no check of their own and no "already done" guard in the game (lane_u Q5): a line applied twice
@@ -1180,22 +1594,22 @@ local function upgradeGate(S, b, id)
   return nil
 end
 -- status: static read only (lane_t1 T8b: b:ChangeExtension(slot, newType))
-def { name = "EXT", status = "static", ref = "lane_t1 T8b", ready = readyRequest,
+def { name = "EXT", status = "static", ref = "lane_t1 T8b", ready = readyRequest, wait = REQ_WAIT + 1.0,
   apply = function(S, job)
     local b = findBkey(job.f[1]); if not b then return "retry:building not found" end
     local stop = upgradeGate(S, b, gateId(int(job.f[3]))); if stop then return stop end
     -- (lane 55) the slot is a place in the building's list of extensions: never past its end
     local slot = int(job.f[2]); local okE, ne = pcall(function() return #b.Extensions end)
     if not okE or slot < 0 or slot >= ne then return "retry:no extension slot " .. tostring(slot) .. " here (" .. tostring(ne) .. ")" end
-    b:ChangeExtension(slot, int(job.f[3])); touch(b)
+    b:ChangeExtension(slot, int(job.f[3])); touch(b); begun(S, b)
     return "ok"
   end }
 -- status: static read only (lane_t1 T8c: b:changeArtisanType(type))
-def { name = "ARTISAN", status = "static", ref = "lane_t1 T8c", ready = readyRequest,
+def { name = "ARTISAN", status = "static", ref = "lane_t1 T8c", ready = readyRequest, wait = REQ_WAIT + 1.0,
   apply = function(S, job)
     local b = findBkey(job.f[1]); if not b then return "retry:building not found" end
     local stop = upgradeGate(S, b, gateId(int(job.f[2]))); if stop then return stop end
-    b:changeArtisanType(int(job.f[2])); touch(b)
+    b:changeArtisanType(int(job.f[2])); touch(b); begun(S, b)
     return "ok"
   end }
 
@@ -1284,8 +1698,7 @@ local function readySetter(S, rec)
   -- "late" records come from a panel's own click handler: the value is read now, a tick after the handler ran
   if rec.late then local okL, v = pcall(function() return int(o[rec.late]) end); if not okL then return nil, "value unreadable" end; rec.args = { v } end
   local argstr = encArgs(d.argt, rec.args)
-  local ek = rec.k .. "@" .. tostring(rec.addr) .. ":" .. argstr
-  if not d.rel and T.expect[ek] and T.expect[ek] > os.clock() then T.expect[ek] = nil; return nil, "echo" end
+  if not d.rel and T.isEcho(rec.k, rec.addr, argstr) then return nil, "echo" end   -- (lane 81) the same value a replay just applied
   local key = d.target == "building" and bkeyOf(rec.snap) or T.rkey(o)
   if not key then return nil, "region without a name" end
   return key .. " " .. argstr
@@ -1309,7 +1722,7 @@ local function applySetter(S, job)
 end
 local function setter(name, cls, fn, argt, status, ref, rel)
   hook(P .. cls .. ":" .. fn, { name }, seeObj(name, argt))
-  return def { name = name, status = status, ref = ref, rel = rel, fn = fn, argt = argt,
+  return def { name = name, status = status, ref = ref, rel = rel, abs = not rel, fn = fn, argt = argt,
                target = (cls == "Region") and "region" or "building", ready = readySetter, apply = applySetter }
 end
 
@@ -1371,11 +1784,10 @@ setter("LIVECANCEL", "SMBuildingMaster", "cancelOrder", "i", "static", "lane_t2 
 -- status: proven live on one copy for the hook and the call (README session 14, slider 1 -> 2 -> 1); the owner lookup by
 -- scan is new and not yet run live
 hook(P .. "MaintenanceComponent:SetSliderValue", { "MAINT" }, seeObj("MAINT", "i"))
-def { name = "MAINT", status = "live1", ref = "README s14; lane_t2 T7j", argt = "i",
+def { name = "MAINT", status = "live1", ref = "README s14; lane_t2 T7j", argt = "i", abs = true,
   ready = function(S, rec)
     local argstr = encArgs("i", rec.args)
-    local ek = "MAINT@" .. tostring(rec.addr) .. ":" .. argstr
-    if T.expect[ek] and T.expect[ek] > os.clock() then T.expect[ek] = nil; return nil, "echo" end
+    if T.isEcho("MAINT", rec.addr, argstr) then return nil, "echo" end
     local b
     for _, e in pairs(T.bidx) do
       if valid(e.obj) then local ok, a = pcall(function() return addrOf(e.obj.MaintenanceComponent) end); if ok and a == rec.addr then b = e.obj; break end end
@@ -1428,7 +1840,7 @@ hook(P .. "SMBuildingMaster:SetAllowFertilization", { "FERTILIZE" }, function(se
   return { k = "FERTILIZE", obj = b, args = { want } }
 end)
 def { name = "FERTILIZE", status = "live", ref = "lane_s21_29 A031; lane_s21_75",
-      fn = "SetAllowFertilization", argt = "b", target = "building", ready = readySetter, apply = applySetter }
+      fn = "SetAllowFertilization", argt = "b", target = "building", abs = true, ready = readySetter, apply = applySetter }
 
 local function filterOf(b)
   local t = {}; local a = b.storageFilter
@@ -1438,13 +1850,12 @@ local function filterOf(b)
 end
 T.fieldSent = T.fieldSent or {}
 local function fieldAction(name, read, write)
-  return def { name = name, target = "building", status = "press2", ref = "README s21 (panel press)",
+  return def { name = name, target = "building", status = "press2", ref = "README s21 (panel press)", abs = true,
     ready = function(S, rec)
       local b = rec.obj; if not valid(b) then return nil, "building gone" end
       if not owned(b) then return nil, "not the lord's" end
       local v = read(b)
-      local ek = name .. "@" .. tostring(rec.addr) .. ":" .. v
-      if T.expect[ek] and T.expect[ek] > os.clock() then T.expect[ek] = nil; return nil, "echo" end
+      if T.isEcho(name, rec.addr, v) then return nil, "echo" end
       -- one press of "all" or "none" runs the handler of every good: many records, one value. Send it once.
       local sk = name .. "@" .. tostring(rec.addr)
       if T.fieldSent[sk] and T.fieldSent[sk].v == v and os.clock() - T.fieldSent[sk].t < 1.0 then return nil, "same value just sent" end
@@ -1592,7 +2003,7 @@ def { name = "REASSIGN", status = "console2", ref = "README s21", rel = true,
 --   X.hook(path, { "NAME" }, see)  and  X.def { name = "NAME", ready = ..., apply = ... }               -- anything else
 -- Argument letters of a setter: i int / enum / byte, b bool, n FName, s string. A setter on "Region" targets the region.
 T.api = { def = def, hook = hook, setter = setter, fieldAction = fieldAction, seeWidget = seeWidget, seeObj = seeObj,
-          readySetter = readySetter, applySetter = applySetter, encArgs = encArgs, decArgs = decArgs,
+          isEcho = T.isEcho, readySetter = readySetter, applySetter = applySetter, encArgs = encArgs, decArgs = decArgs,
           bident = identB, bkeyOf = bkeyOf, findBkey = findBkey, owned = owned, isLocal = isLocal, touch = touch,
           int = int, enc = enc, dec = dec, split = split, addrOf = addrOf, valid = valid, un = un, P = P, WI = WI }
 
@@ -1600,9 +2011,8 @@ T.api = { def = def, hook = hook, setter = setter, fieldAction = fieldAction, se
 local function handleSeen(S, rec)
   if rec.k == "_note" then A.log("TOWN note: %s", rec.msg); stat(S, "t_notes"); return "done" end
   local d = T.defs[rec.k]; if not (d and d.ready) then return "done" end
-  if rec.addr and T.touched[rec.addr] and os.clock() - T.touched[rec.addr] < 0.75 then
-    stat(S, "t_echo"); A.log("TOWN dropped %s on a just-replayed target (echo)", rec.k); return "done"
-  end
+  -- (lane 81) no drop by time here any more: a record on a target replayed in the last 0.75 s was dropped as an echo,
+  -- also a player's real change (G22). Echoes are told by their value in d.ready (T.isEcho) and by T.depth.
   if rec.nameB and not rec.snap then
     rec.snap = identB(rec.nameB)
     if not rec.snap then
@@ -1621,6 +2031,12 @@ local function handleSeen(S, rec)
   end
   if type(res) == "table" then for _, f in ipairs(res) do T.emitAction(S, rec.k, f) end
   else T.emitAction(S, rec.k, res) end
+  -- (lane 81) the player acted on this target: no echo of an earlier replay is expected on it any more, of any kind
+  -- (kinds that undo each other: PLIM / PUNLIM, RECIPE_ON / OFF, TSTOCK_ON / OFF ...)
+  if rec.addr then
+    local mark = "@" .. tostring(rec.addr) .. ":"
+    for k in pairs(T.expect) do if k:find(mark, 1, true) then T.expect[k] = nil end end
+  end
   return "done"
 end
 
@@ -1636,8 +2052,32 @@ local function processSeen(S, all)
 end
 
 -- ================================================================ tick: lines -> replays
-local function runJob(S, job)
+-- (lane 81) the order rule, decided in the apply queue (the host's order): another player's line for a slot this
+-- friend sent a value for marks it when it is APPLIED here (any status); this friend's own line coming back is a job
+-- of the same queue: if it was marked, the host applied this friend's value last, and it is put back. Deciding when a
+-- line arrives was wrong both ways: two lines can arrive in one read (game run cross 1), and a press can still wait in
+-- the hook queue when the other line arrives (it is sent first in the next tick).
+local function ownBack(S, job)
+  local o = T.own and T.own[job.ownBack]
+  if not (o and o.slot and T.ownSlot and T.ownSlot[o.slot] == job.ownBack) then return end   -- a newer own value is on its way
+  T.ownSlot[o.slot] = nil
+  if not o.over then return end
   local d = T.defs[job.act]
+  T.depth = T.depth + 1
+  local ok, status = pcall(d.apply, S, job)
+  T.depth = T.depth - 1
+  stat(S, "t_ownBack")
+  A.log("TOWN %s %s: the host applied it after %s (lines crossed): this copy's value is put back: %s", job.act, job.ownBack, tostring(o.over), ok and tostring(status) or ("error " .. tostring(status)))
+  if ok and status == "ok" and C.panels and C.panels.touched then pcall(C.panels.touched, job.act, job.f and job.f[1]) end
+end
+local function runJob(S, job)
+  if job.ownBack then ownBack(S, job); return "done" end
+  local d = T.defs[job.act]
+  if S.role ~= "host" and job.origin ~= S.name and T.ownSlot then
+    local slot = T.lineSlot(job.act, job.fields)
+    local mine = slot and T.ownSlot[slot]
+    if mine and T.own and T.own[mine] then T.own[mine].over = job.origin .. ":" .. tostring(job.n) end
+  end
   T.depth = T.depth + 1
   local ok, status, fwd, extra = pcall(d.apply, S, job)
   T.depth = T.depth - 1
@@ -1675,13 +2115,22 @@ local function onMessage(S, from, kind, w, line)
   if C.hold then A.log("TOWN dropped a T line during a join/repair hold"); return true end
   local origin, n, act = w[4], w[5], w[6]
   if not (origin and n and act) then return true end
-  if origin == S.name then return true end                      -- our own action coming back from the host
+  if origin == S.name then                                      -- our own action coming back from the host
+    -- (lane 81) the order rule: decided in the apply queue, in the host's order (runJob, ownBack)
+    local tag = origin .. ":" .. tostring(n)
+    local o = T.own and T.own[tag]
+    if o and o.slot and T.ownSlot and T.ownSlot[o.slot] == tag and T.defs[act] then
+      T.aq[#T.aq + 1] = { act = act, origin = origin, n = n, from = from, f = split(o.fields or "", " "), fields = o.fields, t = vnow(), ownBack = tag }
+    end
+    return true
+  end
   if S.role == "host" and origin ~= from then A.log("TOWN dropped %s: origin %s sent by %s", act, origin, tostring(from)); return true end
   local id = origin .. ":" .. n
   if T.seenMsg[id] then return true end
   markSeen(id)
   if act == "NAK" then
     local tag = w[7] or ""
+    do local o = T.own and T.own[tag]; if o and o.slot and T.ownSlot and T.ownSlot[o.slot] == tag then T.ownSlot[o.slot] = nil end end   -- (lane 81) refused: nothing to put back
     if tag:sub(1, #S.name + 1) == S.name .. ":" then
       local why = dec(w[8] or "?")
       stat(S, "t_refused")
@@ -1690,22 +2139,14 @@ local function onMessage(S, from, kind, w, line)
       -- demolish click does it, and the host's treasury push puts the silver right. Anything else: ask the host for a
       -- repair, i.e. everyone reloads the host's world.
       --   status: undo of a refused building: see README session 17
-      local rec = T.own and T.own[tag]; local undone = false
-      if rec and rec.act == "BUILD" and rec.f1 then
-        local e = decB(rec.f1); local b = e and T.findB(e.t, e.x, e.y); local h = A.helper()
-        if b and valid(h) then
-          local a = addrOf(b); if a then T.recentDem[a] = os.clock() end      -- our own removal is not an action to report
-          local ok, r = pcall(T.quiet, function() return T.requestDemolish(h, b) end)
-          undone = ok and r == true
-        end
-      end
-      if undone then
-        stat(S, "t_undone")
-        A.log("TOWN the host refused our building %s (%s): removed here", tag, why)
-        if C.notify then C.notify("refused", "The treasury could not pay for that building") end
-      else
-        A.log("TOWN the host refused our action %s: %s. This copy now differs from the host: asking for a repair", tag, why)
-        if C.join and C.join.requestRepair then C.join.requestRepair("refused " .. tag) end
+      local rec = T.own and T.own[tag]
+      -- (lane 81) the undo: done now when this copy's own building or area is there; when it is not there yet (a line
+      -- read in the same moment its own commit is still being made: a slow copy or a fast link), looked for again
+      -- every tick for up to UNDO_WAIT s before the repair
+      if not T.undoTry(S, tag, rec, why) then
+        T.undoQ = T.undoQ or {}
+        T.undoQ[#T.undoQ + 1] = { tag = tag, rec = rec, why = why, t0 = os.clock() }
+        A.log("TOWN the host refused our action %s (%s): our own not found yet, looked for again for %.1f s", tag, why, T.UNDO_WAIT)
       end
     end
     return true
@@ -1719,6 +2160,31 @@ local function onMessage(S, from, kind, w, line)
   return true
 end
 
+-- (lane 81) the pile a refused building's undo leaves (see the NAK branch): removed as soon as it is there
+local function undoPileStep(S)
+  local L = T.undoPiles; if not (L and #L > 0) then return end
+  local now = os.clock()
+  for i = #L, 1, -1 do
+    local u = L[i]; local done = false
+    pcall(function()
+      local arr = S.eng.buildingArr
+      for j = 1, #arr do
+        local b = un(arr[j])
+        if valid(b) and A.btype(b) == 88 and not u.pre[addrOf(b) or 0] then
+          local l = b:K2_GetActorLocation()
+          if not far(l.X, l.Y, u.x, u.y, 500) then
+            local Pm = rawget(C, "patch"); local ok, msg = false, "no native piece"
+            if Pm and Pm.pilegone then ok, msg = Pm.pilegone(b) end
+            A.log("TOWN the pile our refused building %s left: %s (%s)", tostring(u.tag), ok and "removed" or "left to the game", tostring(msg))
+            stat(S, ok and "t_undonePile" or "t_undonePileLeft"); done = true; return
+          end
+        end
+      end
+    end)
+    if done or now - u.t0 > 5.0 then table.remove(L, i) end
+  end
+end
+
 -- ================================================================ tick
 local function tick(S, clock)
   if C.hold then T.lastC = nil; return end     -- a join or repair is loading a save: S.eng may be invalid; onWorld resets after
@@ -1729,14 +2195,139 @@ local function tick(S, clock)
   if T.reassignW then T.reassignWatch() end
   if #T.q > 0 then processSeen(S, false) end
   if T.pend or #T.aq > 0 then processApply(S) end
+  if T.undoQ and #T.undoQ > 0 and T.undoStep then T.undoStep(S) end
+  if T.undoPiles and #T.undoPiles > 0 then undoPileStep(S) end
   if clock - (T.pruneT or 0) > 5.0 then
     T.pruneT = clock
-    for k, v in pairs(T.expect) do if v < clock then T.expect[k] = nil end end
+    for k, v in pairs(T.expect) do if v.t < clock then T.expect[k] = nil end end
     for k, v in pairs(T.touched) do if clock - v > 5 then T.touched[k] = nil end end
     for k, v in pairs(T.recentDem) do if clock - v > 10 then T.recentDem[k] = nil end end
     if T.dropped and T.dropped > 0 then A.log("TOWN %d hook records dropped (queue full)", T.dropped); T.dropped = 0 end
   end
 end
+
+-- (lane 81, the own-click rule) a refused drawn kind of this copy removed by name, the way BUILD's undo removes a
+-- building: the field, pasture or market at the line's centre; every burgage plot of the line's lots (EXTEND: after
+-- the extended house); the road between the line's first and last points. Each under the quiet wrapper (our own
+-- removal is not an action to report). true when the removal was handed to the game.
+local AREA_T = { FIELD = 5, PASTURE = 10, MARKET = 13 }
+local function demolishOwn(b)
+  local h = A.helper(); if not (valid(b) and valid(h)) then return false end
+  local a = addrOf(b); if a then T.recentDem[a] = os.clock() end
+  local ok, r = pcall(T.quiet, function() return T.requestDemolish(h, b) end)
+  return ok and r == true
+end
+local function lotsOf(rec, first)
+  local w = split(rec.all or "", " "); local o = {}
+  for i = first, #w do local l = decLot(w[i]); if l then o[#o + 1] = l end end
+  return o
+end
+T.undoArea = {
+  FIELD = function(S, rec) local c = decV(split(rec.all or "", " ")[1]); if not c then return "no centre" end; local b = T.findB(5, c.X, c.Y); if not b then return "not found" end; return demolishOwn(b) end,
+  PASTURE = function(S, rec) local c = decV(split(rec.all or "", " ")[1]); if not c then return "no centre" end; local b = T.findB(10, c.X, c.Y); if not b then return "not found" end; return demolishOwn(b) end,
+  MARKET = function(S, rec) local c = decV(split(rec.all or "", " ")[1]); if not c then return "no centre" end; local b = T.findB(13, c.X, c.Y); if not b then return "not found" end; return demolishOwn(b) end,
+  HOUSE = function(S, rec)
+    local n, done = 0, 0
+    for _, l in ipairs(lotsOf(rec, 1)) do local tr = l.primaryBuildingTransform.Translation; n = n + 1; local b = T.findB(3, tr.X, tr.Y); if b and demolishOwn(b) then done = done + 1 end end
+    return n > 0 and done == n or ("lots " .. done .. " of " .. n)
+  end,
+  EXTEND = function(S, rec)
+    local n, done = 0, 0
+    for _, l in ipairs(lotsOf(rec, 2)) do local tr = l.primaryBuildingTransform.Translation; n = n + 1; local b = T.findB(3, tr.X, tr.Y); if b and demolishOwn(b) then done = done + 1 end end
+    return n > 0 and done == n or ("lots " .. done .. " of " .. n)
+  end,
+  -- a refused MOVE: only when the host had removed the building itself ("moved building gone on the host"): this
+  -- copy's moved copy at the new place (the line's second word) is removed. Any other refusal of a move: the repair.
+  MOVE = function(S, rec, why)
+    if not tostring(why or ""):find("moved building gone on the host", 1, true) then return "no undo for this refusal of a move" end
+    local w = split(rec.all or "", " "); local e = decB(w[2] or ""); if not e then return "no new place" end
+    local b = T.findB(e.t, e.x, e.y); if not b then return "not found" end
+    return demolishOwn(b)
+  end,
+  ROAD = function(S, rec)
+    local pts = decPts(split(rec.all or "", " ")[1]); if #pts < 2 then return "no points" end
+    local a, z = pts[1], pts[#pts]
+    local r = T.findRoad(a.X, a.Y, z.X, z.Y); if not r then return "road not found" end
+    local h = A.helper(); if not valid(h) then return "no helper" end
+    local ok, e = pcall(T.quiet, function() h:removeRoad(r) end)
+    return ok or tostring(e)
+  end,
+}
+-- where a refused drawn kind of this copy stood, for the pile watch (the BUILD undo's): its centre, or its first lot
+function T.undoAt(rec)
+  local w = split(rec.all or "", " ")
+  if rec.act == "MOVE" then local e = decB(w[2] or ""); if e then return { x = e.x, y = e.y } end end
+  if AREA_T[rec.act] then local c = decV(w[1]); if c then return { x = c.X, y = c.Y } end end
+  if rec.act == "HOUSE" or rec.act == "EXTEND" then
+    local l = decLot(w[rec.act == "EXTEND" and 2 or 1] or ""); if l then local tr = l.primaryBuildingTransform.Translation; return { x = tr.X, y = tr.Y } end
+  end
+  return nil
+end
+
+-- (lane 81) one try of the undo of a refused own action: true when it is done (removed, or a kind with no undo: the
+-- repair was asked), false when this copy's own object is not there yet
+T.UNDO_WAIT = 1.0
+-- (lane 81) the reasons a drawn kind or a move is refused for BEFORE the host made any part of it: only then is the
+-- friend's removal of all of it right. Any other reason (e.g. "made 2 of 3 lots": the host keeps a part) asks for the
+-- repair, as before (the friend loads alone).
+local UNDO_SAFE = { "place is taken", "afford", "no helper", "bad fields", "bad lot", "bad points", "no lots",
+                    "made nothing", "made no road", "write failed", "moved building gone on the host", "refused by the test" }
+function T.undoSafe(why)
+  why = tostring(why or "")
+  for _, w in ipairs(UNDO_SAFE) do if why:find(w, 1, true) then return true end end
+  return false
+end
+function T.undoTry(S, tag, rec, why, last)
+  local undone, missing = false, false
+  if rec and rec.act == "BUILD" and rec.f1 then
+    local e = decB(rec.f1); local b = e and T.findB(e.t, e.x, e.y); local h = A.helper()
+    if b and valid(h) then
+      local a = addrOf(b); if a then T.recentDem[a] = os.clock() end      -- our own removal is not an action to report
+      local ok, r = pcall(T.quiet, function() return T.requestDemolish(h, b) end)
+      undone = ok and r == true
+    elseif not b then missing = true end
+  elseif rec and T.undoArea and T.undoArea[rec.act] and not T.undoSafe(why) then
+    A.log("TOWN the host refused our %s %s after a part of it may have been made there (%s): no undo, the repair", tostring(rec.act), tag, tostring(why))
+  elseif rec and T.undoArea and T.undoArea[rec.act] then
+    local okU, r = pcall(T.undoArea[rec.act], S, rec, why)                  -- a drawn kind: removed by name
+    undone = okU and r == true
+    if not undone and okU and (r == "not found" or r == "road not found" or (type(r) == "string" and r:find("^lots 0 of"))) then missing = true end
+    if not undone and not missing then A.log("TOWN the undo of our %s %s did not take (%s)", tostring(rec.act), tag, tostring(r)) end
+  end
+  if missing and not last then return false end
+  if undone then
+    -- (lane 81, the own-click rule) the game's demolish (refund) leaves a pile where the refused building stood;
+    -- the host has none there. With the native goods switch on a pile never empties by itself here, and the facts
+    -- module removed it only after 20 s (live r5b B1: 88 shown 0.37 s after the press, gone after 21 s). It goes
+    -- now: a pile that appears at that place within 5 s is emptied and removed (P.pilegone).
+    local e = (rec.act == "BUILD") and decB(rec.f1) or (T.undoAt and T.undoAt(rec))
+    if e then
+      local pre = {}
+      pcall(function() local arr = S.eng.buildingArr; for i = 1, #arr do local x = un(arr[i]); if valid(x) and A.btype(x) == 88 then local l = x:K2_GetActorLocation(); if not far(l.X, l.Y, e.x, e.y, 500) then pre[addrOf(x) or 0] = true end end end end)
+      T.undoPiles = T.undoPiles or {}
+      T.undoPiles[#T.undoPiles + 1] = { x = e.x, y = e.y, t0 = os.clock(), pre = pre, tag = tag }
+    end
+    stat(S, "t_undone")
+    A.log("TOWN the host refused our %s %s (%s): removed here", (rec.act == "BUILD") and "building" or tostring(rec.act), tag, why)
+    local text = why:find("place is taken", 1, true) and "That place was already taken"
+      or (why:find("afford", 1, true) and "The treasury could not pay for that building") or "The host could not do that here"
+    if C.notify then C.notify("refused", text) end
+  else
+    A.log("TOWN the host refused our action %s: %s. This copy now differs from the host: asking for a repair", tag, why)
+    if C.join and C.join.requestRepair then C.join.requestRepair("refused " .. tag) end
+  end
+  return true
+end
+local function undoStep(S)
+  local L = T.undoQ; if not (L and #L > 0) then return end
+  local now = os.clock()
+  for i = #L, 1, -1 do
+    local u = L[i]
+    local last = now - u.t0 >= T.UNDO_WAIT
+    if T.undoTry(S, u.tag, u.rec, u.why, last) then table.remove(L, i) end
+  end
+end
+T.undoStep = undoStep
 
 C.register("town", {
   onWorld = function(S) T.reset(); A.log("TOWN world reset: caches and queues cleared") end,
@@ -1826,7 +2417,7 @@ T.test = {
   pump = function() T.p1addr = addrOf(C.s.p1); processSeen(C.s, true); return #T.q end,
   hooksNow = function() T.p1addr = addrOf(C.s.p1); for _ = 1, 8 do ensureHooks(true) end; return T.status() end,
   result = function(id) return T.results[id] end,
-  clearEcho = function() T.touched = {}; T.expect = {}; T.recentDem = {} end,   -- one-copy tests act on a target right after replaying on it
+  clearEcho = function() T.touched = {}; T.expect = {}; T.recentDem = {}; T.ownSlot = {} end,   -- one-copy tests act on a target right after replaying on it
   -- test cleanup: remove a building the way the click does (helper's demolishRequests; gone after the helper's next Tick;
   -- refund=true, so a goods pile of type 88 may appear). Never building:demolish() directly (HAZARDS).
   demolish = function(b) if not valid(b) then return false end; return T.quiet(T.requestDemolish, A.helper(), b) end,

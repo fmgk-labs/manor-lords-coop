@@ -382,6 +382,286 @@ static void mroll_cmd(int argc, char **argv)
     MR.bad++; log_line("MROLL refused: needs ON | OFF | WATCH | ACC <worker> <building>");
 }
 
+/* ------------------------------------------------------------------ NOROLL (lane 87): a friend's own mercenary month roll
+ * Why (READ, lanes/lane_s21_87/design_noroll.txt): Engine::rerollMercenaries (4cd83e0, engine rcx) empties the offer list
+ * (engine +BF0h, availableMercs), adds at most three companies of the company table (+BE8h) picked with rand(), and gives
+ * this copy's player (+5B0h) the notice "mercenaries_available"; it writes nothing else of the engine. Its callers: the
+ * month block of TemporalComponent::updateDay (4d78bf0), RTSMultiEngineCPP::BeginPlay (4c83bfa, engine +301h zero only)
+ * and the script layer's thunk (4ae9d60). On a friend the month roll drew three companies the host never had for one look
+ * (66 ms, lane 88's run p88a) before the realm module wrote the host's list back; a hook on the reflected function never
+ * fires there (updateDay calls the C++ routine). Engine::refillMercenaries (40a70e0) is the linker's shared empty stub
+ * (C2 00 00): nothing to stop there, and it must not be written.
+ *   NOROLL ON     friend: the roll's entry, 7 bytes ("mov rax,rsp; mov [rax+20h],rbx"), into a stub (a 5-byte jmp and two
+ *                 int3): every call returns at once (blocked), unless a pass is set. The offers then change only by the
+ *                 host's word (the realm module), a load and a hire.
+ *   NOROLL PASS   the next call goes through, once (passed): the realm module's own call when this copy holds fewer offers
+ *                 than the host (a script cannot add a record; the game's roll makes the slots, written over with the
+ *                 host's records in the same tick). A pass not used before the next tick of this piece begins is dropped
+ *                 (expired).
+ *   NOROLL OFF    the entry as it was.
+ * Signature MERCROLL (4cd83e0, the entry up to "lea rbx,[rcx+0BF0h]"). Known build only. Status:
+ * "NOROLL off|on blocked= passed= expired= bad=" or "NOROLL unavailable <why>". */
+#define NOR_LEN        7
+static const uint8_t NOR_ORIG[NOR_LEN] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x20 };
+typedef void (*nor_fn)(uint8_t *eng);
+static struct {
+    int avail; char why[160];
+    uint8_t *entry, *stub, *tramp; uint8_t jmp[NOR_LEN];
+    volatile LONG on, pass;
+    unsigned blocked, passed, expired, bad;
+} NOR;
+
+static int noroll_status(char *buf, size_t len)
+{
+    if (g_off) return _snprintf(buf, len, "NOROLL unavailable dll is off\r\n");
+    if (!NOR.avail) return _snprintf(buf, len, "NOROLL unavailable %s\r\n", NOR.why);
+    return _snprintf(buf, len, "NOROLL %s blocked=%u passed=%u expired=%u bad=%u\r\n",
+                     NOR.on ? "on" : "off", NOR.blocked, NOR.passed, NOR.expired, NOR.bad);
+}
+
+static int noroll_scan(void)
+{
+    int known = g_stamp == KNOWN_TIMESTAMP && g_imgsize == KNOWN_IMAGESIZE;
+    uint8_t *ks = NOR.stub, *kt = NOR.tramp, kj[NOR_LEN];
+    memcpy(kj, NOR.jmp, NOR_LEN);
+    memset(&NOR, 0, sizeof(NOR)); NOR.stub = ks; NOR.tramp = kt; memcpy(NOR.jmp, kj, NOR_LEN);   /* a stub made once is kept */
+    if (!known) _snprintf(NOR.why, sizeof(NOR.why), "another game build (timestamp %X)", g_stamp);
+    else if (g_hit[S_MERCROLL].hits != 1) _snprintf(NOR.why, sizeof(NOR.why), "MERCROLL signature has %d hits (need exactly 1)", g_hit[S_MERCROLL].hits);
+    else {
+        NOR.entry = g_base + g_hit[S_MERCROLL].rva;
+        if (memcmp(NOR.entry, NOR_ORIG, NOR_LEN) != 0 && !(NOR.stub && NOR.entry[0] == 0xE9))
+            _snprintf(NOR.why, sizeof(NOR.why), "the entry does not start with its known bytes");
+        else if (((uintptr_t)NOR.entry & 7) + NOR_LEN > 8)
+            _snprintf(NOR.why, sizeof(NOR.why), "the entry's first bytes would cross an 8-byte block");
+        else NOR.avail = 1;
+    }
+    log_line("  NOROLL %s %s", NOR.avail ? "available" : "unavailable", NOR.avail ? "" : NOR.why);
+    return NOR.avail;
+}
+
+/* every call of the roll while the stub is in: blocked, or through once on a pass */
+static void noroll_wrap(uint8_t *eng)
+{
+    if (NOR.on && InterlockedExchange(&NOR.pass, 0) == 0) { NOR.blocked++; g_dirty = 1; return; }   /* friend: the host's offers */
+    if (NOR.on) { NOR.passed++; g_dirty = 1; }
+    ((nor_fn)(void *)NOR.tramp)(eng);
+}
+
+/* stub: mov rax,<wrapper>; jmp rax. Trampoline: the entry's 7 bytes; jmp [rip+0] -> entry + 7. The entry gets a 5-byte
+ * jmp to the stub (relative to entry + 5) and two int3 (never run: the trampoline resumes at entry + 7). */
+static int nor_make(void)
+{
+    uint8_t *p = alloc_near(g_base, g_imgsize), *resume = NOR.entry + NOR_LEN;
+    void *fn = (void *)&noroll_wrap;
+    size_t n = 0; int32_t rel; DWORD old;
+    if (!p) return 0;
+    p[n++] = 0x48; p[n++] = 0xB8; memcpy(p + n, &fn, 8); n += 8; p[n++] = 0xFF; p[n++] = 0xE0;
+    n = (n + 15) & ~(size_t)15;
+    NOR.tramp = p + n;
+    memcpy(p + n, NOR_ORIG, NOR_LEN); n += NOR_LEN;
+    p[n++] = 0xFF; p[n++] = 0x25; p[n++] = 0; p[n++] = 0; p[n++] = 0; p[n++] = 0; memcpy(p + n, &resume, 8); n += 8;
+    rel = (int32_t)((intptr_t)p - (intptr_t)(NOR.entry + 5));
+    NOR.jmp[0] = 0xE9; memcpy(NOR.jmp + 1, &rel, 4); NOR.jmp[5] = 0xCC; NOR.jmp[6] = 0xCC;
+    if (!VirtualProtect(p, 0x1000, PAGE_EXECUTE_READ, &old)) { VirtualFree(p, 0, MEM_RELEASE); return 0; }
+    FlushInstructionCache(GetCurrentProcess(), p, 0x1000);
+    NOR.stub = p;
+    return 1;
+}
+/* the stub in (1) or out (0); 1 when it is as asked */
+static int nor_set(int on)
+{
+    char w[160]; int r = 1;
+    if (on) {
+        if (!NOR.stub && !nor_make()) { log_line("NOROLL: no free memory near the game module for a stub"); return 0; }
+        if (memcmp(NOR.entry, NOR.jmp, NOR_LEN) == 0) return 1;
+        r = write_bytes(NOR.entry, NOR_ORIG, NOR.jmp, NOR_LEN, w, sizeof(w));
+    } else {
+        if (!NOR.stub || memcmp(NOR.entry, NOR.jmp, NOR_LEN) != 0) return 1;
+        r = write_bytes(NOR.entry, NOR.jmp, NOR_ORIG, NOR_LEN, w, sizeof(w));
+    }
+    if (r != 1) { log_line("NOROLL: the entry not %s: %s", on ? "hooked" : "restored", w); if (r < 0) internal_failure("noroll write failed"); return 0; }
+    return 1;
+}
+
+static void noroll_off(const char *why)
+{
+    if (!NOR.avail) return;
+    InterlockedExchange(&NOR.on, 0); InterlockedExchange(&NOR.pass, 0);
+    nor_set(0);
+    log_line("NOROLL off (%s): blocked %u passed %u expired %u", why, NOR.blocked, NOR.passed, NOR.expired);
+    g_dirty = 1;
+}
+
+static void noroll_on(void)
+{
+    g_dirty = 1;
+    if (!NOR.avail) { NOR.bad++; log_line("NOROLL ON refused: unavailable (%s)", NOR.why); return; }
+    InterlockedExchange(&NOR.on, 1);                       /* before the stub goes in: its first call is blocked */
+    if (!nor_set(1)) { noroll_off("the hook could not be set"); NOR.avail = 0; _snprintf(NOR.why, sizeof(NOR.why), "the entry could not be written"); return; }
+    log_line("NOROLL on (friend: the mercenary month roll is the host's)");
+}
+
+/* at the start of every tick, before the commands: a pass not used since the tick that set it is dropped */
+static void noroll_tick(void)
+{
+    if (InterlockedExchange(&NOR.pass, 0)) { NOR.expired++; g_dirty = 1; }
+}
+
+static void noroll_cmd(int argc, char **argv)
+{
+    int v;
+    g_dirty = 1;
+    if (!NOR.avail) { NOR.bad++; log_line("NOROLL refused: unavailable (%s)", NOR.why); return; }
+    if (argc == 2 && on_off(argv[1], &v)) { if (v) noroll_on(); else noroll_off("NOROLL OFF"); return; }
+    if (argc == 2 && _stricmp(argv[1], "PASS") == 0) { InterlockedExchange(&NOR.pass, 1); return; }
+    NOR.bad++; log_line("NOROLL refused: needs ON | OFF | PASS");
+}
+
+/* ------------------------------------------------------------------ BARNAN (lane 87, the bar's cure 2): a friend's site with
+ * no parts yet reads its bar with no work done, not "not a number"
+ * Why (READ, lanes/lane_s21_87/design_cures.txt 7; run p87g): SMBuildingMaster::getConstructionProgress (4d3d940,
+ * building rcx) gives (work + G) * 0.5 (70ef0e0), G = (sum needed - sum short) / sum needed in double, 1.0 (70da508)
+ * when nothing is needed, with the shortages from 4c663a0 (inventory +448h, needed goods +3D0h: it reads their list
+ * headers and records and writes only its own out-list), work = sum of the parts' hp (+314h) / sum of their max (+318h)
+ * over the list at +2F8h (count +300h), with no check: an empty list gives 0/0. A friend makes a rival's site through
+ * the player's placement path, whose parts come a few frames after the building; the host's AI site had a part with no
+ * work in its first frame (3@8981,7789: bar 0), the friend's none: "not a number" for 0.079 s, a value the host never
+ * had. Its callers: the script layer's thunk (4af596e: the panel's widget) and PawnCPP::drawBuildingOverlays (4b3b161:
+ * the bars over the sites).
+ *   BARNAN ON     friend: the function's entry, 7 bytes ("mov rax,rsp; mov [rax+8],rbx"), into a stub. For a building
+ *                 whose part list is empty, the wrapper runs the game's own function on a COPY of the building's first
+ *                 0x500 bytes (on its own stack) whose part list is one made-up part with hp 0 and max 1: the game
+ *                 itself works out G (its goods routine reads the real lists through the copied headers) and the work
+ *                 half is 0. Nothing of the game's object is written. Every other call runs the original (the trampoline).
+ *   BARNAN OFF    the entry as it was. The host never switches it on: its own first frames stay the game's.
+ * Signature SITEPROG (4d3d940, the entry up to "add rcx,448h"). Known build only. Status:
+ * "BARNAN off|on zeroed= faults= bad=" or "BARNAN unavailable <why>". */
+#define BN_LEN         7
+#define BN_COPY        0x500
+static const uint8_t BN_ORIG[BN_LEN] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08 };
+typedef float (*bn_fn)(uint8_t *b);
+static struct {
+    int avail; char why[160];
+    uint8_t *entry, *stub, *tramp; uint8_t jmp[BN_LEN];
+    volatile LONG on;
+    unsigned zeroed, faults, bad;
+} BN;
+static __declspec(align(16)) uint8_t BN_PART[0x320];      /* the made-up part: hp 0.0 at +314h, max 1.0 at +318h */
+static uint8_t *BN_LIST[1];
+
+static int barnan_status(char *buf, size_t len)
+{
+    if (g_off) return _snprintf(buf, len, "BARNAN unavailable dll is off\r\n");
+    if (!BN.avail) return _snprintf(buf, len, "BARNAN unavailable %s\r\n", BN.why);
+    return _snprintf(buf, len, "BARNAN %s zeroed=%u faults=%u bad=%u\r\n", BN.on ? "on" : "off", BN.zeroed, BN.faults, BN.bad);
+}
+
+static int barnan_scan(void)
+{
+    int known = g_stamp == KNOWN_TIMESTAMP && g_imgsize == KNOWN_IMAGESIZE;
+    uint8_t *ks = BN.stub, *kt = BN.tramp, kj[BN_LEN];
+    float zero = 0.0f, one = 1.0f;
+    memcpy(kj, BN.jmp, BN_LEN);
+    memset(&BN, 0, sizeof(BN)); BN.stub = ks; BN.tramp = kt; memcpy(BN.jmp, kj, BN_LEN);   /* a stub made once is kept */
+    memset(BN_PART, 0, sizeof(BN_PART)); memcpy(BN_PART + 0x314, &zero, 4); memcpy(BN_PART + 0x318, &one, 4);
+    BN_LIST[0] = BN_PART;
+    if (!known) _snprintf(BN.why, sizeof(BN.why), "another game build (timestamp %X)", g_stamp);
+    else if (g_hit[S_SITEPROG].hits != 1) _snprintf(BN.why, sizeof(BN.why), "SITEPROG signature has %d hits (need exactly 1)", g_hit[S_SITEPROG].hits);
+    else {
+        BN.entry = g_base + g_hit[S_SITEPROG].rva;
+        if (memcmp(BN.entry, BN_ORIG, BN_LEN) != 0 && !(BN.stub && BN.entry[0] == 0xE9))
+            _snprintf(BN.why, sizeof(BN.why), "the entry does not start with its known bytes");
+        else if (((uintptr_t)BN.entry & 7) + BN_LEN > 8)
+            _snprintf(BN.why, sizeof(BN.why), "the entry's first bytes would cross an 8-byte block");
+        else BN.avail = 1;
+    }
+    log_line("  BARNAN %s %s", BN.avail ? "available" : "unavailable", BN.avail ? "" : BN.why);
+    return BN.avail;
+}
+
+/* every call of the progress function while the stub is in */
+static float barnan_wrap(uint8_t *b)
+{
+    if (BN.on && b) {
+        int32_t n = -1;
+        __try { n = *(volatile int32_t *)(b + 0x300); } __except (EXCEPTION_EXECUTE_HANDLER) { n = -1; BN.faults++; }
+        if (n == 0) {
+            __declspec(align(16)) uint8_t copy[BN_COPY];
+            int ok = 0;
+            __try { memcpy(copy, b, BN_COPY); ok = 1; } __except (EXCEPTION_EXECUTE_HANDLER) { BN.faults++; }
+            if (ok) {
+                *(uint8_t ***)(copy + 0x2F8) = BN_LIST; *(int32_t *)(copy + 0x300) = 1;
+                BN.zeroed++; g_dirty = 1;
+                return ((bn_fn)(void *)BN.tramp)(copy);
+            }
+        }
+    }
+    return ((bn_fn)(void *)BN.tramp)(b);
+}
+
+/* stub: mov rax,<wrapper>; jmp rax. Trampoline: the entry's 7 bytes; jmp [rip+0] -> entry + 7. The entry gets a 5-byte
+ * jmp to the stub (relative to entry + 5) and two int3 (never run: the trampoline resumes at entry + 7). */
+static int bn_make(void)
+{
+    uint8_t *p = alloc_near(g_base, g_imgsize), *resume = BN.entry + BN_LEN;
+    void *fn = (void *)&barnan_wrap;
+    size_t n = 0; int32_t rel; DWORD old;
+    if (!p) return 0;
+    p[n++] = 0x48; p[n++] = 0xB8; memcpy(p + n, &fn, 8); n += 8; p[n++] = 0xFF; p[n++] = 0xE0;
+    n = (n + 15) & ~(size_t)15;
+    BN.tramp = p + n;
+    memcpy(p + n, BN_ORIG, BN_LEN); n += BN_LEN;
+    p[n++] = 0xFF; p[n++] = 0x25; p[n++] = 0; p[n++] = 0; p[n++] = 0; p[n++] = 0; memcpy(p + n, &resume, 8); n += 8;
+    rel = (int32_t)((intptr_t)p - (intptr_t)(BN.entry + 5));
+    BN.jmp[0] = 0xE9; memcpy(BN.jmp + 1, &rel, 4); BN.jmp[5] = 0xCC; BN.jmp[6] = 0xCC;
+    if (!VirtualProtect(p, 0x1000, PAGE_EXECUTE_READ, &old)) { VirtualFree(p, 0, MEM_RELEASE); return 0; }
+    FlushInstructionCache(GetCurrentProcess(), p, 0x1000);
+    BN.stub = p;
+    return 1;
+}
+/* the stub in (1) or out (0); 1 when it is as asked */
+static int bn_set(int on)
+{
+    char w[160]; int r = 1;
+    if (on) {
+        if (!BN.stub && !bn_make()) { log_line("BARNAN: no free memory near the game module for a stub"); return 0; }
+        if (memcmp(BN.entry, BN.jmp, BN_LEN) == 0) return 1;
+        r = write_bytes(BN.entry, BN_ORIG, BN.jmp, BN_LEN, w, sizeof(w));
+    } else {
+        if (!BN.stub || memcmp(BN.entry, BN.jmp, BN_LEN) != 0) return 1;
+        r = write_bytes(BN.entry, BN.jmp, BN_ORIG, BN_LEN, w, sizeof(w));
+    }
+    if (r != 1) { log_line("BARNAN: the entry not %s: %s", on ? "hooked" : "restored", w); if (r < 0) internal_failure("barnan write failed"); return 0; }
+    return 1;
+}
+
+static void barnan_off(const char *why)
+{
+    if (!BN.avail) return;
+    InterlockedExchange(&BN.on, 0);
+    bn_set(0);
+    log_line("BARNAN off (%s): zeroed %u faults %u", why, BN.zeroed, BN.faults);
+    g_dirty = 1;
+}
+
+static void barnan_on(void)
+{
+    g_dirty = 1;
+    if (!BN.avail) { BN.bad++; log_line("BARNAN ON refused: unavailable (%s)", BN.why); return; }
+    InterlockedExchange(&BN.on, 1);
+    if (!bn_set(1)) { barnan_off("the hook could not be set"); BN.avail = 0; _snprintf(BN.why, sizeof(BN.why), "the entry could not be written"); return; }
+    log_line("BARNAN on (friend: a site with no parts yet reads its bar with no work done)");
+}
+
+static void barnan_cmd(int argc, char **argv)
+{
+    int v;
+    g_dirty = 1;
+    if (!BN.avail) { BN.bad++; log_line("BARNAN refused: unavailable (%s)", BN.why); return; }
+    if (argc == 2 && on_off(argv[1], &v)) { if (v) barnan_on(); else barnan_off("BARNAN OFF"); return; }
+    BN.bad++; log_line("BARNAN refused: needs ON | OFF");
+}
+
 /* ------------------------------------------------------------------ SITEHP (lane 71): a site's work done is the host's
  * Why (READ, getConstructionProgress 4d3d940, signature SPROG): a site's progress bar is
  *   0.5 * ( delivered goods / needed goods  +  sum of its parts' hp / sum of their max hp )
@@ -394,32 +674,63 @@ static void mroll_cmd(int argc, char **argv)
  *   SITEHP HOLD <b> <frac>  friend: the work fraction (float bits, hex) to hold; every tick, when this copy's sum of hp
  *                           differs from frac * sum of max (more than a thousandth of it), the parts' hp are scaled to it
  *                           (each part in proportion, the rest filled in list order, never above a part's max)
+ *   SITEHP HOLDX <b> <frac> friend (lane 87): the exact hold. Run p87a: with POLL's threshold (a fraction was reported
+ *                           when it had moved by 0.0005), four decimals on the way and HOLD's margin (a thousandth of
+ *                           the max) a friend's bar was a number the host did not show in 101 of 1,882 readings at
+ *                           three decimals, and stood across a rounding edge of the proof's one decimal for days
+ *                           (session l7b). HOLDX: every tick, when the fraction's bits (float sums in list order, one
+ *                           float division: as the game makes them, 4d3da16) are neither the wanted ones nor the ones
+ *                           this hold reached at its last write, the parts are filled IN LIST ORDER, as the game's own
+ *                           builders fill them (4d27780: the first part that is not full up to its max, then the next):
+ *                           full parts, one partial part, the rest 0, so that the game's sum over the game's max sum
+ *                           is the wanted fraction bit for bit. The partial part is moved by one step of the sum's
+ *                           float grid (at most 8 times) until it is. Where no sum of this copy's grid gives those
+ *                           bits (the two copies can have different part counts, so different max sums) the nearest is
+ *                           taken (one float step of the fraction, about 0.0000001 of the bar; counted "near"). A
+ *                           part with max <= 0 is left alone (the game's adder skips it). Never above a part's max.
+ *   POLL (lane 87): a site is reported when the BITS of its fraction changed.
+ *   SITEHP FILL <b>         friend (lane 87): every part of this site to its max, at once (in the command, so ahead of
+ *                           a FINISH that follows it in the same tick), and the site is no longer held. On the host a
+ *                           site is finished by the stroke that fills its last part: a finished building's parts are
+ *                           all full there. A friend's site is finished on the host's word, while its parts stand at
+ *                           the host's last fraction as a site, and a hold still named would be applied once more
+ *                           after the FINISH of that tick (the commands of a tick run before sitehp_tick).
  *   SITEHP DROP <b> | FORGET
  * Every site is checked alive at every use (object number and name as when it was named, a region, the part list's
- * count 0..64, every part committed with a vtable in the module). Known build only. Status: "SITEHP available held=
+ * count 0..1024, every part committed with a vtable in the module). Known build only.
+ * (lane 87) The count's limit was 64 before 0.9.13. A church has 85 parts, a manor 69, a tavern 75, a large house 73, the
+ * most seen 120 (game runs p87a, l7b): such a site was refused at its first POLL or HOLD on both copies, so a friend's
+ * bar of every big building was its own builders' work. Status: "SITEHP available held=
  * watched= writes= polls= lines= gone= bad= faults=" or "SITEHP unavailable <why>". */
 #define SH_MAX        256
 #define SH_PARTS      0x2F8
 #define SH_HP         0x314
 #define SH_HPMAX      0x318
-#define SH_PMAX       64
+#define SH_PMAX       1024
 #define SH_CHECK      0x400
-typedef struct { uint8_t *b; uint32_t idx; uint64_t name; int mode; float want; float sent; int sentk; } sh_ent;   /* mode 1 held, 2 watched */
+typedef struct { uint8_t *b; uint32_t idx; uint64_t name; int mode; float want; float sent; int sentk;
+                 uint32_t wbits, got; int gotk; } sh_ent;   /* mode 1 held, 2 watched, 3 held exactly (lane 87: wbits wanted, got reached) */
 static struct {
     int avail; char why[160];
     sh_ent e[SH_MAX]; int n;
-    unsigned writes, polls, lines, gone, bad, faults;
+    unsigned writes, polls, lines, gone, bad, faults, nearn, fills;
 } SH;
 
 static float sh_abs(float x) { return x < 0.0f ? -x : x; }
+static uint32_t sh_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static float sh_float(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+/* the next float up or down, for a float that is 0 or more */
+static float sh_step(float f, int up) { uint32_t u = sh_bits(f); if (up) u++; else if (u) u--; return sh_float(u); }
 
 static int sitehp_status(char *buf, size_t len)
 {
-    int i, h = 0, w = 0;
+    int i, h = 0, w = 0, x = 0;
     if (g_off) return _snprintf(buf, len, "SITEHP unavailable dll is off\r\n");
     if (!SH.avail) return _snprintf(buf, len, "SITEHP unavailable %s\r\n", SH.why);
-    for (i = 0; i < SH.n; i++) { if (SH.e[i].mode == 1) h++; else w++; }
-    return _snprintf(buf, len, "SITEHP available held=%d watched=%d writes=%u polls=%u lines=%u gone=%u bad=%u faults=%u\r\n", h, w, SH.writes, SH.polls, SH.lines, SH.gone, SH.bad, SH.faults);
+    for (i = 0; i < SH.n; i++) { if (SH.e[i].mode == 1) h++; else if (SH.e[i].mode == 3) { h++; x++; } else w++; }
+    /* (lane 87) hx: of the held sites, those held exactly (HOLDX); near: exact holds that reached the nearest float only */
+    return _snprintf(buf, len, "SITEHP available held=%d watched=%d writes=%u polls=%u lines=%u gone=%u bad=%u faults=%u hx=%d near=%u cap=%d fills=%u\r\n",
+                     h, w, SH.writes, SH.polls, SH.lines, SH.gone, SH.bad, SH.faults, x, SH.nearn, SH_PMAX, SH.fills);
 }
 
 static int sitehp_scan(void)
@@ -489,6 +800,64 @@ static int sh_hold_one(sh_ent *e)
     return 1;
 }
 
+/* (lane 87) the exact hold of one site: see SITEHP HOLDX above. 1 written, 0 nothing to do, -1 the site is gone */
+static int sh_hold_exact(sh_ent *e)
+{
+    static float t[SH_PMAX];                    /* the hp wanted, part by part (one thread: the game's tick) */
+    int n = 0, i, k, part = -1, wrote = 0; uint8_t *const *d = sh_parts(e, &n);
+    float S, M, want, tgt, acc, best, u; uint32_t qb; double bestd;
+    if (!d) return -1;
+    if (n == 0) return 0;
+    sh_sums(d, n, &S, &M);
+    if (!(M > 0.0f)) return 0;
+    qb = sh_bits(S / M);
+    if (qb == e->wbits || (e->gotk && qb == e->got)) return 0;
+    want = sh_float(e->wbits);
+    /* the hp sum whose division by M gives the wanted bits: the float nearest want * M, else one of its 8 neighbours */
+    tgt = (float)((double)want * (double)M);
+    if (tgt > M) tgt = M;
+    if (!(tgt >= 0.0f)) tgt = 0.0f;
+    best = tgt; bestd = 1e300;
+    for (k = 0; k <= 8; k++) {
+        float c = tgt; int j, s = (k + 1) / 2; double dd;
+        for (j = 0; j < s; j++) c = sh_step(c, k & 1);
+        if (c > M) continue;
+        if (sh_bits(c / M) == e->wbits) { best = c; break; }
+        dd = (double)(c / M) - (double)want; if (dd < 0.0) dd = -dd;
+        if (dd < bestd) { bestd = dd; best = c; }
+    }
+    tgt = best;
+    /* in list order: full parts while the game's own running sum stays at or under tgt, then one partial part */
+    acc = 0.0f;
+    for (i = 0; i < n; i++) {
+        float m = *(const float *)(d[i] + SH_HPMAX), v;
+        if (!(m > 0.0f)) { t[i] = *(const float *)(d[i] + SH_HP); acc += t[i]; continue; }
+        if (acc + m <= tgt) v = m;
+        else if (acc < tgt) { v = tgt - acc; if (v > m) v = m; part = i; }
+        else v = 0.0f;
+        t[i] = v; acc += v;
+    }
+    /* the game's sum of these must be tgt itself: the partial part moves by one step of tgt's grid until it is */
+    u = sh_step(tgt, 1) - tgt;
+    for (k = 0; k < 8 && part >= 0; k++) {
+        float m = *(const float *)(d[part] + SH_HPMAX), sum = 0.0f, v;
+        for (i = 0; i < n; i++) sum += t[i];
+        if (sum == tgt) break;
+        v = sum < tgt ? t[part] + u : t[part] - u;
+        if (!(v >= 0.0f) || v > m) break;
+        t[part] = v;
+    }
+    for (i = 0; i < n; i++) {
+        if (!(*(const float *)(d[i] + SH_HPMAX) > 0.0f)) continue;
+        if (sh_bits(*(const float *)(d[i] + SH_HP)) != sh_bits(t[i])) { *(float *)(d[i] + SH_HP) = t[i]; wrote = 1; }
+    }
+    sh_sums(d, n, &S, &M);
+    e->got = sh_bits(S / M); e->gotk = 1;
+    if (e->got != e->wbits) SH.nearn++;
+    if (wrote) SH.writes++;
+    return wrote;
+}
+
 static sh_ent *sh_find(const uint8_t *b) { int i; for (i = 0; i < SH.n; i++) if (SH.e[i].b == b) return &SH.e[i]; return NULL; }
 static void sh_remove(sh_ent *e) { *e = SH.e[--SH.n]; memset(&SH.e[SH.n], 0, sizeof(sh_ent)); }
 
@@ -500,8 +869,8 @@ static void sitehp_tick(void)
     for (i = SH.n - 1; i >= 0; i--) {
         sh_ent *e = &SH.e[i];
         int r;
-        if (e->mode != 1) continue;
-        __try { r = sh_hold_one(e); }
+        if (e->mode != 1 && e->mode != 3) continue;
+        __try { r = e->mode == 3 ? sh_hold_exact(e) : sh_hold_one(e); }
         __except (EXCEPTION_EXECUTE_HANDLER) { SH.faults++; r = -1; }
         if (r < 0) { SH.gone++; log_line("SITEHP: held %p is gone or not sane: dropped", (void *)e->b); sh_remove(e); g_dirty = 1; }
     }
@@ -521,7 +890,7 @@ static void sitehp_poll(void)
             if (d) { sh_sums(d, np, &hp, &mx); f = mx > 0.0f ? hp / mx : -1.0f; }
         } __except (EXCEPTION_EXECUTE_HANDLER) { SH.faults++; ok = 0; }
         if (!ok || !d) { SH.gone++; sh_remove(e); continue; }
-        if (e->sentk && sh_abs(f - e->sent) < 0.0005f) continue;
+        if (e->sentk && sh_bits(f) == sh_bits(e->sent)) continue;      /* (lane 87) the bits: was "moved by less than 0.0005" */
         e->sent = f; e->sentk = 1;
         if (f < 0.0f) bits = 0xFFFFFFFFu; else memcpy(&bits, &f, 4);
         n += _snprintf(buf + n, sizeof(buf) - (size_t)n, "%IX %08X\r\n", (uintptr_t)e->b, bits);
@@ -535,10 +904,10 @@ static void sitehp_poll(void)
 
 static void sitehp_add(const char *s, int mode, const char *fs)
 {
-    unsigned long long a = 0, fb = 0; char why[200]; sh_ent *e; uint8_t *b; float f = 0.0f;
+    unsigned long long a = 0, fb = 0; char why[200]; sh_ent *e; uint8_t *b; float f = 0.0f; uint32_t u = 0;
     if (!parse_u64(s, &a) || !comp_sane(a, SH_CHECK, why, sizeof(why))) { SH.bad++; log_line("SITEHP refused: %s", a ? why : "not an address"); return; }
-    if (mode == 1) {
-        char *end; uint32_t u;
+    if (mode == 1 || mode == 3) {
+        char *end;
         fb = _strtoui64(fs, &end, 16);
         if (end == fs || *end || fb > 0xFFFFFFFFull) { SH.bad++; log_line("SITEHP HOLD refused: '%.20s' is not float bits (hex)", fs); return; }
         u = (uint32_t)fb; memcpy(&f, &u, 4);
@@ -546,12 +915,37 @@ static void sitehp_add(const char *s, int mode, const char *fs)
     }
     b = (uint8_t *)(uintptr_t)a;
     e = sh_find(b);
-    if (e && e->mode == mode && *(const uint32_t *)(b + OBJ_INDEX_OFF) == e->idx && *(const uint64_t *)(b + OBJ_NAME_OFF) == e->name) { e->want = f; return; }
+    if (e && e->mode == mode && *(const uint32_t *)(b + OBJ_INDEX_OFF) == e->idx && *(const uint64_t *)(b + OBJ_NAME_OFF) == e->name) {
+        if (e->wbits != u) e->gotk = 0;        /* (lane 87) another fraction is wanted: what the last write reached no longer counts */
+        e->want = f; e->wbits = u; return;
+    }
     if (e) sh_remove(e);
     if (SH.n >= SH_MAX) { SH.bad++; log_line("SITEHP refused: %d sites already", SH_MAX); return; }
     e = &SH.e[SH.n++]; memset(e, 0, sizeof(*e));
-    e->b = b; e->idx = *(const uint32_t *)(b + OBJ_INDEX_OFF); e->name = *(const uint64_t *)(b + OBJ_NAME_OFF); e->mode = mode; e->want = f;
-    log_line("SITEHP %s %p", mode == 1 ? "HOLD" : "WATCH", (void *)b);
+    e->b = b; e->idx = *(const uint32_t *)(b + OBJ_INDEX_OFF); e->name = *(const uint64_t *)(b + OBJ_NAME_OFF); e->mode = mode; e->want = f; e->wbits = u;
+    log_line("SITEHP %s %p", mode == 1 ? "HOLD" : mode == 3 ? "HOLDX" : "WATCH", (void *)b);
+}
+
+/* (lane 87) SITEHP FILL <b>: see the head comment. The site is checked as for a hold (its own number and name of now). */
+static void sitehp_fill(const char *s)
+{
+    unsigned long long a = 0; char why[200]; sh_ent tmp, *e; uint8_t *b; uint8_t *const *d = NULL; int n = 0, i, wrote = 0;
+    if (!parse_u64(s, &a) || !comp_sane(a, SH_CHECK, why, sizeof(why))) { SH.bad++; log_line("SITEHP FILL refused: %s", a ? why : "not an address"); return; }
+    b = (uint8_t *)(uintptr_t)a;
+    e = sh_find(b);
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.b = b; tmp.idx = *(const uint32_t *)(b + OBJ_INDEX_OFF); tmp.name = *(const uint64_t *)(b + OBJ_NAME_OFF);
+    __try {
+        d = sh_parts(&tmp, &n);
+        if (d) for (i = 0; i < n; i++) {
+            float m = *(const float *)(d[i] + SH_HPMAX);
+            if (m > 0.0f && *(const float *)(d[i] + SH_HP) != m) { *(float *)(d[i] + SH_HP) = m; wrote = 1; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { SH.faults++; d = NULL; }
+    if (e) sh_remove(e);
+    if (!d) { SH.bad++; log_line("SITEHP FILL refused: %p is not a site with a sane part list", (void *)b); return; }
+    if (wrote) SH.writes++;
+    SH.fills++;
 }
 
 static void sitehp_cmd(int argc, char **argv)
@@ -561,13 +955,15 @@ static void sitehp_cmd(int argc, char **argv)
     if (!SH.avail) { SH.bad++; log_line("SITEHP refused: unavailable (%s)", SH.why); return; }
     if (argc == 3 && _stricmp(argv[1], "WATCH") == 0) { sitehp_add(argv[2], 2, NULL); return; }
     if (argc == 4 && _stricmp(argv[1], "HOLD") == 0) { sitehp_add(argv[2], 1, argv[3]); return; }
+    if (argc == 4 && _stricmp(argv[1], "HOLDX") == 0) { sitehp_add(argv[2], 3, argv[3]); return; }      /* lane 87 */
+    if (argc == 3 && _stricmp(argv[1], "FILL") == 0) { sitehp_fill(argv[2]); return; }                  /* lane 87 */
     if (argc == 3 && _stricmp(argv[1], "DROP") == 0) {
         unsigned long long a = 0; sh_ent *e;
         if (parse_u64(argv[2], &a) && (e = sh_find((uint8_t *)(uintptr_t)a)) != NULL) sh_remove(e);
         return;
     }
     if (argc == 2 && _stricmp(argv[1], "FORGET") == 0) { SH.n = 0; memset(SH.e, 0, sizeof(SH.e)); log_line("SITEHP FORGET"); return; }
-    SH.bad++; log_line("SITEHP refused: needs WATCH <b> | HOLD <b> <frac bits> | DROP <b> | FORGET | POLL");
+    SH.bad++; log_line("SITEHP refused: needs WATCH <b> | HOLD <b> <frac bits> | HOLDX <b> <frac bits> | FILL <b> | DROP <b> | FORGET | POLL");
 }
 
 /* ------------------------------------------------------------------ FAMROLL (lane 71): births, new families and sickness on the host's word

@@ -25,8 +25,16 @@ PF=$(lua friend 'return (lord.bIsPlayerPaused and eng.gameSpeed < 0.01) and "pau
 echo "host: $PH   friend: $PF"
 case "$PH$PF" in *running*|*TIMEOUT*|*ERR*) echo "NOT PAUSED on both copies: no sweep"; exit 3;; esac
 
+# (lane 81) the owner's real pointer, read only: where it is, and whether it is inside a test window of this lane
+pointer() { powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$SW/pointer.ps1")" -Pids "$(tr -d '\r' < "$RUN/host.pid" 2>/dev/null),$(tr -d '\r' < "$RUN/friend.pid" 2>/dev/null)" 2>&1 | tr -d '\r' | tail -1; }
+echo "pointer at the start: $(pointer)"
+# (lane 81) both copies' cameras on the host's place before the sweep (a pointer at a window's edge can have
+# scrolled one of them to the map's edge): the probe puts its lord there (SW_CAM)
+CAM=$(lua host 'local l = lord:K2_GetActorLocation(); return string.format("%.1f,%.1f,%.1f", l.X, l.Y, l.Z)' | sed 's/OK: //' | tr -d '\r')
+case "$CAM" in *,*,*) ;; *) CAM="";; esac
+echo "camera of both copies: ${CAM:-not read}"
 hdr() { # hdr <cmd> <out file> -> $RUN/_sw_<cmd>.lua (the probe with its header)
-  { printf 'SW_CMD = "%s"\nSW_DIR = [[%s\\]]\nSW_OUT = [[%s]]\nSW_ONLY = "%s"\nSW_SCREENS = "%s"\n' "$1" "$(cygpath -w "$SW")" "$(cygpath -w "$2")" "$ONLY_ARG" "$SCR"
+  { printf 'SW_CMD = "%s"\nSW_DIR = [[%s\\]]\nSW_OUT = [[%s]]\nSW_ONLY = "%s"\nSW_SCREENS = "%s"\nSW_CAM = "%s"\n' "$1" "$(cygpath -w "$SW")" "$(cygpath -w "$2")" "$ONLY_ARG" "$SCR" "$CAM"
     cat "$SW/sweep_probe.lua"; } > "$RUN/_sw_$1_$3.lua"; }
 hdr start "$H" h; hdr start "$F" f; hdr status "$H" h; hdr status "$F" f
 echo "host:   $(np "$RUN/_sw_start_h.lua" 30 | tail -1 | cut -c1-160)"

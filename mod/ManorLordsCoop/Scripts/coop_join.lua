@@ -92,6 +92,38 @@ J.allFor = J.allFor or {}; J.brk = J.brk or {}; J.brkSaid = J.brkSaid or {}; J.w
 local function gi() return FindFirstOf("MLGameInstance") end
 local function GS() return StaticFindObject("/Script/Engine.Default__GameplayStatics") end
 local function enc(s) return (tostring(s):gsub("[^%w]", function(ch) return string.format("%%%02X", ch:byte()) end)) end
+local function dec(s) return (tostring(s):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)) end
+
+-- (lane 81) a player's join, leave or return is told on EVERY copy, once: the host shows it and sends
+--   J PN <id> <kind> <player> <text>        (id = this host's run and a number; kind "joined", "left" or "back")
+-- A friend shows each id once (J.pnSeen): a friend that loads alone reads the host's lines again from the save's mark,
+-- and would otherwise show the same notice twice. A friend is never told that it itself left or came back.
+J.pnSeen = J.pnSeen or {}; J.pnList = J.pnList or {}
+function J.tellAll(kind, who, text)
+  local S = C.s; if not (S and S.role == "host") then return nil end
+  J.pnRun = J.pnRun or string.format("%d", math.floor(tonumber(A.now()) or 0))
+  J.pnN = (J.pnN or 0) + 1
+  local id = J.pnRun .. "." .. J.pnN
+  -- the player is sent by his slot ("friend1"), not by the Steam name a join path holds: a friend's log then names
+  -- the slot only (lane 61's rule; the friend learns slot -> name from the text, see J.pnLine)
+  local slot = who
+  if S.display then for sl, nm in pairs(S.display) do if nm == who then slot = sl end end end
+  A.send(string.format("J PN %s %s %s %s", id, tostring(kind), enc(slot), enc(text)))
+  return id
+end
+function J.pnLine(S, w)
+  local id, kind, who, text = w[5], w[6], dec(w[7] or ""), dec(w[8] or "")
+  if not (id and kind and w[8]) then return "bad" end
+  if J.pnSeen[id] then return "again" end
+  J.pnSeen[id] = true; J.pnList[#J.pnList + 1] = id
+  if #J.pnList > 200 then J.pnSeen[table.remove(J.pnList, 1)] = nil end
+  if who == S.name and kind ~= "joined" then return "self" end
+  -- the name a player sees, so that this copy's log names only the slot (C.notify writes the log through S.display)
+  local nm = text:match("^(.-) left the game$") or text:match("^(.-) joined the game$") or text:match("^(.-) is back$")
+  if nm and nm ~= "" and nm ~= who and who:match("^friend%d+$") then S.display = S.display or {}; S.display[who] = nm end
+  if C.notify then C.notify(kind == "back" and "joined" or kind, text) end
+  return "shown"
+end
 
 -- ---- hooks (registered from tick; callbacks only record or blank a parameter)
 -- (lane 63) how the next world starts ("new" / "load"), stamped with the number of worlds attached so far (the core's
@@ -156,6 +188,7 @@ end
 local function loadSave(S, name, level)
   J.loading = { name = name, t = os.clock() }; J.lastLoaded = name; J.noteStart("load")
   if C.men and C.men.loadBegins then pcall(C.men.loadBegins) end   -- (lane 43) the native table of held men empties now
+  if C.visit and C.visit.beforeLoad then pcall(C.visit.beforeLoad) end   -- (lane 86) a walker leaves visit mode before the load
   C.hold = true                                   -- ignore the host's state until the new world is up (and, when every copy loads, until the host says go)
   S.replay = nil
   local g = gi(); if not A.valid(g) then A.log("join: no game instance, cannot load"); J.loading = nil; return end
@@ -448,7 +481,7 @@ local function hostTick(S, clock)
       if J.joiner and not came then J.joiner = nil; if C.notify then C.notify("synced", "The player did not finish joining") end
       elseif J.joiner then                               -- this resync brought a player in: say so on every copy
         local text = J.joiner .. " joined the game"
-        A.send("J NOTE " .. enc(text))
+        J.tellAll("joined", J.joiner, text)                -- (lane 81) once on every friend (was J NOTE: an info notice)
         if C.notify then C.notify("joined", text) end
         J.joiner = nil
       elseif C.notify and not prep then C.notify("synced", "Synced") end
@@ -621,6 +654,7 @@ function M.onMessage(S, from, kind, w, line)
       end
     elseif w[4] == "LOAD" then J.single = nil; loadSave(S, w[5], w[6] or "Mission01_ROBBER")      -- every copy loads
     elseif w[4] == "SYNCING" then if C.notify then C.notify("syncing", "Syncing with the host") end
+    elseif w[4] == "PN" then J.pnLine(S, w)                -- (lane 81) a player joined, left or is back
     elseif w[4] == "NOTE" and w[5] then if C.notify then C.notify("info", (w[5]:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))) end
     elseif w[4] == "BREAK" and w[5] then
       -- (lane 63) the host's breaker holds a kind of reason: this copy's whole difference into this log, and to the
@@ -653,7 +687,7 @@ function M.onMessage(S, from, kind, w, line)
         A.log("join: %s loaded %s alone and is back %.1f s after asking (%s); every value is sent again; this copy did not pause or load", from, a.name, clock - a.asked, tostring(a.reason))
         if a.join then                                   -- a new player: say so on every copy
           local text = a.join .. " joined the game"
-          A.send("J NOTE " .. enc(text))
+          J.tellAll("joined", a.join, text)              -- (lane 81) once on every friend
           if C.notify then C.notify("joined", text) end
         end
       else

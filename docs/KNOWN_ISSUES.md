@@ -1,11 +1,11 @@
 # Known issues and limitations
 
-Manor Lords Co-op **0.2.1** (v1, beta for testing with friends). Game version **0.8.117** only.
+Manor Lords Co-op **0.2.7** (beta for testing with friends). Game version **0.8.117** only.
 
-Checked against the project's test records on 2026-11-17. Every number here comes from a recorded test run.
+Checked against the project's test records on 2026-11-20. Every number here comes from a recorded test run.
 Where nothing was run, this page says "never tested".
 
-**0.2.1 was tested by the lead:** one full session (every pause equal) and two installs from the release zip (join, 5 resyncs, a rejoin; no crash). The speed change in 0.2.1 (item C1) did not come up in those runs, so it is not yet seen working in a game.
+**0.2.7 was tested on test copies** (two or three copies of the game on one PC) by the lead and helpers. It was not tested over real Steam between two PCs.
 
 ## How to read this page
 
@@ -43,8 +43,8 @@ Words used below:
 ### A1. Three or more players
 
 - **You see:** unknown.
-- **Numbers:** never with 3 or more real players. 5 copies on one PC ran 40 minutes with nobody acting, on an older build. The lobby takes 8 players; 6 to 8 never ran.
-- **Basis:** never tested with real players. Lead's run with 5 copies.
+- **Numbers:** never with 3 or more real players. Three copies on one PC (host and two friends, 0.2.7): town actions 10 of 10 equal on all three copies, a friend's change over another friend's 3 of 3, stock equal between the host and each friend, three players on one setting 16 of 16 (presses 0.06 to 0.88 s apart, no resync), a friend's reload. 5 copies on one PC ran 40 minutes with nobody acting, on an older build. The lobby takes 8 players; 4 to 8 never ran.
+- **Basis:** never tested with real players. Helper's runs with 3 copies (scripts, no real mouse); lead's run with 5 copies.
 - **Workaround:** start with one friend. Add more friends one at a time.
 
 ### A2. Long sessions and late-game towns
@@ -85,15 +85,15 @@ For squads and villagers the owner set softer bars on 2026-11-16. These items pa
 ### B3. Free merchants a few metres off
 
 - **You see:** a travelling merchant (one man who walks between regions) a few metres from his place on the host's screen.
-- **Numbers:** 99 % within 2.4 to 2.7 m in 10 of 12 test windows. Right after a rejoin: up to 4.5 m (99 %), largest 5.2 m.
+- **Numbers:** 99 % within 2.4 to 2.7 m in 10 of 12 test windows. Right after a rejoin: up to 4.5 m (99 %), largest 5.2 m. In 0.2.7, against the host's path of the last 3 s, two sessions of 30 game days at speed 4: half within 0.4 m, 99 % within 1.4 to 1.8 m; over 3 m in 0.3 to 0.5 % of the readings, never for longer than 1.7 s; largest 16 m (every merchant at once for about a second).
 - **Basis:** helper's runs. Not measured: during a friend's resync.
 - **Workaround:** none needed.
 
 ### B4. Numbers arrive a moment late on a friend
 
 - **You see:** a number on a friend's screen (stock, a total) changes shortly after the host's.
-- **Numbers:** longest delay 1.66 to 1.86 s in the lead's last five sessions. 0 values the host never had.
-- **Basis:** lead's runs.
+- **Numbers:** in the 0.2.7 session checks the longest delay of a goods number was 1.0 to 2.2 s, the usual one about 0.5 to 0.7 s; 0 values the host never had. Once a region's goods total came 3.11 s after the host's, at speed 8 with eight game copies running on the PC (the owner accepted that single case).
+- **Basis:** lead's runs and helper's runs.
 - **Workaround:** none needed.
 
 ---
@@ -103,8 +103,8 @@ For squads and villagers the owner set softer bars on 2026-11-16. These items pa
 ### C1. The game slows to speed 1 when an enemy is spotted
 
 - **You see:** the game drops to speed 1 for everybody when bandits or raiders appear.
-- **Numbers:** the plain game does this too; speed is shared, so the host's drop reaches everyone. Since 0.2.1 a friend's own drop is no longer sent to the others.
-- **Basis:** plain game measured without the mod; lead's runs. The 0.2.1 change did not come up in the 0.2.1 runs.
+- **Numbers:** the plain game does this too; speed is shared, so the host's drop reaches everyone. Since 0.2.1 a friend's own drop is no longer sent to the others. Since 0.2.7 also the game's second alarm on a friend a few seconds later, and a friend's Explore button, are no longer sent.
+- **Basis:** plain game measured without the mod; lead's runs; helper's runs (0.2.7, scripts).
 - **Workaround:** any player presses the speed button again.
 
 ### C2. Drops to speed 1 with no known cause
@@ -120,9 +120,9 @@ For squads and villagers the owner set softer bars on 2026-11-16. These items pa
 
 ### D1. The region's squad count after a resync
 
-- **You see:** nothing. No screen shows this count. The game's "enemies present" and "under attack" flags were equal everywhere.
-- **Numbers:** after a rejoin, a hidden per-region squad count differs in 5 to 7 regions, by at most 2 to 4. Every differing entry was a free merchant (264 of 264).
-- **Basis:** helper's runs. Left as it is on purpose.
+- **You see:** nothing. No screen shows this count. The game asks the list one question only: "does a squad hostile to this region's owner stand here?". That answer switches the map's claim buttons off ("Can't claim when enemy units are present") and sets the region's "under attack" flag, which keeps villagers at home. A free merchant, or a lord's own squad in his own region, can never make that answer yes.
+- **Numbers:** after a rejoin, a hidden per-region squad count differs in 5 to 7 regions, by at most 2 to 4. Almost every differing entry was a free merchant (264 of 264 in one run, 153 of 170 in another; the rest were a rival lord's own squads at home and squads being removed).
+- **Basis:** helper's runs. The count is left as it is on purpose and is no longer compared; the mod's daily check compares the two answers above instead. The host also asks its own game before it carries out a friend's claim, so a friend's copy cannot lay a claim the host's screen forbids.
 - **Workaround:** none needed.
 
 ### D2. The job board's villager names
@@ -150,6 +150,7 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 | Declare peace | Clicked host to friend. Friend to host never clicked. |
 | Settle a new region | Tested from the console only. Ends in a resync of every copy, by design. |
 | Unit editor | **Not carried.** It changes only your own copy. |
+| Castle planner: Reset button | Never pressed with an effect: it stayed greyed out in every plan tested. Needs a real click. |
 
 - **Numbers:** of 140 player actions: 83 proven both ways, 32 carried but not proven both ways, 1 not carried, 24 need nothing (2026-11-16).
 - **Basis:** the project's coverage table.
@@ -194,7 +195,21 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 - **Basis:** helper's runs.
 - **Workaround:** none needed now. Report it if you see it.
 
+### F6. A rare close of a game in a busy town (0.2.6; fixed in 0.2.7)
+
+- **You saw (0.2.6):** rarely, a player's game closed in a town where buildings and piles come and go.
+- **Numbers:** estimated about once in two to three hours of play in such a town (wide margin), close to never where nothing is demolished. Cause: the mod looked at a game object (a cart, a pile, a felled tree) after the game had freed it. 0.2.7 checks such objects against the game's own list first.
+- **Basis:** helper's runs on test copies: the close seen once in three pinned sessions before the fix; none in the sessions after it.
+- **Workaround:** none needed. If it ever happens, send a bug report (Co-op > Make Bug Report). Should the new check itself cause trouble, `coop.cfg` has the line `keptguard = off`.
+
 ---
+
+### F7. A friend's close after a rival site over just-cleared felled trees (0.2.7)
+
+- **You see:** a friend's game closes.
+- **Numbers:** seen once in 16 test sessions, on a test build, 1.5 s after a rival lord's building site was placed over felled trees the friend had just cleared. Not seen again in 340 removals and 5 such sites made on purpose.
+- **Basis:** helper's runs on test copies. Cause not proven; 0.2.7 adds two safeguards (a villager is never handed a tree that was just removed; a friend leaves trees under a new host site for its own placement of that site).
+- **Workaround:** the friend joins again. **Report** it with the Co-op menu's bug report.
 
 ## G. Smaller open items
 
@@ -276,7 +291,7 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
   - **Redraws:** building panels and every tab (the building's own settings, and the region's trade rules, limits, taxes and workers); the region panel and the lord panel (taxes, policies, perks, region name, war and peace); the development tree (perk and policy cards, region name, trade summary); claims; the army panel and the mercenary panel (a friend's orders on the host, a player's behaviour stance on every copy, squad names, the retinue).
   - **Left to the game's own redraw (not checked):** on a friend, the host's push stance and skills (the game's own functions ask for the redraw themselves).
   - **As in the plain game:** the approval breakdown redraws once a day.
-  - **Not carried at all:** joining two castle walls in the castle planner.
+  - **Joining two castle walls** (0.2.6: not carried at all): carried from 0.2.7. The castle planner window (cost line, castle area, the Construct button) redraws after another player's change from 0.2.7 too.
   - **If you both change one value:** the host's order of arrival decides, as before. Your panel shows the final value after you let go.
 - **Basis:** helper's runs on test copies (two copies, one PC, scripts only): a field's priority 9 of 9 (the friend's panel redrawn 40 to 70 ms after the host's line), workers 2 of 2, the chosen tab kept 3 of 3, region and lord panels 3 of 3, development tree 6 of 6, behaviour stance 6 of 6, mercenary panel redrawn with the army panel; with nobody acting 0 redraws over 9 game days, 3 times. Never tested: a held button, a dragged slider, an open drop-down and typing with a real mouse; a scrolled list.
 - **Fixed with it:** with a field's panel open on two copies, the field's fertilization setting went back and forth between them and could swallow the host's own field priority click.
@@ -301,15 +316,18 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 - **You see:** when a sheep or cow starves, the notice reaches a friend, but the animal stays alive there about 30 seconds longer and its body is not shown.
 - **Basis:** helper's runs on test copies. Fix being built for 0.2.6.
 
-### G15. Mourning and new villagers after a friend's reload
+### G15. Mourning and new villagers after a friend's reload (changed in 0.2.6 and 0.2.7)
 
-- **You see:** right after a friend reloads, a home's mourning days can read wrong for a short time, and a new villager can appear on the friend several seconds after the host.
-- **Basis:** helper's runs on test copies. Fix being built for 0.2.6.
+- **You saw (0.2.5):** right after a friend reloads, a home's mourning days could read wrong for a short time, and a new villager could appear on the friend several seconds after the host.
+- **Now:** new villagers appear on a friend within a moment, also after a reload (0.2.6). From 0.2.7 a friend's game no longer counts a home's mourning days itself: the days shown are the host's.
+- **Basis:** helper's runs on test copies (lane 64's pinned sessions with the change on). Not measured since on a friend's reload in particular.
 
-### G16. A friend can keep extra free merchants
+### G16. A friend can keep extra free merchants (0.2.5 and 0.2.6; fixed in 0.2.7)
 
-- **You see:** after a reload a friend can show more free merchants than the host. They are not removed, to keep the merchants the host also has safe.
-- **Basis:** helper's runs: with removal on, a friend could delete a merchant the host still had; 0.2.5 keeps them all (3 of 3 reloads equal at 21 merchants). A safe removal is planned for 0.2.6.
+- **You see (0.2.5, 0.2.6):** after a reload a friend can show more free merchants than the host. They are not removed, to keep the merchants the host also has safe.
+- **In 0.2.7:** a merchant the friend has and the host has not is taken out with his pack animal, about 1 to 2 s after the host's list shows it. A merchant the host has is never taken out.
+- **Numbers (0.2.7):** 4 test runs of 9 loads each (23 loads of the friend alone, 13 of every copy) with merchants made or taken out on the host around the loads, and two sessions of 30 game days: 0 wrong removals; the longest time a friend's merchant count differed from the host's was 1.8 s. After a friend's own load its merchants are the save's for the first 2 s or so (0.2.7: 1.6 to 2.3 s in 17 of 18 test loads; it was 5 to 6 s). Once, after a 61 s load, it took 12.6 s.
+- **Basis:** helper's runs on test copies. Earlier: with the old removal on, a friend could delete a merchant the host still had; 0.2.5 keeps them all (3 of 3 reloads equal at 21 merchants).
 
 ### G17. A rare resync after a demolition (0.2.4 and 0.2.5; fixed in 0.2.6)
 
@@ -317,10 +335,14 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 - **Basis:** helper's run on test copies: the building's name was lost before the line was sent. The same code is in 0.2.4. Fix being built for 0.2.6.
 - **Workaround:** none needed; the resync repairs it.
 
-### G18. Hand carts for gatherers on a friend
+### G18. Hand carts and timber carts on a friend (fixed in 0.2.7)
 
-- **You see:** on a friend, a gatherer may carry by hand where the host's uses a hand cart; the carts drawn are the host's.
-- **Basis:** helper's runs: task given 15 of 15, the cart back at the host's stand 12 of 13. Being built for 0.2.6.
+- **You saw (0.2.6 and before):** on a friend, a villager could carry by hand where the host's used a hand cart, and a building could show another number of parked carts than on the host for seconds.
+- **Now (0.2.7):** a friend's hand carts and the timber carts the oxen pull follow the host's: who carries or pulls one and which stand holds one. A friend's ox no longer takes a timber cart by its own choice, and a friend's villager no longer takes a hand cart by its own choice.
+- **Numbers:** pinned session on the 0.2.7 base with both on: every building's cart count within 3 s of the host's in 29 of 30 rows (the 30th, in the first seconds after the join, could not be judged), among them the timber cart building's 6 of 6, carts that stand 24 of 24; a friend's ox's own pickups of a timber cart stopped 19 of 19. With the hand carts off: 1,237 late rows in three sessions. On the final base (two 900 s sittings and one pinned session): a friend's villagers' own pickups of a hand cart stopped where the game makes them in all 93, none became a villager's task (before this, 7 in one 900 s sitting did); in the last sitting every building's cart count, every carrier and every cart place within 3 s of the host's; the session's cart rows within 3 s of the host's in all 52 that could be judged (2 in the seconds after the join could not be); a friend's ox's own pickups of a timber cart stopped 35 of 36 in that session.
+- **Left:** for up to about two and a half seconds after a friend loads (joining, or a resync) the friend may show the carts of the save, or hold its first changes while a carrier's take waits for that villager's next task (3 of 7 loads in the last measured run, up to 2.3 s; before, 5 of 7 up to 1.3 s). When a building is finished, a friend's own new hand carts there are swapped for the host's: by the code the host's are drawn within about 0.3 s and made real about 1.6 s later (not checked on screen). Rarely a cart a villager drops by itself, or a timber cart an ox pulls, stands loose for a moment until it is given back (6 of 6 hand carts within 30 ms in the final runs). Once, before the final changes, a friend lost a parked hand cart and the mod made it again 0.8 s later (cause not found; meanwhile the friend should draw the host's cart in its place; not checked on screen).
+- **Big carts:** no way to get one was found in 0.8.117; not tested. The game has the class (its good is 109), but no test save has one, a new game started with the game's start-with-cart setting had none, and no building, upgrade or unit in the test town names one.
+- **Basis:** helper's runs on test copies (lane 74).
 
 ### G19. A trade limit changed by another player, with the Trade tab open (0.2.5; fixed in 0.2.6)
 
@@ -329,23 +351,116 @@ The mod carries these, but nobody clicked them in the game on two copies. The ow
 - **Basis:** the real-click check on test copies. Fix being built for 0.2.6.
 - **Workaround:** close the panel and open it again.
 
-### G20. An ox that dies on the host
+### G20. An ox that dies on the host (0.2.6; fixed in 0.2.7)
 
-- **You see:** if an ox dies on the host, a friend may keep its ox for about 25 seconds, and its body is not shown there.
-- **Basis:** helper's runs on test copies. A test command that kills an ox crashed the game copy; whether the plain game does the same is being checked. Other farm animals are carried within about a second.
-- **Workaround:** none needed; the count settles by itself.
+- **You saw (0.2.6):** if an ox died on the host, a friend could keep its ox for about 25 seconds, and its body was not shown there.
+- **In 0.2.7:** the ox dies on a friend too, with its body, as other farm animals do (within about a second).
+- **Basis:** helper's runs on test copies.
 
-### G21. A claim while enemies are in the region
+### G21. A claim while enemies are in the region (fixed in 0.2.7)
 
 - **You see:** the map does not let you claim a region while enemy units are in it. If an enemy squad is still on the host but already gone on a friend's copy (or the other way round), the friend's claim button can differ from the host's for a few seconds.
-- **Basis:** a reading of the game's code and runs on test copies; a claim the rule forbids was not seen to happen. A check on the host before it carries out a friend's claim is being built for 0.2.7.
+- **In 0.2.7:** the host asks its own game "are enemies present?" before it carries out a friend's claim, and a friend takes the host's "under attack" flag. A friend's copy cannot lay a claim the host's screen forbids.
+- **Basis:** a reading of the game's code and runs on test copies; a claim the rule forbids was not seen to happen.
 - **Workaround:** none needed.
 
-### G22. Two players change the same region's setting in the same second (0.2.5 and 0.2.6)
+### G22. Two players change the same region's setting in the same second (0.2.5 and 0.2.6; fixed in 0.2.7)
 
-- **You see:** you change a trade limit, a trade rule or a production limit less than a second after another player's change to the same region reached you. Your change stays on your copy but is not sent, so the two copies show different numbers (seen: 34 against 33) until the next change of that value. Also: if you hold + down while another player changes the same limit, your value on release wins.
-- **Basis:** the real-click check of 0.2.6 on test copies; the same rule is in 0.2.5. Fix planned for 0.2.7.
-- **Workaround:** change the value once more.
+- **You saw:** you changed a trade limit, a trade rule or a production limit less than a second after another player's change to the same region reached you. Your change stayed on your copy but was not sent, so the two copies showed different numbers (seen: 34 against 33) until the next change of that value.
+- **In 0.2.7:** every real change is sent; when two cross, the host's order decides and every copy ends on the same value. Tested: 18, 10 and 6 presses all equal on both copies, none dropped; three players on one setting 16 of 16. Not tested with a real mouse: holding + down while another player changes the same limit.
+- **Basis:** the real-click check of 0.2.6 on test copies; helper's runs on 0.2.7 (scripts).
+- **Workaround (0.2.6):** change the value once more.
+
+### G23. The livestock merchant of a rival lord on a friend (0.2.6 and before; shown from 0.2.7)
+
+- **You see (0.2.6 and before):** when a rival lord orders an animal, the host sees a merchant walk from the map's edge to the rival's town (about 100 s at speed 4), with the animal he brings walking beside him. A friend does not see that man, and sees the animal already standing at the rival's stable.
+- **In 0.2.7:** a friend shows him about 2 s after he appears on the host, walking the same way, and takes him out within a second after the host's is gone. The animal walks beside him as on the host. Nothing is ordered, paid or delivered on the friend's copy.
+- **Numbers (0.2.7's livestock code, one test run with one rival order):** the merchant: after his first 10 s, at speed 4 median 0.2 m from the host's at the same moment (90 % 0.5 m, 3 of 126 readings over 3 m, largest 4.4 m); at speed 8 median 0.8 m (90 % 1.4 m, 1 of 103 over 3 m, largest 4.8 m). By the 3-second measure (the nearest place the host's had in the last 3 s) never over 2.6 m. In his first 4 s he is up to 11 m behind (he stands while his way is found). The animal: during the walk median 1.5 m from the host's (90 % 2.3 m, 3 of 334 readings over 3 m, largest 4.6 m).
+- **Still different:** in the merchant's first seconds he can be up to about 8 m from the host's for a moment (once in four test merchants; by the 3-second measure never over 2.6 m). The animal after its delivery: up to about 9 m for its first 2 s while the host's turns to its stable. A friend's ox walks a little slower than the host's and is moved up about once a second.
+- **After a friend's long load:** a friend shows the save's merchants until it has caught up with what the host sent meanwhile (about 1.5 to 2.5 s after that on a fast PC; 6 s once on a busy one).
+- **A player's own order:** each copy's game makes its own merchant and animal; one test order (oxen, through the stable's panel): the friend's merchant came 0.01 s after the host's, median 0.2 m from it (4 of 535 readings over 3 m by the 3-second measure, largest 4.1 m). The ox itself was not measured.
+- **Basis:** helper's runs on test copies (lane 82, runs lvB1 and lvD1). One pair of screenshots with the same view (an earlier build of 0.2.7, before the animal was added) shows a figure drawn at the merchant's place on both copies; it is a few pixels in a small test window. No picture yet shows the animal beside him on a friend.
+- **Workaround:** none needed; nothing is counted wrong.
+
+### G24. Fertility overlay: one cell a shade off at the edge of a change (0.2.7)
+
+- **You see:** with the fertility overlay on, a single cell at the edge of a patch whose fertility just changed can be one colour step lighter or darker on a friend than on the host. The fertility itself is the same on both.
+- **Numbers:** 1 of 200 cells in the lead's forced test; the rest equal 3 s after the change.
+- **Basis:** helper's runs on test copies. Cosmetic: each game draws the overlay cell by cell in its own order.
+- **Workaround:** none needed.
+
+### G25. Region graph tooltip never compared (0.2.7)
+
+- **You see:** unknown. The region production graph's lines, stock list and totals were compared and are equal; the tooltip that shows a day's goods when you hover the graph was never compared, because a script cannot hover it. A friend's records can hold a few goods at 0 that the host's do not have; if the tooltip lists goods at 0, they would show only there.
+- **Basis:** helper's runs on test copies, scripts only. Needs a real mouse.
+- **Workaround:** none known. **Report** a tooltip row on a friend that the host lacks.
+
+### G26. A house can lack small pieces on a friend while it is being upgraded (0.2.7)
+
+- **You see:** on a friend, a house (often in another lord's town, often just after it was upgraded) can lack a door, stairs, hay bales, stones or grass at its foot that the host's copy of the same house shows.
+- **Numbers:** in the check's drawn-parts comparison, 1 to 5 of 20 to 32 buildings a pause have a piece only on the host; one upgraded cottage lacked 25 pieces (3 doors, stairs, bales, a bag, stones, grass, 9 ground pieces) in two sessions in a row. Cause found for a door on one house: where a friend shows the host's house part instead of its own, it draws only the part's main mesh, so a door fixed to that part as a second mesh is left out. The upgraded cottage is likely the same, together with ground pieces the mod does not copy on purpose (not looked at piece by piece).
+- **0.2.7:** a friend now draws a house part's other pieces (doors included) with it, and a door's or a tool's turn is no longer compared (it swings by itself on each copy). In the last checks 0 buildings differed in all three phases. Left: while a house's artisan upgrade is under way, a friend can draw only some of its pieces (seen at one house: 28 pieces on the host, 4 on the friend); after the upgrade both match.
+- **Basis:** helper's runs on test copies (lane 83: sessions l83r3b, l83r3c, l83r4a; run 21 read one house actor by actor; lane 87: sessions l87e, l87f, l87g). Being worked on. No screenshot shows it yet: at the test views a door is a few pixels.
+- **Workaround:** none. Nothing is counted wrong; it is only what is drawn.
+
+### G27. A friend a day behind while the game is paused at a day change (0.2.7)
+
+- **You see:** the game is paused right as a new day starts. On a friend the date and the region panel's day labels can show the day before, as long as the pause lasts. They catch up when the game goes on.
+- **Numbers:** a friend's day normally follows the host's 0.39 to 0.61 s later; a pause inside that moment keeps the friend on the old day. Seen once in the lead's release checks (host day 294, friend 293).
+- **Basis:** lead's run on test copies. Being worked on.
+- **Workaround:** unpause for a moment.
+
+### G28. Plots, markets, roads and moves on ground the host has just built on (0.2.7)
+
+- **You see:** if a friend draws a house plot, a market or a road, or moves a building, over ground where the host has just built something (both in the same moment), the host carries it out anyway and both copies keep it, overlapping. A friend's building (a lodge, a saw pit and the like), field or pasture that overlaps the host's is refused, and the friend sees the host's instead. A friend's move of a building the host is demolishing at that moment is refused too.
+- **Numbers:** buildings: an overlap of at least 5 % of the smaller outline (and 2 square metres) is refused; fields and pastures: 10 % (and 4 square metres). In tests 3 of 3 overlapping lodges, fields, pastures and lodges on a field were refused and undone on the friend within about half a second, and 3 of 3 snug neighbours accepted. Roads and moves: 3 of 3 ended the same on both copies, overlapping.
+- **Basis:** helper's runs on test copies (scripts; a friend's placement by a real mouse is the planned real-click check).
+- **Workaround:** none needed in normal play; take one down if two overlap.
+
+### G29. The visit key's name in the Controls screen is English only (0.2.7)
+
+- **You see:** in **Settings > Controls** the row "Walk (co-op visit mode)" is in English, whatever the game's language.
+- **Basis:** design (the row is the mod's own).
+- **Workaround:** none needed.
+
+### G30. Visit mode: what it does not do (0.2.7)
+
+- **You see:** while walking you cannot jump (the game binds no jump key in its own visit mode either). Another player's body follows about half a metre behind where that player really is. A walker that starts inside a fence is moved out to open ground.
+- **Numbers:** three copies all walking: each drew the other two 49 to 54 cm behind on average, 81 cm at most.
+- **Basis:** helper's runs and the lead's real-key sittings on test copies. Never over real Steam between two PCs; never with more than three players.
+- **Workaround:** to switch visit mode off on your copy, remove the `#` in front of `visit = off` in `coop.cfg`.
+
+### G31. A rival house's upgrade count on a friend (fixed in 0.2.7)
+
+- **You see:** nothing in normal play. A hidden count of a rival lord's house upgrades can be one higher on a friend than on the host after the rival upgrades a house that had a backyard extension.
+- **Numbers:** seen once, one house, for 16 game days in one test session.
+- **Basis:** helper's run on test copies; the cause read from the logs (the rival's own upgrade on the host drops the backyard from the list, the friend kept it). **0.2.7:** a friend now drops an upgrade the host's list lacks (about 1.5 s in a test).
+- **Workaround:** none needed.
+
+### G32. A bandit camp gone on the host stays a few seconds on a friend (fixed in 0.2.7)
+
+- **You see:** when a bandit camp is cleared on the host, a friend can still show it for a few seconds.
+- **Numbers:** about 4.5 s, once in one test session. The friend waits until its own bandits have left the camp, because removing a camp they still held once closed a game.
+- **Basis:** helper's runs on test copies. **0.2.7:** the leftover squad of a failed camp is removed at once, and short-lived rival squads leave a friend 0.4 to 0.9 s after the host's (before: 4.1 to 4.5 s). The failed camp cannot be made on purpose, so that part is proven by a desk test only.
+- **Workaround:** none needed.
+
+### G33. Felled trees and logs on the ground can be a few seconds late on a friend (0.2.7)
+
+- **You see:** a felled tree, or the logs beside it, can appear or go on a friend a few seconds after the host, or a friend's woodcutter can fell a tree a moment before the host's does.
+- **Numbers:** in session checks 74 to 147 readings past 3 s and 2 to 3 the host never had, out of many thousands; most within a few seconds.
+- **Basis:** helper's runs on test copies. Being worked on (the game makes a felled tree only at a woodcutter's stroke, so the fix is in the mod's native part).
+- **Workaround:** none needed; it catches up by itself.
+
+### G34. The foreign market's supply list for a moment on a friend (0.2.7)
+
+- **You see:** right after a new day starts, a friend's foreign market panel can show its own supply list for under half a second before the host's.
+- **Numbers:** once in about 148 day changes, 0.37 s, in one test session; every other day change matched within 0.4 s.
+- **Basis:** helper's run on test copies (likely the game's own daily roll on the friend). Being worked on.
+- **Workaround:** none needed.
+
+### G35. Roads and moves over a host building stay on both copies (0.2.7)
+
+- See G28. Both copies stay the same, so nothing differs between players; it is an overlap the game would not allow one player to make.
 
 ---
 

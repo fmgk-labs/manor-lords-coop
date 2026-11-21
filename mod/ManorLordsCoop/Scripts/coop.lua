@@ -8,7 +8,7 @@
 
 local C = rawget(_G, "Coop") or {}
 _G.Coop = C
-C.version = "0.2.6"
+C.version = "0.2.7"
 
 -- where the link files live: set by main.lua to "<this mod's folder>/link/"; the development console uses the probe's folder
 local LINK = rawget(_G, "COOP_LINK_DIR")
@@ -30,7 +30,28 @@ local function un(x) local ok, v = pcall(getOf, x); if ok and v ~= nil then retu
 -- (lane 45) the engine and the player's lord, once checked at the start of this copy's tick (objs), count as valid
 -- for the rest of that tick (every module asked again each frame); cleared when the tick ends (hooks run between ticks)
 local FR = { p1 = false, eng = false }
-local function valid(o) if o == nil then return false end; if o == FR.p1 or o == FR.eng then return true end; local ok, r = pcall(isValidOf, o); return ok and r == true end
+-- (lane 64, round 5) A handle whose address is in C.goneAddr belongs to a building or a unit that has left the game's
+-- list (coop_snap.lua N.gone, the native piece's word). Its object may be freed, and IsValid reads the object: so the
+-- native look at the engine's object array is asked first (N.goneAlive), by the address alone. Freed: false, and the
+-- handle is never touched. Still there, or no entry, or no native piece: IsValid as before.
+local function addrOf(o) return o:GetAddress() end
+local nValid, nGoneAsk = 0, 0
+C.validCount = function() return nValid, nGoneAsk end
+local function valid(o)
+  if o == nil then return false end
+  if o == FR.p1 or o == FR.eng then return true end
+  nValid = nValid + 1
+  local G = rawget(C, "goneAddr")
+  if G then
+    local okA, a = pcall(addrOf, o)
+    if okA and a ~= nil and G[a] ~= nil then
+      nGoneAsk = nGoneAsk + 1
+      local Ns = rawget(C, "snap")
+      if Ns and Ns.goneAlive then local okG, alive = pcall(Ns.goneAlive, a); if okG and alive == false then return false end end
+    end
+  end
+  local ok, r = pcall(isValidOf, o); return ok and r == true
+end
 local function now() return (C.clk or 0) + os.clock() end
 C.leftSilence = C.leftSilence or 30.0   -- (lane 51) s of silence after which the host tells that a friend left (host tick)
 local function far(ax, ay, bx, by, tol) return math.abs(ax - bx) > tol or math.abs(ay - by) > tol end
@@ -372,12 +393,77 @@ local function pawns()
   return t
 end
 
+-- (lane 64, task 64d: the lead's item of 2026-11-20; research/.../lane_s21_64/design_deathregion.txt) A SOLDIER'S BODY
+-- IN THE HOST'S REGION. The game puts a body on the corpse list of the dead man's currentRegion (SMUnit::just_die),
+-- and it gives every man of a squad the region of the squad's CENTRE (SMUnit::updateCurrentRegion with squadCenter,
+-- run by the squad's own man every tenth tick). Each copy works its squad centres out itself: a squad fighting across
+-- a border can have its centre in one region on the host and in the next one on a friend, and every man of it who dies
+-- then lies in the other region there (l64pin20: 5 of 15 bodies for 30 game days; lane 83's run A: 2, 16 days). So the
+-- host's death line names, for each dead man, the region whose corpse list holds his body, and a friend gives its man
+-- that region right before his death, as the game's own update writes it (a plain pointer, no list kept by it).
+-- Off: Coop.deathRegion = false (console), on the host (no regions sent) or on a friend (not used).
+local function regionTag(r)
+  local ok, k = pcall(function() return r.regionUniqueTag:ToString() end)
+  if not ok or type(k) ~= "string" or k == "" or k == "None" then return nil end
+  return (k:gsub("[^%w_%.]", "_"))                    -- (the events module's rkey form)
+end
+-- host: the region whose corpse list holds this dead man's body, looked for by address (his own currentRegion can be
+-- updated again by his own place once he has left his squad), else his currentRegion; "-" when neither is read
+local function bodyRegion(u)
+  local a; pcall(function() if valid(u) then a = u:GetAddress() end end)
+  if not a then return "-" end
+  local found
+  pcall(function()
+    local arr = C.s.eng.regions
+    for i = 1, #arr do
+      local r = un(arr[i])
+      if valid(r) then
+        local c = r.corpses
+        for j = #c, 1, -1 do                           -- (the newest body is the last one)
+          local x = un(c[j])
+          local okA, xa = pcall(function() return x:GetAddress() end)
+          if okA and xa == a then found = r; break end
+        end
+        if found then break end
+      end
+    end
+  end)
+  if not found then pcall(function() local r = u.currentRegion; if valid(r) then found = r end end) end
+  return (found and regionTag(found)) or "-"
+end
+-- friend: the man takes the host's region of his body, right before he dies
+local function deathRegion(u, tag)
+  local S = C.s
+  if C.deathRegion == false or not tag or tag == "-" then return end
+  local r
+  pcall(function()
+    local arr = S.eng.regions
+    for i = 1, #arr do local x = un(arr[i]); if valid(x) and regionTag(x) == tag then r = x; break end end
+  end)
+  if not r then S.stats.deathRegionUnknown = (S.stats.deathRegionUnknown or 0) + 1; return end
+  local cur; pcall(function() cur = u.currentRegion end)
+  local curA; pcall(function() if valid(cur) then curA = cur:GetAddress() end end)
+  if curA and curA == r:GetAddress() then S.stats.deathRegionSame = (S.stats.deathRegionSame or 0) + 1; return end
+  local was = (curA and regionTag(cur)) or "-"
+  local ok = pcall(function() u.currentRegion = r end)
+  local back; pcall(function() local b = u.currentRegion; if valid(b) then back = b:GetAddress() end end)
+  if ok and back == r:GetAddress() then
+    S.stats.deathRegionSet = (S.stats.deathRegionSet or 0) + 1
+    if S.stats.deathRegionSet <= 10 then log("death: a man dies in %s as on the host (his squad's region here: %s)", tag, was) end
+  else
+    S.stats.deathRegionFailed = (S.stats.deathRegionFailed or 0) + 1
+    if S.stats.deathRegionFailed <= 3 then log("death: the host's region %s could not be given to a man here (%s)", tag, ok and "it did not stick" or "the write failed") end
+  end
+end
+
 -- A death the host decided, applied on this copy. The game's own combat code marks a soldier "deathInCombat" before he
 -- dies; without the mark the game books a family grief entry (static read, registry/native5/report.txt), which
 -- would pull approval apart between copies. Tag append and death tried live on one soldier (README session 17).
-local function hostKill(u)
+-- (lane 64) regTag: the host's region of his body (the death line), given to him first (see deathRegion)
+local function hostKill(u, regTag)
   if C.men and C.men.gone then pcall(C.men.gone, u) end   -- (lane 43) out of the native table of held men before he dies
   pcall(function() local t = u.Tags; t[#t + 1] = FName("deathInCombat") end)
+  if regTag then pcall(deathRegion, u, regTag) end
   u:just_die()
 end
 
@@ -480,6 +566,7 @@ end
 
 -- a move that also pulls the squad out of a fight: halt now, move a moment later
 local function moveOrder(h, t)
+  C.s.mirTo = C.s.mirTo or {}; C.s.mirTo[h] = { x = t.X, y = t.Y }     -- (lane 81) where the mod sent it: see scanOrders
   local s = C.s.sc:GetSquad({ Value = h })
   if s.isEngaged or s.targetSquad.Value ~= 0 then
     C.s.sc:SetSkillActive({ Value = h }, HALT, true, true); haltAt[h] = os.clock()
@@ -806,9 +893,64 @@ local SPEED_MINE = { HUDT .. "TimeStopButton_K2Node_ComponentBoundEvent_1_OnClic
                      HUDT .. "Time3Button_K2Node_ComponentBoundEvent_3_OnClicked__DelegateSignature",
                      BPL .. "toggleTimePause", BPL .. "InpActEvt_pause_K2Node_InputActionEvent_1",
                      BPL .. "InpActEvt_fastSpeed_K2Node_InputActionEvent_4", BPL .. "InpActEvt_slowSpeed_K2Node_InputActionEvent_3" }
+-- (lane 81) the game's visit mode (the lord panel's Explore button: MainUICPP_C:EnableVisitMode sets speed 1, lane 84
+-- read it in the graph and saw a friend send "SPEED 1.00"; visitModeOn is the step after the fade) and the retinue
+-- editor's Open (it calls setGameSpeed itself; lane 16's caller list, bp_callers_speed.txt) were missing. That list of
+-- the game's own setGameSpeed callers is now covered in full, apart from loading a save and the game-over screen's
+-- Continue (after playGameOver, which is listed). The game has no photo mode. Leaving visit mode sets no speed (lane 84).
+local MAINUI = "/Game/UI/HUD/MainUICPP.MainUICPP_C:"
+local SPEED_MODES = { MAINUI .. "EnableVisitMode", MAINUI .. "visitModeOn", "/Script/ManorLords.PawnCPP:setCinematicMode", "/Script/ManorLords.PawnCPP:setFollowMode" }
 local SPEED_GAME = { BPL .. "setGamePausedInclVamp", BPL .. "storeOrBringBackGameSpeedAndZoomAfterMapMenuToggle", BPL .. "decreaseGameSpeed",
-                     BPL .. "setupKillCam", BPL .. "playGameOver", "/Game/UI/HUD/MainUICPP.MainUICPP_C:setCastlePlannerOpen",
-                     "/Script/ManorLords.PawnCPP:setCinematicMode", "/Script/ManorLords.PawnCPP:setFollowMode" }
+                     BPL .. "setupKillCam", BPL .. "playGameOver", MAINUI .. "setCastlePlannerOpen",
+                     "/Game/UI/Army/retinueEditor.retinueEditor_C:Open" }
+for _, p in ipairs(SPEED_MODES) do SPEED_GAME[#SPEED_GAME + 1] = p end
+
+-- (lane 81) HOST: the game's own modes of one player (visit mode, follow mode, cinematic mode) set THIS copy's speed to
+-- 1, and the host's speed is everybody's. So on the host such a change is put back at once to the speed and pause the
+-- host had just before (the walker's pace does not depend on the game speed: lane 84, 336 cm in 3 s at speed 1, 4, 8).
+-- A speed control of the host's player in the same moment wins (SPEED_MINE). Full screens (map, menus, development
+-- tree) are left as they were: the plain game pauses there, and for the host that has always paused everybody.
+local function hostModeHooks()
+  if rawget(_G, "__coop_hostmode_done") then return end
+  local S = C.s
+  if os.clock() - (S.hmHookT or -10) < 2.0 then return end
+  S.hmHookT = os.clock()
+  _G.__coop_hooked = _G.__coop_hooked or {}
+  local okAll = true
+  for _, def in ipairs({ { SPEED_MODES, "hmModeT" }, { SPEED_MINE, "spMineT" } }) do
+    for _, path in ipairs(def[1]) do
+      local key = "host|" .. path
+      if not _G.__coop_hooked[key] then
+        local field, why = def[2], path:match("([^:%.]+)$")
+        local ok = pcall(RegisterHook, path, function()
+          local S2 = _G.Coop and _G.Coop.s
+          if S2 and S2.on and S2.role == "host" then S2[field] = os.clock(); if field == "hmModeT" then S2.hmWhy = why end end
+        end)
+        if ok then _G.__coop_hooked[key] = true else okAll = false end
+      end
+    end
+  end
+  if okAll then _G.__coop_hostmode_done = true; log("host: speed hooks of the game's own modes registered") end
+end
+local function hostModeSpeed(S, clock)
+  pcall(hostModeHooks)
+  local okR, pz, sp, fm, cm = pcall(function() return isPaused(), tonumber(S.eng.gameSpeed) or 1.0, S.p1.followMode and true or false, S.p1.cinematicMode and true or false end)
+  if not okR then return end
+  if S.hmWorld ~= S.worlds then S.hmWorld = S.worlds; S.hmKeep = nil; S.hmFollow = nil; S.hmCine = nil end
+  if S.hmFollow ~= nil and (fm ~= S.hmFollow or cm ~= S.hmCine) then S.hmModeT = clock; S.hmWhy = "follow or cinematic mode" end   -- also switched by native code
+  S.hmFollow, S.hmCine = fm, cm
+  local K = S.hmKeep
+  local fresh = S.hmModeT and clock - S.hmModeT < 0.6
+  local mine = S.spMineT and clock - S.spMineT < 0.6
+  if K and fresh and not mine and (pz ~= K.pz or (not pz and math.abs(sp - K.sp) > 0.05)) then
+    if K.pz then setPaused(true) else setPaused(false); S.p1:setGameSpeed(K.sp) end
+    S.stats.speedModeBack = (S.stats.speedModeBack or 0) + 1
+    log("speed: the game's own %s changed the host's speed (to %.2f, paused %s): put back to %.2f, paused %s (one player's mode must not change everybody's speed)",
+      tostring(S.hmWhy), sp, tostring(pz), K.sp, tostring(K.pz))
+    return
+  end
+  if not fresh or mine then S.hmKeep = { sp = sp, pz = pz } end
+end
 
 local function ensureHooks()
   if rawget(_G, "__coop_hooks_done") then return end
@@ -875,6 +1017,14 @@ local function gameChangedSpeed(S, clock)
     end
   end)
   if S.spotT and clock - S.spotT < 2.0 then S.spGameWhy = "enemy squad spotted"; return true end
+  -- (lane 81) the game drops to speed 1 a SECOND time 6 or 8 s after a spotting, with no new notice: every "no known
+  -- cause ... sent as the player's" line in all lanes' friend logs came 6.0 s (6 times) or 8.0 s (18 times) after an
+  -- "enemy squad spotted" one (6 more were unrelated, 280 s apart). A drop to speed 1 (not a pause, not 4 or 8) within
+  -- 10 s of a spotting is the game's too. A player's own speed 1 press is marked by SPEED_MINE before this is asked.
+  if S.spotT and clock - S.spotT < 10.0 then
+    local okS, sp = pcall(function() return tonumber(S.eng.gameSpeed) or 0 end)
+    if okS and math.abs(sp - 1.0) < 0.05 and not isPaused() then S.spGameWhy = "enemy squad spotted (the game's second drop)"; return true end
+  end
   return S.spGameT ~= nil and clock - S.spGameT < 0.6
 end
 
@@ -898,6 +1048,16 @@ local function scanOrders(report, btn)
       -- a squad this copy is taking away (removeSafe halts it, and removeTick halts it again every 3 s): the halt is
       -- the mod's, not the player's (lane 20 F3: it went to the host as "O MOVE" for a squad the host no longer had)
       if not recent and ((S.rmQ and S.rmQ[h]) or (S.rmByMod and S.rmByMod[h] and os.clock() - S.rmByMod[h] < 30.0)) then recent = true end
+      -- (lane 81) inside this player's own input window, a change the mirror did not make is the player's order even
+      -- within 0.6 s of the mirror's touch (it was dropped by time alone): an attack on another squad than the host's
+      -- target, or a move more than 3 m from where the mod sent the squad and from the host's target
+      if recent and report and old and not (S.rmQ and S.rmQ[h]) then
+        local H = S.host and S.host[h]; local mt = S.mirTo and S.mirTo[h]
+        local own
+        if st.tgt ~= 0 then own = st.tgt ~= old.tgt and (not H or st.tgt ~= H.tgt)
+        else own = far(st.tx, st.ty, old.tx, old.ty, 30) and (not mt or far(st.tx, st.ty, mt.x, mt.y, 300)) and (not H or far(st.tx, st.ty, H.tx, H.ty, 300)) end
+        if own then recent = false; S.stats.ordersInMirror = (S.stats.ordersInMirror or 0) + 1 end
+      end
       if old and not recent and (report or quiet or btn) then
         local moved = far(st.tx, st.ty, old.tx, old.ty, 30) or far(st.lx, st.ly, old.lx, old.ly, 30)
         local sent = false
@@ -1082,7 +1242,8 @@ local function watch()
     -- or "stand-in squad" in its own log, on all four friends at once, and the host passed it on to everybody.
     -- (S.modQuestT: the events module has just started one of the host's quests here; the game answers a new quest
     -- message by going one speed step down: lane 16, measured on the plain game)
-    elseif clock - (S.worldT or 0) < 10.0 or clock - (S.modSquadT or -100) < 3.0 or clock - (S.modQuestT or -100) < 3.0 then S.agree = false
+    -- (lane 81) not when the player's own speed control ran (SPEED_MINE): his press in those seconds was lost before
+    elseif not (S.spMineT and clock - S.spMineT < 0.6) and (clock - (S.worldT or 0) < 10.0 or clock - (S.modSquadT or -100) < 3.0 or clock - (S.modQuestT or -100) < 3.0) then S.agree = false
     -- Who changed it (lane 16)? The player's own speed control ran within 0.6 s (SPEED_MINE): his, sent below.
     -- Otherwise, when the game itself did something that changes speed or pause (gameChangedSpeed above), it is the
     -- game's: nothing is sent, and the host's next state line puts this copy back to the host's speed and pause
@@ -1320,8 +1481,12 @@ end
 -- full = false (20 times a second): only squads in action (fighting, marching, or changed in the last 3 s), and only
 -- those whose state changed since it was last sent. Battles need the host's state to reach friends as fast as a
 -- friend's order reaches the host; a death is sent the moment the head count changes.
+-- (lane 90) the timing proof's army note (coop_world.lua W.proofQ: a TEST TOOL, it does nothing unless the session
+-- check switched cfg.proof on): the soldiers per lord, dated in the tick this copy's squads changed
+local function armyNote(why) local Wm = rawget(C, "world"); if Wm and Wm.proofQ then pcall(Wm.proofQ, why) end end
 local function hostSnapshot(full)
   local S = C.s; local parts = {}; local seen = {}; local clock = os.clock()
+  local noteWhy, noteAny = nil, false      -- (lane 90) a squad came, went, lost or gained men, or began or ended a rout
   local list
   if full then
     -- a routing squad drops out of its lord's list but still exists: keep following every squad we have seen
@@ -1339,25 +1504,34 @@ local function hostSnapshot(full)
       local st = sqState(h); local K = S.sq[h]
       if not K then
         K = { n = st.n, list = aliveList(h), hot = clock }; S.sq[h] = K
-        if S.baseDone then announce(h, st) end
+        if S.baseDone then announce(h, st); noteWhy = (noteWhy and (noteWhy .. ",") or "new ") .. h; noteAny = true end
       elseif st.n ~= K.n then
+        noteAny = true
         local cur = aliveList(h); local has, places = {}, {}
         for _, e in ipairs(cur) do has[e.id] = true end
         -- a man who is no longer in the squad died only if the game says so (SMUnit.dead) or he no longer exists.
         -- Militia men who walk home after "disband" leave the squad alive: reported as deaths, they were killed on
         -- every friend's copy (session 20: a friend's town lost its 13 militia men each time the host sent them home)
         local toks, named = {}, false
+        local regs, anyReg = {}, false                 -- (lane 64) the region of each body (see bodyRegion)
         for i, e in ipairs(K.list) do
           if not has[e.id] then
             local alive = false; pcall(function() alive = valid(e.u) and not e.u.dead end)
-            if not alive then places[#places + 1] = i; toks[#toks + 1] = e.tok or "-"; if e.tok and e.tok ~= "-" then named = true end
+            if not alive then
+              places[#places + 1] = i; toks[#toks + 1] = e.tok or "-"; if e.tok and e.tok ~= "-" then named = true end
+              local rg = (C.deathRegion ~= false) and bodyRegion(e.u) or "-"
+              regs[#regs + 1] = rg; if rg ~= "-" then anyReg = true; S.stats.deathRegionSent = (S.stats.deathRegionSent or 0) + 1 else S.stats.deathRegionNone = (S.stats.deathRegionNone or 0) + 1 end
             else S.stats.leftAlive = (S.stats.leftAlive or 0) + 1 end
           end
         end
         K.list = cur; K.n = st.n; K.hot = clock
         -- the marks of the dead follow their places only when one of them has a name (see aliveList)
-        if #places > 0 then send(string.format("D %d %s%s", h, table.concat(places, ","), named and (" " .. table.concat(toks, ",")) or "")) end
+        -- (lane 64) with the regions of the bodies the marks always go ("-" for a man without a name): a friend of 0.2.6
+        -- reads "-" as "by his place", as before, and leaves the fifth field alone
+        if #places > 0 and anyReg then send(string.format("D %d %s %s %s", h, table.concat(places, ","), table.concat(toks, ","), table.concat(regs, ",")))
+        elseif #places > 0 then send(string.format("D %d %s%s", h, table.concat(places, ","), named and (" " .. table.concat(toks, ",")) or "")) end
       end
+      if K.st and (K.st.ctl == FLEEING) ~= (st.ctl == FLEEING) then noteAny = true end   -- (lane 90) a rout: the army count changes
       K.st = st; K.stT = clock     -- (lane 48) kept for the men module (coop_x_men.lua): its squad states without reads of its own
       local enc = string.format("%d,%d,%d,%d,%.0f,%.0f,%.0f,%d,%d,%s,%.0f,%.0f,%d,%d", h, st.n, st.ctl, st.tgt, st.tx, st.ty, st.tz, st.push, st.behav,
         st.skKey == "" and "-" or st.skKey, st.cx, st.cy, st.eng and 1 or 0, st.rs)
@@ -1406,13 +1580,14 @@ local function hostSnapshot(full)
     end
   end
   if full then
-    for h in pairs(S.sq) do if not seen[h] then S.sq[h] = nil; send("G " .. h) end end
+    for h in pairs(S.sq) do if not seen[h] then S.sq[h] = nil; send("G " .. h); noteWhy = (noteWhy and (noteWhy .. "; ") or "") .. "gone " .. h; noteAny = true end end
     S.baseDone = true
   end
   if full or #parts > 0 then
     local list = table.concat(parts, ";")
     send(string.format("S %.2f %d %.4f %s %s", S.eng.gameSpeed, hostStopped() and 1 or 0, gameClock(), list == "" and "-" or list, full and "F" or "P"))
   end
+  if noteAny then armyNote(noteWhy) end
 end
 
 -- ---------------------------------------------------------------- friend: follow the host
@@ -1492,12 +1667,64 @@ local function menQuiet(h)
   end)
   return ok and quiet == true
 end
+-- (lane 90) A YOUNG SQUAD. The host's game makes another lord's squad and takes it away within half a second (seen
+-- in four session checks: mercenaries of the rival lord A1, 18 to 72 men). The host says "gone" 0.53 to 0.72 s after
+-- it announced the squad; this copy made it 0.05 to 0.21 s after the announcement. Watched for under 4.5 s, it took
+-- the 4 s rule above and stood here 4.6 to 5.1 s, 4.1 to 4.5 s after the host's word (the owner's bar is 3 s). But a
+-- squad this copy made itself for the host (spawnCompleteUnit) has been watched ALL its life: from the tick it was
+-- made, every tick (youngTick), and in every entry of the host's state for it. If nothing in that life could have
+-- thrown anything (no target, no fight flag, no engaged squad, no building target, no raid skill, no rout, no man in
+-- a fighting stance or with a task of his own, no failed read, and none of the host's entries for it named a target,
+-- a fight, a rout or a raid), nothing of it is in the air: it takes lane 76's short way (halted, removed at the next
+-- look, asked again at the removal). Any doubt: the 4 s rule. C.rmYoung = false gives the rule of before.
+-- nil when squad h is quiet now, else why not
+local function youngStir(h)
+  local ok, why = pcall(function()
+    local s = C.s.sc:GetSquad({ Value = h })
+    if s.Control == FLEEING then return "it flees" end
+    if s.isEngaged or s.targetSquad.Value ~= 0 or #s.engagedSquads > 0 then return "a fight flag or a target" end
+    local b = s.targetBuildingPart; if b and b:IsValid() then return "a building target" end
+    local sk = s.activeSkills; for i = 1, #sk do if tonumber(un(sk[i])) == RAIDING then return "the raid skill" end end
+    local arr = s.unitArr
+    for i = 1, #arr do
+      local u = un(arr[i])
+      if valid(u) and not u.dead and (u.fightingStance or #u.Tasks > 0) then return "a man in a fighting stance or with a task" end
+    end
+    return nil
+  end)
+  if not ok then return "a read failed" end
+  return why
+end
+-- every tick on a friend: each young squad is looked at until it is gone or lane 76's quiet rule has it
+local function youngTick()
+  local S = C.s; local Y = S.young
+  if not Y or next(Y) == nil then return end
+  local K, clock = S.calm, os.clock()
+  for h, y in pairs(Y) do
+    if y.world ~= S.worlds or not sqValid(h) or clock - y.t > 120 then Y[h] = nil
+    elseif not y.word and K and K.world == S.worlds and K.seen[h] and K.run - K.seen[h] >= 4.5 then Y[h] = nil   -- watched long enough: the quiet rule has it
+    elseif not y.stirred then
+      y.looks = (y.looks or 0) + 1
+      local why = youngStir(h)
+      if why then y.stirred = why; y.stirT = clock end
+    end
+  end
+end
+C.youngTickFn = youngTick      -- (lane 90) for the desk test
+local function youngQuiet(h, fleeing)
+  local S = C.s; local K = S.calm; local y = S.young and S.young[h]
+  if C.rmYoung == false or not y or y.stirred or fleeing then return false end
+  if y.world ~= S.worlds or not K or K.world ~= S.worlds or K.busy[h] or K.flee[h] then return false end
+  local why = youngStir(h)
+  if why then y.stirred = why; y.stirT = os.clock(); return false end
+  return true
+end
 -- has this squad been quiet for over 4 s of running game (see above)? fleeing: it has fled for that long (a fleeing
 -- squad throws nothing; it keeps its fight flags)
 local function sqQuiet(h, fleeing)
   local S = C.s; local K = S.calm
   if C.rmFast == false or not K or K.world ~= S.worlds then return false end
-  local seen = K.seen[h]; if not seen or K.run - seen < 4.5 then return false end
+  local seen = K.seen[h]; if not seen or K.run - seen < 4.5 then return youngQuiet(h, fleeing) end   -- (lane 90) young: see above
   if fleeing then local f = K.flee[h]; return f ~= nil and K.run - f > 4.0 end
   local b = K.busy[h]; if b and K.run - b <= 4.0 then return false end
   return menQuiet(h)
@@ -1519,6 +1746,16 @@ local function removeSafe(h, why)
   local fast = sqQuiet(h, fleeing)                -- (lane 76) quiet for over 4 s already: nothing of its own is in the air
   S.rmQ[h] = { t = clock, why = why, haltT = clock, fast = fast or nil, fled = fleeing or nil }
   if fast then S.stats.removedFast = (S.stats.removedFast or 0) + 1 end
+  -- (lane 90) a young squad: every condition of the young way at the host's word, in the log
+  local y = S.young and S.young[h]
+  if y then
+    y.word = clock
+    local K = S.calm
+    if fast and not (K and K.seen[h] and K.run - K.seen[h] >= 4.5) then S.stats.removedYoung = (S.stats.removedYoung or 0) + 1 end
+    log("squad %d (made here %.2f s ago for the host's %s) at the host's word: the young way is %s (stirred: %s; noted busy: %s; fleeing: %s; now: %s; looked at %d times)",
+      h, clock - y.t, tostring(y.hh), fast and "open" or "closed", tostring(y.stirred or "no"), tostring(K ~= nil and K.busy[h] ~= nil),
+      tostring(fleeing), tostring(youngStir(h) or "quiet"), y.looks or 0)
+  end
   -- A squad that flees here (the game's own rout, started with the host's) is not halted and its men are never
   -- "let die" (below): they became bodies in the player's region that the host does not have (lane 4, session 21:
   -- 8 fled bandits killed here, approval 46 against the host's 57 three days later through "unburied", then families
@@ -2426,6 +2663,8 @@ local function makeSquad(S, sc, w)
     -- a squad made from a repeated announcement is an older squad of the host's that may have lost men: its
     -- head count follows the host's from the start (the mirror's rule for a squad that has matched once)
     if again then S.mir[lh] = { t = os.clock(), pt = 0, matched = true }; S.stats.madeAgain = (S.stats.madeAgain or 0) + 1 end
+    -- (lane 90) a squad made here with the game's spawnCompleteUnit is watched from this tick on (see youngTick)
+    if how == "squad" then S.young = S.young or {}; S.young[lh] = { world = S.worlds, t = os.clock(), hh = hh } end
     log("created %s for host %d as local %d (%s, %s)%s", how, hh, lh, w[5], w[6], again and ": this copy did not have it after loading alone" or "")
     end
   end
@@ -2452,12 +2691,84 @@ local function flushNew(S, sc, why)
   end
   S.stats.newBatches = (S.stats.newBatches or 0) + 1
   if #Q > 1 then log("%d new squads of the host made in one tick (%s, the first waited %.0f ms)", #Q, why, (os.clock() - Q.t) * 1000) end
+  armyNote(string.format("%d new squad line(s) of the host handled here", #Q))     -- (lane 90; test tool only)
 end
 C.flushNew = flushNew
 
+-- (lane 64, round 5) THE FRIEND'S CLOCK WAITS FOR THE HOST'S. The owner's bar: a friend never shows a value the host
+-- has not had, so a friend's day may not turn before the host's. Measured before this (sitting gd1, a host that
+-- stalls 0.6 s every 1.4 s): every day of the friend turned 0.2 to 1.0 s BEFORE the host's. Two causes: the follow
+-- rule aimed at the host's clock itself with a dead band of 0.02 days either way and only a weak pull when ahead (to
+-- run as slow as a stalling host the friend had to be 0.036 days ahead); and while the host stood, the friend ran on.
+-- The rule now (cfg.clockLag = false gives the rule of before):
+--   * the friend's place is cfg.clockLag seconds (0.4) BEHIND the host's stated clock, whatever the game speed;
+--   * closer than that it runs slower, in proportion, down to a stand (cfg.clockMin, 0.02) at the host's clock; at
+--     or past the host's clock it stands;
+--   * further behind it runs faster as before (4 per day, at speed 1 and 2 as much per second as at speed 4; at most 3 times; after a load the catch-up rule, which now
+--     aims at the same place and never closes more than half of what is left in a tenth of a second);
+--   * while nothing of the host arrives (cfg.holdAfter 0.25 s; cfg.holdFast 0.1 s while it runs above 1.5 times) the
+--     clock stands (friendInbox below). 0.25 s is less than the 0.4 s it keeps behind, so it cannot pass the host's
+--     last word. It stands until the host is back or this copy leaves the co-op game (60 s at the very most).
+-- Returns the time scale and how far the copy is from its place (days; above 0 = too far behind).
+local function clockDil(gap, sp, catching, frame, cfg)
+  sp = math.max(sp or 1.0, 1.0)
+  local dayS = 40.0 / sp                                       -- a game day in seconds at this speed
+  if cfg.clockLag == false then                                -- the rule of before
+    local dil = 1.0
+    if gap > 0.02 then
+      if catching then dil = math.min(cfg.catchMax or 16.0, 64.0 / sp, 1.0 + gap * math.min(cfg.catchGain or 30.0, 100.0 / sp), 1.0 + 0.5 * gap * dayS / frame)
+      else dil = math.min(3.0, 1.0 + gap * 4.0) end
+    elseif gap < -0.02 then dil = math.max(0.5, 1.0 + gap * 4.0) end
+    return dil, gap
+  end
+  local lagD = (cfg.clockLag or 0.4) / dayS
+  local minD = cfg.clockMin or 0.02
+  local e = gap - lagD
+  if gap <= 0 then return minD, e end
+  if e < 0 then return math.max(minD, gap / lagD), e end
+  if e > 0.02 then
+    if catching then return math.min(cfg.catchMax or 16.0, 64.0 / sp, 1.0 + e * math.min(cfg.catchGain or 30.0, 100.0 / sp), 1.0 + 0.5 * e * dayS / math.max(frame, 0.1)), e end
+    return math.min(3.0, 1.0 + e * math.max(4.0, 0.4 * dayS)), e      -- (4 per day as before at speed 4 and 8; at speed 1 and 2 the same pull per second behind)
+  end
+  return 1.0, e
+end
+C.clockDil = clockDil
+
 local function friendInbox()
   local S = C.s; local sc = S.sc
+  -- (lane 64, 0.2.6) The time scale is set only while a state line of the host is handled. A scale above the steady
+  -- rule's 3 (the catch-up after a load) with no such line for 0.3 s (the host hitched, or this player's own speed
+  -- change holds the follow rule) goes back to 1: nothing would pull it down, and at 16 times a second is a day and more.
   local lines, ends = recv("host")
+  -- (lane 64, round 5) nothing of the host for cfg.holdAfter s (cfg.holdFast while this copy runs above 1.5 times):
+  -- this copy's clock stands until the host's next state line sets it again (see clockDil). Not while this player's
+  -- own speed change holds the follow rule, nor while a save loads: there the guard of 0.2.6 below stays.
+  local hT = S.heard and S.heard["host"]; local nowH = os.clock()
+  if S.dilK and hT and S.cfg.followSpeed and S.cfg.clockLag ~= false and nowH >= (S.speedHold or 0) and not rawget(C, "hold") then
+    local silent = nowH - hT
+    local want
+    -- the hold ends when the host's next state line comes; when this copy is on its way out of the co-op game (the
+    -- session module's way out: the host said goodbye, Steam says it left, or its silence passed the limit, 30 s);
+    -- and after cfg.holdMax s (60) whatever else happens, so that no copy is ever left standing.
+    -- (sitting hk1: with an end after 10 s the friend ran on while the host still stood, was ahead when the host
+    --  came back at 13 s, and had to wait for it: a day could have turned before the host's in between)
+    local Ps = rawget(C, "session")
+    local away = Ps and Ps.leaving
+    if silent > (S.cfg.holdMax or 60.0) or away then if S.dilHeldNow then want = 50 end
+    elseif silent > ((S.dilK > 75) and (S.cfg.holdFast or 0.1) or (S.cfg.holdAfter or 0.25)) then want = math.max(1, math.floor((S.cfg.clockMin or 0.02) * 50 + 0.5)) end
+    if want and S.dilK ~= want then
+      S.dilK = want; S.dilT = nowH
+      if want == 50 then S.dilHeldNow = nil
+      else
+        S.dilHeldNow = true; S.stats.dilHeld = (S.stats.dilHeld or 0) + 1
+        if S.stats.dilHeld <= 3 then log("clock: nothing of the host for %.2f s: this copy's clock waits (%d)", silent, S.stats.dilHeld) end
+      end
+      pcall(function() local GS = S.GS; if not valid(GS) then GS = StaticFindObject("/Script/Engine.Default__GameplayStatics"); S.GS = GS end; GS:SetGlobalTimeDilation(S.p1, want / 50) end)
+    end
+  elseif S.dilK and S.dilK > 150 and os.clock() - (S.dilSeen or 0) > 0.3 then
+    S.dilK = 50; S.dilT = os.clock(); S.stats.dilDropped = (S.stats.dilDropped or 0) + 1
+    pcall(function() local GS = S.GS; if not valid(GS) then GS = StaticFindObject("/Script/Engine.Default__GameplayStatics"); S.GS = GS end; GS:SetGlobalTimeDilation(S.p1, 1.0) end)
+  end
   for i, line in ipairs(lines) do
     local w = words(line); local kind = w[3]
     -- (lane 76) new squads that wait are made before the first line that is not about them (see flushNew)
@@ -2507,14 +2818,39 @@ local function friendInbox()
         local dil = 1.0
         if not hp and hclk and hclk > 0 then
           local gap = hclk - gameClock()                                  -- in game days
-          if gap > 0.02 then dil = math.min(3.0, 1.0 + gap * 4.0) elseif gap < -0.02 then dil = math.max(0.5, 1.0 + gap * 4.0) end
-          S.clockGap = gap
+          -- (lane 64, 0.2.6) AFTER A LOAD the copy starts at the beginning of the save's day while the host ran on: it is
+          -- the rest of that day and the loading time behind (measured 0.6 to 1.7 days). With the rule below (at most 3
+          -- times, 4 per day of gap) the last half day alone took over 10 s: the friend's day number turned 3 to 6.3 s
+          -- after the host's for one or two days (rl1 to rl4). Until the first gap of this world within 0.02 days (at
+          -- most cfg.catchFor s after the first gap measured in this world: a paused host measures none) the time scale
+          -- goes up to cfg.catchMax and follows the gap cfg.catchGain
+          -- times as steeply. Steady following (a slow frame, a held clock) keeps the old rule.
+          if S.catchW ~= S.worlds then S.catchW = S.worlds; S.catching = S.role == "friend"; S.catchT = os.clock(); S.catchGap = gap end
+          local nowC = os.clock()
+          if nowC - (S.catchPrev or -1) > 0.005 then S.catchFrame = math.min(math.max(nowC - (S.catchPrev or nowC), 0.02), 1.0); S.catchPrev = nowC end
+          local frame = S.catchFrame or 0.07
+          local _, off = clockDil(gap, hs, S.catching, frame, S.cfg)        -- (lane 64, round 5) off: how far from its place
+          if S.catching and (math.abs(off) <= 0.02 or (S.cfg.clockLag ~= false and off < 0) or os.clock() - (S.catchT or 0) > (S.cfg.catchFor or 30.0) or S.cfg.catchMax == false) then
+            if S.cfg.catchMax ~= false then log("clock: this copy was %.2f days behind the host after its load; within 0.02 days after %.2f s", S.catchGap or 0, os.clock() - (S.catchT or 0)) end
+            S.catching = false
+          end
+          -- (rl5, host at speed 8: with one cap and one gain for every speed this copy ran PAST the host: 1.86 days behind,
+          --  0.9 s later 0.55 days ahead, its next day 0.5 s before the host's, 6.7 s until within 0.02. A frame of the
+          --  catch-up is long, and at speed 8 one frame at 16 times was a fifth of a day and more.) So the scale is held
+          --  three ways: time scale times game speed at most 64 (16 at most); the gain falls with the speed (a day is
+          --  40 s / speed: measured 10 s at speed 4, 5 s at speed 8); and one frame, as long as the last one, never
+          --  closes more than half of the gap.
+          -- (several state lines can be read in one tick: the frame's length is taken between ticks only)
+          -- (lane 64, round 5) the rule itself is clockDil (above friendInbox); a copy that has just left the catch-up
+          -- takes the steady rule's scale from this line on
+          dil, off = clockDil(gap, hs, S.catching, frame, S.cfg)
+          S.clockGap = off; S.clockRaw = gap
         end
         -- (lane 47, round two) the engine's time scale and its pause are asked of the game at most every 0.25 s (or
         -- at once when the wanted scale changed), not at every state line (20 a second): the game itself changes
         -- neither (only a full screen pauses it; it is then let run at most 0.25 s later than before)
-        local dk = math.floor(dil * 50 + 0.5)
-        if dk ~= S.dilK or os.clock() - (S.dilT or 0) >= 0.25 then S.dilK = dk; S.dilT = os.clock(); pcall(function()
+        local dk = math.floor(dil * 50 + 0.5); S.dilSeen = os.clock()
+        if dk ~= S.dilK or os.clock() - (S.dilT or 0) >= 0.25 then S.dilK = dk; S.dilT = os.clock(); S.dilHeldNow = nil; pcall(function()
           local GS = S.GS; if not valid(GS) then GS = StaticFindObject("/Script/Engine.Default__GameplayStatics"); S.GS = GS end
           if math.abs(GS:GetGlobalTimeDilation(S.p1) - dil) > 0.02 then GS:SetGlobalTimeDilation(S.p1, dil) end
           -- (lane 20) The game's full screens pause the engine as well as the speed (setGamePausedInclVamp calls
@@ -2539,6 +2875,13 @@ local function friendInbox()
         H.sk = {}; if f[10] and f[10] ~= "-" then for k in f[10]:gmatch("%d+") do H.sk[#H.sk + 1] = tonumber(k) end end
         if H.h and H.n then
           S.host[H.h] = H; S.seenT[H.h] = clockNow
+          -- (lane 90) an entry of the host for a young squad that names a target, a fight, a rout or a raid: the young
+          -- way is closed for good (see youngStir)
+          local Yg = S.young and S.young[H.h]
+          if Yg and not Yg.stirred then
+            local raid = false; for _, k in ipairs(H.sk) do if k == RAIDING then raid = true end end
+            if (tonumber(f[4]) or 0) ~= 0 or H.eng or H.ctl == FLEEING or raid then Yg.stirred = "the host's state"; Yg.stirT = clockNow end
+          end
           -- (lane 47, round two) a squad whose entry is the very text of the last one (nothing changed on the host) is
           -- mirrored again at most every 0.25 s, not at every state line (20 a second; mirror reads the squad's whole
           -- state through the game, about 25 values): a change on the host is mirrored at once as before; a squad of
@@ -2569,11 +2912,12 @@ local function friendInbox()
           end
         end
       end
-    elseif kind == "D" then       -- D <squad> <places>: the soldiers at these places (sorted by id) died on the host
+    elseif kind == "D" then       -- D <squad> <places> [<marks> [<regions>]]: the soldiers at these places (sorted by id) died on the host
       local h = toLocal(tonumber(w[4])); local n = 0
       if sqValid(h) then
         local list = aliveList(h); local doomed = {}; local taken = {}
         local toks = {}; if w[6] then for t in w[6]:gmatch("[^,]+") do toks[#toks + 1] = t end end
+        local regs = {}; if w[7] then for t in w[7]:gmatch("[^,]+") do regs[#regs + 1] = t end end   -- (lane 64) each body's region on the host
         local k = 0
         for p in (w[5] or ""):gmatch("%d+") do
           k = k + 1
@@ -2582,9 +2926,9 @@ local function friendInbox()
           local tok = toks[k]
           if tok and tok ~= "-" then for _, x in ipairs(list) do if x.tok == tok and not taken[x] then e = x; S.stats.deathsByName = (S.stats.deathsByName or 0) + 1; break end end end
           if not e then e = list[tonumber(p)]; if e and taken[e] then e = nil end end
-          if e and valid(e.u) then taken[e] = true; doomed[#doomed + 1] = e.u end
+          if e and valid(e.u) then taken[e] = true; doomed[#doomed + 1] = { u = e.u, r = regs[k] } end
         end
-        for _, u in ipairs(doomed) do hostKill(u); n = n + 1 end
+        for _, d in ipairs(doomed) do hostKill(d.u, d.r); n = n + 1 end
       end
       S.stats.deaths = (S.stats.deaths or 0) + n
     elseif kind == "MT" then      -- MT <host squad> <marks>: the men of another lord's militia unit on the host (round 2)
@@ -2741,7 +3085,10 @@ end
 local function body()
   local S = C.s; local clock = os.clock()
   local roleN0 = S.roleN                                      -- (lane 62) C.setRole counts its calls: see the module loop below
-if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local tf0 = io.open(LINK .. "dev_trace.txt", "rb"); if tf0 then tf0:close(); C.traceF = io.open(LINK .. S.name .. "_trace.txt", "w+b") end end   -- (lane 47, round three: test switch dev_trace.txt)
+if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local tf0 = io.open(LINK .. "dev_trace.txt", "rb"); if tf0 then local tx = tf0:read("*a") or ""; tf0:close(); C.traceF = io.open(LINK .. S.name .. "_trace.txt", "w+b"); for hm in tx:gmatch("hook=([%w_]+)") do C.traceHook = rawget(C, "traceHook") or {}; C.traceHook[hm] = true end; C.traceGc = tonumber(tx:match("gc=(%d+)")); C.traceStale = tx:find("stale=1", 1, true) ~= nil end end   -- (lane 47, round three: test switch dev_trace.txt)
+  -- (test switch dev_trace.txt with the word gc=<s>: the engine's clean-up is run every <s> seconds, so that an object
+  -- the game has destroyed is freed soon after; a test's way to meet freed memory, never in a player's game)
+  if C.traceF and rawget(C, "traceGc") and clock - (S.tGcT or 0) >= C.traceGc then S.tGcT = clock; pcall(function() StaticFindObject("/Script/Engine.Default__KismetSystemLibrary"):CollectGarbage() end) end
   if clock - (S.slowT or -10) > 5.0 then S.slowT = clock; slowOpenCheck() end   -- (lane 65) test switch dev_slowopen.txt
   if S.role == "idle" then
     -- Not a co-op game (a solo game, or the title screen before anything was chosen): the mod changes nothing. Only the
@@ -2792,6 +3139,7 @@ if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local
     S.later = keep
   end
   if S.role == "host" then
+    local okM, eM = pcall(hostModeSpeed, S, clock); if not okM then countErr(S, "hostModeSpeed", eM) end   -- (lane 81)
     if clock - S.tIn >= 0.02 then S.tIn = clock; crumb(S, "hostInbox"); hostInbox() end
     -- a friend's rally that had to wait for the helper (it was placing a building): try again, give up after 5 s
     if S.rallyQ and next(S.rallyQ) then
@@ -2824,7 +3172,12 @@ if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local
             local back = not S.gone[p] or why == "silence" or (why == "steam" and not off and h > gt) or (why == "bye" and h > gt + 20.0)
             if back then
               if S.quiet[p] then log("%s heard again after %.1f s", p, g) end
-              if S.gone[p] then log("%s is back (it had left: %s)", p, tostring(why)); C.notify("joined", ((S.display and S.display[p]) or p) .. " is back") end
+              if S.gone[p] then
+                log("%s is back (it had left: %s)", p, tostring(why))
+                local text = ((S.display and S.display[p]) or p) .. " is back"
+                C.notify("joined", text)
+                local Jm = rawget(C, "join"); if Jm and Jm.tellAll then pcall(Jm.tellAll, "back", p, text) end   -- (lane 81) every friend sees it too
+              end
               S.gone[p] = nil; S.quiet[p] = nil
             end
           end
@@ -2850,6 +3203,7 @@ if not C.traceF and clock - (S.traceT or -10) > 5.0 then S.traceT = clock; local
     crumb(S, "watch"); watch()
     if clock - S.tUp >= 0.5 then S.tUp = clock; crumb(S, "removeTick"); removeTick(clock); crumb(S, "friendUpkeep"); friendUpkeep() end
     if clock - S.tIn >= 0.02 then S.tIn = clock; crumb(S, "friendInbox"); friendInbox() end
+    if S.young and next(S.young) ~= nil then crumb(S, "youngTick"); youngTick() end      -- (lane 90) every tick, after the inbox made new squads
     if clock - (S.tBeat or 0) >= 3.0 then S.tBeat = clock; send("H") end      -- "still here"
     -- The host heard and now silent for 10 s may have left (closed the game, crashed, lost the link): this player is
     -- told, as the host is told of a friend. Found by lane 29: the host's process ended and the friend saw nothing for 30 s.
@@ -2914,6 +3268,7 @@ function C.dispatch(from, w, line)
   for name, m in pairs(C.modules) do
     if m.onMessage then
       local k0 = os.clock()
+      if C.traceF then C.trace(name .. ".onMessage " .. tostring(w[3]) .. " " .. tostring(w[4]) .. " " .. tostring(w[5])) end   -- (test switch dev_trace.txt only)
       local ok, r = pcall(m.onMessage, C.s, from, w[3], w, line)
       local d = os.clock() - k0                                -- lane 45: the module that took the line, or that spent time on it
       if r or d > 0 then local mn = K.msgName[name]; if not mn then mn = name .. ":msg"; K.msgName[name] = mn end; kAdd(mn, d * 1000) end
@@ -2944,7 +3299,9 @@ function C.friendLeft(p, why, kind)
   S.gone = S.gone or {}; if S.gone[p] then return end
   S.goneWhy = S.goneWhy or {}; S.goneT = S.goneT or {}
   S.gone[p] = true; S.goneWhy[p] = kind or "silence"; S.goneT[p] = os.clock(); log("%s left the game: %s", p, why)
-  C.notify("left", ((S.display and S.display[p]) or p) .. " left the game")
+  local text = ((S.display and S.display[p]) or p) .. " left the game"
+  C.notify("left", text)
+  local Jm = rawget(C, "join"); if S.role == "host" and Jm and Jm.tellAll then pcall(Jm.tellAll, "left", p, text) end   -- (lane 81) every friend sees it too
 end
 -- (lane 62) This host lost its own Steam lobby (coop_ui.lua tells the player once, in one notice): every friend heard
 -- so far has left with it. Marked as gone on Steam's word, without a "left the game" notice each. A friend that
@@ -3419,6 +3776,11 @@ end
 
 function C.stop()
   if C.handle then pcall(CancelDelayedAction, C.handle); C.handle = nil end
+  -- (lane 64, round 5) a friend whose clock waits for a silent host (friendInbox) runs at normal time again
+  if C.s and C.s.dilHeldNow then
+    local S = C.s; S.dilHeldNow = nil; S.dilK = 50
+    pcall(function() if valid(S.p1) then StaticFindObject("/Script/Engine.Default__GameplayStatics"):SetGlobalTimeDilation(S.p1, 1.0) end end)
+  end
   if C.s then C.s.on = false; if C.s.out then pcall(function() C.s.out:close() end); C.s.out = nil end end
   if C.s then closeReaders(C.s) end                                    -- (lane 65) the kept read handles
   C.logClose()                                                          -- (lane 47) opened again by the next line
@@ -3456,6 +3818,7 @@ function C.setRole(role, name, peers)
   if S.out then pcall(function() S.out:close() end); S.out = nil end
   -- a friend's copy may be running a little fast or slow to catch up with the host: back to normal time
   pcall(function() if valid(S.p1) then StaticFindObject("/Script/Engine.Default__GameplayStatics"):SetGlobalTimeDilation(S.p1, 1.0) end end)
+  S.dilK = 50; S.dilHeldNow = nil               -- (lane 64, round 5) and the mod's own note of it (a held clock ends with the role)
   S.role = role; S.name = name or (role == "friend" and "friend1" or "host"); S.peers = peers or {}
   S.roleN = (S.roleN or 0) + 1                  -- (lane 62) the driver stops this tick's module loop after a role change
   S.linkWait = nil; S.linkHold = nil            -- (lane 62, part two) a window for a lost Steam link belongs to the role before

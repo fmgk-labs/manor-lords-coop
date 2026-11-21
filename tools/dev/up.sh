@@ -12,6 +12,9 @@ GEN="up_$$_$(date +%s)"; echo "$GEN" > "$RUN/gen"
 mine() { [ "$(cat "$RUN/gen" 2>/dev/null)" = "$GEN" ] || { echo "another start or a down took over: this start stops here"; exit 4; }; }
 # the native DLLs are build outputs (not in git): a fresh worktree takes them from the main checkout
 for d in coop_patch coop_steam; do [ -f "native/$d/out/$d.dll" ] || { mkdir -p "native/$d/out"; cp "$MAIN/native/$d/out/$d.dll" "native/$d/out/"; }; done
+# (lead, 2026-11-21) the copied DLL can be old (the main checkout's): the patch DLL must carry this checkout's version, else it is built
+VSRC=$(grep -o 'COOP_PATCH_VERSION "[0-9.]*"' native/coop_patch/coop_patch.c | cut -d'"' -f2)
+grep -a -q "$VSRC" native/coop_patch/out/coop_patch.dll || { echo "native coop_patch.dll is not $VSRC: building it"; (cd native/coop_patch && cmd //c ".\build.cmd" > /dev/null 2>&1); grep -a -q "$VSRC" native/coop_patch/out/coop_patch.dll || { echo "NATIVE DLL IS NOT $VSRC: stop"; exit 1; }; }
 V=$(grep '^C.version = ' mod/ManorLordsCoop/Scripts/coop.lua | cut -d'"' -f2 | head -1)
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/package.ps1 -Dist 'dist\test' 2>&1 | head -1
 [ -s "dist/test/ManorLordsCoop-$V.zip" ] || { echo "NO ZIP BUILT"; exit 1; }
@@ -48,6 +51,12 @@ printf 'local gi = FindFirstOf("MLGameInstance")\ngi.savefileToLoad = "%s"\nStat
 mlx io "$RUN/_load.lua" 30
 n=0; until grep -q "world 1 attached" "$LK/host_log.txt" 2>/dev/null || [ $n -ge 40 ]; do /usr/bin/sleep 3; n=$((n+1)); done; /usr/bin/sleep 8
 echo "host: $(grep -h "started as\|world .* attached" "$LK/host_log.txt" 2>/dev/null | cut -c16-70 | tr '\n' ';')"
+# (lane 81) edge scrolling off in every test copy: the owner's real pointer resting on (or last seen at) a test
+# window's edge scrolled that copy's camera to the map's edge (lane_s21_81, the intermittent release-check failure).
+# The game keeps the switch in its game instance (MLGameInstance.bEnableEdgeScrolling, set by SetEdgeScrolling); no
+# test profile file holds it (rtsSettings.sav has no such key), so it is set at every start, after the copy answers.
+printf 'local gi = FindFirstOf("MLGameInstance"); local ok = pcall(function() gi:SetEdgeScrolling(false) end)\nreturn "edge scrolling off: " .. tostring(ok) .. " " .. tostring(gi.bEnableEdgeScrolling)\n' > "$RUN/_edge.lua"
+echo "host: $(mlx io "$RUN/_edge.lua" 15 | tail -1)"
 [ "${ONLY:-}" = "host" ] && { echo "host only (ONLY=host)"; exit 0; }
 start friend friend1 io2 1 "$FENV"
 n=0; until grep -q "joined the game" "$LK/host_log.txt" 2>/dev/null || [ $n -ge 50 ]; do /usr/bin/sleep 3; n=$((n+1)); done; /usr/bin/sleep 6
@@ -58,6 +67,7 @@ for _, c in ipairs({ "t.MaxFPS 15", "sg.ShadowQuality 0", "sg.FoliageQuality 0",
 return "low graphics"
 ' > "$RUN/_gfx.lua"
 mlx io "$RUN/_gfx.lua" 15 > /dev/null; mlx io2 "$RUN/_gfx.lua" 15 > /dev/null
+echo "friend: $(mlx io2 "$RUN/_edge.lua" 15 | tail -1)"            # (lane 81) edge scrolling off, see above
 # FRIENDS=n (default 1): more friends on this PC: friend2 ... friendn, test consoles io3 ... (mlx io3 <file>), pid files
 # friend2.pid ... Each join makes every copy load the host's save again. One slot per copy; the start waits for memory.
 i=2; while [ $i -le ${FRIENDS:-1} ]; do
@@ -67,6 +77,7 @@ i=2; while [ $i -le ${FRIENDS:-1} ]; do
   powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$DEV/start.ps1")" -Exe "$EXE" -Suffix "$SUFFIX" -Role friend -Name "friend$i" -Io "io$((i+1))" -WinX "$(wx $i)" -WinY "$(wy $i)" -ResX $RESX -ResY $RESY -PidFile "$(cygpath -w "$RUN/friend$i.pid")" -Extra ''
   n=0; until [ "$(grep -c "joined the game" "$LK/host_log.txt" 2>/dev/null)" -ge $i ] || [ $n -ge 70 ]; do /usr/bin/sleep 3; n=$((n+1)); done; /usr/bin/sleep 8
   mlx "io$((i+1))" "$RUN/_gfx.lua" 15 > /dev/null; mlx io "$RUN/_gfx.lua" 15 > /dev/null; mlx io2 "$RUN/_gfx.lua" 15 > /dev/null
+  mlx "io$((i+1))" "$RUN/_edge.lua" 15 > /dev/null                 # (lane 81) edge scrolling off
   echo "friend$i: $(grep "joined the game" "$LK/host_log.txt" | tail -1 | cut -c16-90) ($(grep -c "joined the game" "$LK/host_log.txt") joins so far)"
   i=$((i+1))
 done

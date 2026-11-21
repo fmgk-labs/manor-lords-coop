@@ -106,7 +106,10 @@ local DEFAULT_CFG = {
   applyEvery = 0.5, -- friend: a pass over the host's values at most this often
   ownWait = 2.0,    -- friend: an entry of its own at a list's end waits this long for the host's
   expFloor = 1.0,   -- host: a building's expertise at most this often (it grows with every work hit)
-  mktEvery = 2.0,   -- host: prices and supply this often
+  timeEvery = 0.25, -- (lane 83) the time pie's own look over the buildings, host and friend, this often
+  timeMs = 2.0,     -- (lane 83) ... at most this much of a tick
+  mktEvery = 0.5,
+  mktApply = 0.25,  -- (lane 83) friend: the supply and prices compared with the host's this often (and at once on a line)   -- host: prices and supply this often (lane 83: was 2.0; the foreign supply reached a friend up to 2.9 s late, r27m83 day 364)
   menEvery = 0.5,   -- host: squads' men this often
   menTol = 0.01,    -- ... a change smaller than this (or 0.5 % of the value) is not sent
   gearSettle = 1.5, -- host: a man's equipment must hold this long before it is sent
@@ -299,6 +302,14 @@ local function bObj(S, k)
   if ok and b and valid(b) and addr(b) == I.a then return b end
   return nil
 end
+-- (lane 83) the timing proof's note of a building's production row (W.proofNote, section pt): the host's at every
+-- send of its log or time list, a friend's at every write of the host's; the check dates the values a player sees from
+-- these (a pair of goods the host held between two of the proof's reads was sent, never dated: l83r8a, 89@10020,8120)
+local function ptNote(S, k)
+  local w = W(); if not (w and w.proofNote and w.cfg and w.cfg.proof) then return end
+  local b = bObj(S, k); if b then pcall(w.proofNote, b, false, "pt") end
+end
+X.ptNote = ptNote
 local function byKey(S)            -- for an object member of a record (rare)
   local t = {}; local I = index(S); if not I then return t end
   for k in pairs(I.by) do local b = bObj(S, k); if b then t[k] = b end end
@@ -375,10 +386,13 @@ local function hostTrkB(S, k, b, digest)
       -- sent when the pie's whole per cents change (the totals grow with every second of work: sending each change
       -- would cost a line a second per workplace) and after an ASK ALL
       local p = gamePct(c) or pctOf(cur)
-      if prime then R.t = cur; R.tp = p; return end
+      -- (lane 83) a building first seen in the world's first pass is the save's (the friend has the same); one seen
+      -- later (built, or a rival's finished site) is new: its list goes out at once, or a friend kept its own pie for it
+      -- (l83r7a, 117@9740,6460: the host's pie empty, the friend's 100 % in one part, never sent)
+      if prime and not HS.firstPassDone then R.t = cur; R.tp = p; return end
       if digest or p ~= R.tp or not R.t or #R.t ~= n then
         local ch = {}; for i = 1, n do ch[#ch + 1] = i .. "=" .. cur[i] end
-        R.t = cur; R.tp = p; sendParts("time", string.format("ST U %s %d %s ", k, n, p ~= "" and p or "-"), ch); bump("u_sent")
+        R.t = cur; R.tp = p; sendParts("time", string.format("ST U %s %d %s ", k, n, p ~= "" and p or "-"), ch); bump("u_sent"); ptNote(S, k)
       end
     end)
   end
@@ -545,6 +559,34 @@ end
 
 -- ---------------------------------------------------------------- host: the driver
 local HS = X.HS or {}; X.HS = HS
+-- (lane 83) the time pie's own look (host): the pass over the buildings comes at most every hostEvery s and is spread
+-- over ticks at budgetMs, so a pie change reached a friend seconds late (session l83r3c: 61 readings past 3 s). Every
+-- cfg.timeEvery s each building already noted by the pass is asked for its pie (one call); a change is sent at once.
+local function hostTimeLook(S, clock)
+  local T = HS.tlook
+  if not T then
+    if clock - (HS.tlookT or -1e9) < cfg.timeEvery then return end
+    local I = index(S); if not I then return end
+    T = { i = 0, list = I.list, c0 = os.clock() }; HS.tlook = T; HS.tlookT = clock
+  end
+  local t0 = os.clock()
+  while (os.clock() - t0) * 1000 < cfg.timeMs do
+    T.i = T.i + 1; local k = T.list[T.i]
+    if not k then X.passLong("host time", os.clock() - T.c0, #T.list); HS.tlook = nil; return end
+    local R = HT[k]
+    if R and R.t then
+      local b = bObj(S, k); local c = b and comp(b, "ProductionTrackerComponent")
+      if c then
+        local p = gamePct(c)
+        if p and p ~= R.tp then
+          local arr = c[L.time]; local n = #arr; local cur = readList(arr, L.TIw, 1, n)
+          local ch = {}; for i = 1, n do ch[#ch + 1] = i .. "=" .. cur[i] end
+          R.t = cur; R.tp = p; sendParts("time", string.format("ST U %s %d %s ", k, n, p ~= "" and p or "-"), ch); bump("u_sentLook"); ptNote(S, k)
+        end
+      end
+    end
+  end
+end
 local function hostTick(S, clock)
   learn()
   local t0 = os.clock()
@@ -563,7 +605,7 @@ local function hostTick(S, clock)
   if not HS.pass and clock - (HS.passT or -1e9) >= cfg.hostEvery then
     local I = index(S)
     if I then pcall(X.hostGone, I, S) end
-    if I then HS.pass = { i = 0, list = I.list, digest = HS.wantDigest, full = HS.fullB, exp = {} }; HS.wantDigest = nil; HS.fullB = nil; HS.passT = clock end
+    if I then HS.pass = { i = 0, list = I.list, digest = HS.wantDigest, full = HS.fullB, exp = {}, c0 = os.clock() }; HS.wantDigest = nil; HS.fullB = nil; HS.passT = clock end
   end
   local P = HS.pass
   if P then
@@ -572,6 +614,8 @@ local function hostTick(S, clock)
       local k = P.list[P.i]
       if not k then
         if #P.exp > 0 then sendParts("exp", "ST E ", P.exp) end
+        X.passLong("host", os.clock() - P.c0, #P.list)    -- (lane 83) how long a pass over the buildings takes
+        HS.firstPassDone = true                            -- (lane 83) buildings seen from now on are new (hostTrkB)
         HS.pass = nil; break
       end
       local b = bObj(S, k)
@@ -581,6 +625,7 @@ local function hostTick(S, clock)
       end
     end
   end
+  if on.time and L.time and L.TIw then local okT, eT = pcall(hostTimeLook, S, clock); if not okT then bump("u_lookErr"); X.lastErr = tostring(eT); HS.tlook = nil end end
   if clock - (HS.mktT or -1e9) >= cfg.mktEvery or full then HS.mktT = clock; pcall(hostMkt, S, full) end
   if clock - (HS.menT or -1e9) >= cfg.menEvery or full then HS.menT = clock; pcall(hostMen, S, clock, full) end
   if clock - (HS.famT or -1e9) >= cfg.famEvery or full then HS.famT = clock; pcall(hostRetFam, S, full) end
@@ -627,9 +672,9 @@ local function onU(w)              -- the time list is sent whole, with the host
   local k, n, p = w[5], tonumber(w[6]), w[7]; if not (k and n and p) then return end
   local R = fT(k); local t = { n = n, list = {} }
   items(w[8], function(i, e) i = tonumber(i); if i then t.list[i] = e end end)
-  if #t.list == n then t.p = (p ~= "-") and p or pctOf(t.list); R.t = t else bump("u_badLine") end
+  if #t.list == n then t.p = (p ~= "-") and p or pctOf(t.list); R.t = t; X.tdirty = X.tdirty or {}; X.tdirty[k] = true else bump("u_badLine") end
 end
-local function onM(w) local key, n = w[5], tonumber(w[6]); if not (key and n) then return end; local E = FM[key] or { list = {} }; FM[key] = E; E.n = n; items(w[7], function(i, v) i = tonumber(i); if i then E.list[i] = v end end); E.dirty = true end
+local function onM(w) local key, n = w[5], tonumber(w[6]); if not (key and n) then return end; local E = FM[key] or { list = {} }; FM[key] = E; E.n = n; items(w[7], function(i, v) i = tonumber(i); if i then E.list[i] = v end end); E.dirty = true; X.mktDirty = true end
 local function onIdx(T, w) local key, n = tonumber(w[5]) or w[5], tonumber(w[6]); if not key then return end; local E = T[key] or { list = {} }; T[key] = E; E.n = n; E.t = os.clock(); E.up = nil; items(w[7], function(i, v) E.list[tonumber(i) or i] = v end) end
 
 -- ---------------------------------------------------------------- the production log through the native piece (game run)
@@ -646,6 +691,8 @@ local function onIdx(T, w) local key, n = tonumber(w[5]) or w[5], tonumber(w[6])
 local HL = X.HL or {}; X.HL = HL      -- host: [bkey] = { [good] = { entries } }   what was sent
 local FL = X.FL or {}; X.FL = FL      -- friend: [bkey] = { [good] = { n = , list = { entries } } }
 cfg.logReadEvery = cfg.logReadEvery or 1.0; cfg.logTail = cfg.logTail or 8
+cfg.logHostEvery = cfg.logHostEvery or 0.5   -- (lane 83) the host reads every log this often (one read of all trackers: about 10 ms, run 25)
+cfg.logDirtyEvery = cfg.logDirtyEvery or 0.25 -- (lane 83) a friend writes the buildings whose host lines came this often
 cfg.missDrop = cfg.missDrop or 30.0
 -- friend: a building's held values dropped (gone on the host, or not on this copy for cfg.missDrop s)
 -- (the miss mark stays: values the host sends again for a building still missing here are dropped on the next pass
@@ -665,11 +712,18 @@ end
 on.log = (on.log == nil) and true or on.log
 local function patchP() local P = rawget(C, "patch"); if P and P.fn and P.send and P.tick and P.dir then return P end end
 -- every tracker of this copy: { [bkey] = { a = hex address, log = { [good] = { "d/a", ... } } } } (nil without the native piece)
-local function readLogs(S, tag)
+local function readLogs(S, tag, only)
   local P = patchP(); if not P then return nil end
   local I = index(S); if not I then return nil end
   local addrs, keyOf = {}, {}
-  for _, k in ipairs(I.list) do
+  local list = I.list
+  if only then list = {}; for k in pairs(only) do if I.by[k] then list[#list + 1] = k end end end   -- (lane 83) these keys only
+  -- (lane 83, run 26) a building no longer at its listed place (one demolished, a pile made: the list shifted) makes
+  -- the index be read again once, so its tracker is found in this pass and not a second later
+  local again = false
+  for _, k in ipairs(list) do if not bObj(S, k) then again = true; break end end
+  if again then I = index(S, true) or I; bump("l_reindex"); if not only then list = I.list end end
+  for _, k in ipairs(list) do
     local b = bObj(S, k)
     local ok, a = pcall(function() local c = b.ProductionTrackerComponent; if c and c:IsValid() then return string.format("%X", c:GetAddress()) end end)
     if ok and a then addrs[#addrs + 1] = a; keyOf[a] = k end
@@ -702,12 +756,14 @@ local function readLogs(S, tag)
 end
 local function firstDiff(a, b) local n = math.min(#a, #b); for i = 1, n do if a[i] ~= b[i] then return i end end; if #a ~= #b then return n + 1 end; return nil end
 local function hostLog(S, clock)
-  if not on.log or clock - (X.HS.logT or -1e9) < cfg.logReadEvery then return end
+  if not on.log or clock - (X.HS.logT or -1e9) < (cfg.logHostEvery or cfg.logReadEvery) then return end
   X.HS.logT = clock
+  local r0 = os.clock()
   local now = readLogs(S, "h"); if not now then return end
+  do local ms = (os.clock() - r0) * 1000; X.logReadMs = math.max(X.logReadMs or 0, ms); bump("l_reads"); bump("l_readMs", math.floor(ms + 0.5)) end   -- (lane 83)
   local tail = X.HS.logAll; X.HS.logAll = nil
   for k, B in pairs(now) do
-    local R = HL[k]
+    local R = HL[k]; local sentK = false
     local first = not R
     if first then HL[k] = B.log; R = B.log end            -- seen first: noted (the save is the same on a friend)
     if not first or tail then
@@ -734,13 +790,15 @@ local function hostLog(S, clock)
         for c = from, #e, 200 do
           local part = {}; for i = c, math.min(#e, c + 199) do part[#part + 1] = e[i] end
           sendL("log", string.format("ST L %s %d %d %d %s", k, g, #e, c - 1, table.concat(part, ";")))
-          bump("l_sent", #part)
+          bump("l_sent", #part); sentK = true
+          if cfg.logTrace then log("trace L sent %s %d n=%d last=%s", k, g, #e, tostring(e[#e])) end   -- (lane 83, test only)
         end
         if from > #e then sendL("log", string.format("ST L %s %d %d %d -", k, g, #e, #e)) end   -- (shorter: the count alone)
       end
       R[g] = e
     end
-    for g in pairs(R) do if not B.log[g] then R[g] = nil; sendL("log", string.format("ST L %s %d -1 0 -", k, g)) end end
+    for g in pairs(R) do if not B.log[g] then R[g] = nil; sendL("log", string.format("ST L %s %d -1 0 -", k, g)); sentK = true end end
+    if sentK then ptNote(S, k) end
     end
   end
   -- a digest a game day (n and hash of each good's list): a friend that differs asks for the whole list
@@ -816,6 +874,7 @@ local function onL(w)
   if w[9] and w[9] ~= "-" then for x in w[9]:gmatch("[^;]+") do E.list[i] = x; i = i + 1 end end
   for j = #E.list, n + 1, -1 do E.list[j] = nil end
   E.n = n
+  X.fdirty = X.fdirty or {}; X.fdirty[k] = true                 -- (lane 83) read and written in the friend's next look
 end
 local function onLS(w)            -- the host's full list lost its first <s> entries (the game keeps 366 days)
   local k, g, s = w[5], tonumber(w[6]), tonumber(w[7]); if not (k and g and s and s > 0) then return end
@@ -834,15 +893,24 @@ local function onLD(w, mine)
   end
 end
 local function friendLog(S, clock)
-  if not on.log or clock - (X.flogT or -1e9) < cfg.logReadEvery then return end
-  X.flogT = clock
+  if not on.log then return end
+  -- (lane 83) the buildings whose host lines came are read and written every cfg.logDirtyEvery s (their trackers only);
+  -- every building once a cfg.logReadEvery s as before
+  local only
+  if clock - (X.flogT or -1e9) >= cfg.logReadEvery then X.flogT = clock; X.fdirty = nil
+  elseif X.fdirty and next(X.fdirty) and clock - (X.fdirtyT or -1e9) >= cfg.logDirtyEvery then only = X.fdirty; X.fdirty = nil; bump("l_dirtyPass")
+  else return end
+  X.fdirtyT = clock
   if not next(FL) then return end
-  local mine = readLogs(S, "f"); if not mine then return end
+  local mine = readLogs(S, "f", only); if not mine then return end
+  -- (lane 83) a building whose lines came but whose tracker was not read now stays for the next look
+  if only then for k in pairs(only) do if not mine[k] and FL[k] and IX and IX.by[k] then X.fdirty = X.fdirty or {}; X.fdirty[k] = true end end end
   local P = patchP()
   for k, R in pairs(FL) do
     local B = mine[k]
     if B then
       for g, E in pairs(R) do
+        if not (E.n and #E.list == E.n) then bump("l_waitList") end   -- (lane 83: counted; a list still on its way)
         if E.n and #E.list == E.n then
           local m = B.log[g] or {}
           local i = firstDiff(m, E.list)
@@ -851,6 +919,8 @@ local function friendLog(S, clock)
             --  key or the room first)
             local part = {}; for j = i, #E.list do part[#part + 1] = E.list[j] end
             P.send(string.format("HIST TRKSET %s %d %d %s", B.a, g, i - 1, #part > 0 and table.concat(part, ",") or "-")); bump("l_set")
+            X.ptWritten = X.ptWritten or {}; X.ptWritten[k] = true
+            if cfg.logTrace then log("trace L set %s %d n=%d last=%s %s", k, g, #E.list, tostring(E.list[#E.list]), only and "dirty" or "full") end   -- (lane 83, test only)
           end
         end
       end
@@ -868,6 +938,7 @@ local function friendLog(S, clock)
     end
   end
   P.tick()
+  if X.ptWritten then local wr = X.ptWritten; X.ptWritten = nil; for k in pairs(wr) do ptNote(S, k) end end   -- (lane 83)
 end
 
 -- ---------------------------------------------------------------- friend: writing
@@ -967,12 +1038,12 @@ local function friendBuildings(S, clock, t0)
     if clock - (X.fpassT or -1e9) < cfg.applyEvery then return true end
     local I = index(S); if not I then return true end
     local keys = {}; for k in pairs(FT) do keys[#keys + 1] = k end; for k in pairs(FE) do if not FT[k] then keys[#keys + 1] = k end end; for k in pairs(FD) do if not FT[k] and not FE[k] then keys[#keys + 1] = k end end
-    F = { i = 0, keys = keys }; X.fpass = F; X.fpassT = clock
+    F = { i = 0, keys = keys, c0 = os.clock() }; X.fpass = F; X.fpassT = clock
     BYKEY = (L.TE and L.TE.hasObj) and byKey(S) or nil     -- only when an entry names a building (not seen yet)
   end
   while (os.clock() - t0) * 1000 < cfg.budgetMs do
     F.i = F.i + 1; local k = F.keys[F.i]
-    if not k then X.fpass = nil; return true end
+    if not k then X.passLong("friend", os.clock() - F.c0, #F.keys); X.fpass = nil; return true end
     local b = bObj(S, k)
     if not b then
       -- not on this copy (gone, or not built here yet): counted once; dropped after cfg.missDrop s (the host's
@@ -1085,6 +1156,39 @@ local function friendRetFam(S)
     end
   end
 end
+-- (lane 83) the time pie's own look (friend): the host's time list is written in the tick after it came (not at the
+-- next pass over the buildings, every applyEvery s and spread over ticks: l83r3c, a value the host never had held a
+-- median 0.5 s, up to 3.5 s), and every cfg.timeEvery s each building's pie is compared with the host's last one;
+-- where they differ (this copy's own work moved it) the host's totals are written. Same gates as the pass (called from
+-- friendTick after them; the host's spec, the same count).
+local function friendTimeOne(S, k, R)
+  local b = bObj(S, k); local c = b and comp(b, "ProductionTrackerComponent"); if not c then return end
+  local arr = c[L.time]; local n = #arr
+  if n ~= R.t.n then bump("u_countDiffers"); return end
+  if (gamePct(c) or pctOf(readList(arr, L.TIw, 1, n))) ~= R.t.p then
+    local put = false
+    for i = 1, n do local h = R.t.list[i]; if h then local r = arr[i]; if rec(r, L.TIw) ~= h then putRec(r, L.TIw, h, true); bump("u_putLook"); put = true end end end
+    if put then ptNote(S, k) end                                 -- (lane 83) the friend's row dated at the write
+  end
+end
+local function friendTimeLook(S, clock)
+  if not (on.time and L.TIw and FS.U == hash(L.specU or "")) then return end
+  local t0 = os.clock()
+  local D = X.tdirty
+  if D then X.tdirty = nil; for k in pairs(D) do local R = FT[k]; if R and R.t then local ok, e = pcall(friendTimeOne, S, k, R); if not ok then bump("u_lookErr"); X.lastErr = tostring(e) end end end end
+  local T = X.tlook
+  if not T then
+    if clock - (X.tlookT or -1e9) < cfg.timeEvery then return end
+    local keys = {}; for k, R in pairs(FT) do if R.t then keys[#keys + 1] = k end end
+    T = { i = 0, keys = keys, c0 = os.clock() }; X.tlook = T; X.tlookT = clock
+  end
+  while (os.clock() - t0) * 1000 < cfg.timeMs do
+    T.i = T.i + 1; local k = T.keys[T.i]
+    if not k then X.passLong("friend time", os.clock() - T.c0, #T.keys); X.tlook = nil; return end
+    local R = FT[k]
+    if R and R.t then local ok, e = pcall(friendTimeOne, S, k, R); if not ok then bump("u_lookErr"); X.lastErr = tostring(e) end end
+  end
+end
 local function friendTick(S, clock)
   -- "send me everything": 3 s into a world, and again every 30 s until the host's spec came (a host not ready yet)
   if os.clock() - (S.worldT or 0) > cfg.askAfter and (not X.asked or (not X.gotSpec and clock - X.asked >= 30.0)) then
@@ -1104,9 +1208,15 @@ local function friendTick(S, clock)
   do local okG, eG = pcall(X.friendGrid, S, clock); if not okG then bump("g_err"); X.lastErr = tostring(eG) end end
   do local okH, eH = pcall(X.friendHist, S, clock); if not okH then bump("h_err"); X.lastErr = tostring(eH) end end
   local done = friendBuildings(S, clock, t0)
+  do local okT, eT = pcall(friendTimeLook, S, clock); if not okT then bump("u_lookErr"); X.lastErr = tostring(eT); X.tlook = nil end end
+  -- (lane 83) the foreign supply and prices on their own: in the tick after the host's line came, and every
+  -- cfg.mktApply s (this copy's own daily roll of the supply list is set back to the host's within that); it waited for
+  -- the end of the pass over the buildings (1-4 s): l83r9a, the friend showed the day before's list 0.2-2.3 s after
+  -- each day change, and once its own roll, never sent again, past 3 s (day 447)
+  if X.mktDirty or clock - (X.mktT or -1e9) >= (cfg.mktApply or 0.25) then X.mktDirty = nil; X.mktT = clock; pcall(friendMkt, S) end
   if done and clock - (X.otherT or -1e9) >= cfg.applyEvery then
     X.otherT = clock
-    pcall(friendMkt, S); pcall(friendMen, S); pcall(friendRetFam, S)
+    pcall(friendMen, S); pcall(friendRetFam, S)
   end
 end
 
@@ -1130,7 +1240,21 @@ function X.wideBuilding(P, b, k)
       end
       local pct = "-"
       if L.time and L.TIw then pcall(function() local arr = c[L.time]; pct = gamePct(c) or pctOf(readList(arr, L.TIw, 1, #arr)) end) end
-      if ng > 0 or (pct ~= "-" and pct:find("[1-9]")) then P.pt[k] = ng .. "|" .. ne .. "|" .. hs .. "|" .. pct end
+      -- (lane 83, proposal 4) what the building panel shows in nGoods' place: the yield status word (GetYieldStatus,
+      -- ProductivityTrackerWidget), the goods made over 30 days (getGoodsProducedOver, the produced-goods lists) and
+      -- whether the productivity tab shows at all (SMBuildingMaster.ShouldShowProductivity, which reads nGoods)
+      local y, made, show = "?", "?", "?"
+      pcall(function() y = tostring(c:GetYieldStatus()) end)
+      pcall(function()
+        local t = {}
+        for g, v in pairs(c:getGoodsProducedOver(30) or {}) do
+          local gk, x = g, v; pcall(function() gk = g:get() end); pcall(function() x = v:get() end)
+          if tonumber(x) and tonumber(x) ~= 0 then t[#t + 1] = tostring(gk) .. "=" .. string.format("%d", math.floor(tonumber(x) + 0.5)) end
+        end
+        table.sort(t); made = #t > 0 and table.concat(t, ",") or "-"
+      end)
+      pcall(function() show = b:ShouldShowProductivity() and "1" or "0" end)
+      if ng > 0 or (pct ~= "-" and pct:find("[1-9]")) or made ~= "-" then P.pt[k] = ng .. "|" .. ne .. "|" .. hs .. "|" .. pct .. "|" .. y .. "|" .. made .. "|" .. show end
     end
   end
   if P.ex and L.exp then
@@ -1253,18 +1377,44 @@ function X.trial(step)
 end
 
 -- ---------------------------------------------------------------- the module
+-- (lane 83) the longest pass over the buildings since the last status line, and how many passes and buildings
+function X.passLong(side, s, n)
+  local P = X.passStat or {}; X.passStat = P
+  local e = P[side] or { n = 0, max = 0, b = 0 }; P[side] = e
+  e.n = e.n + 1; e.b = n; if s > e.max then e.max = s end
+end
 local function status()
   local t = {}; for k, v in pairs(X.stats) do t[#t + 1] = k .. "=" .. tostring(v) end; table.sort(t)
   local b = {}; for k, v in pairs(X.bytes) do b[#b + 1] = k .. "=" .. v end; table.sort(b)
   local nt = 0; for _ in pairs(FT) do nt = nt + 1 end; local nh = 0; for _ in pairs(HT) do nh = nh + 1 end
-  return string.format("stats %s: %s | bytes %s | host lists %d, friend's store %d | err %s", X.version, table.concat(t, " "), table.concat(b, " "), nh, nt, tostring(X.lastErr))
+  local ps = {}; for side, e in pairs(X.passStat or {}) do ps[#ps + 1] = string.format("%s %d passes, longest %.2f s, %d buildings", side, e.n, e.max, e.b) end; X.passStat = nil
+  return string.format("stats %s: %s | bytes %s | host lists %d, friend's store %d | passes: %s | err %s", X.version, table.concat(t, " "), table.concat(b, " "), nh, nt, #ps > 0 and table.concat(ps, "; ") or "-", tostring(X.lastErr))
 end
 X.status = status
 
 local function tick(S, clock)
   if not (valid(S.eng) and valid(S.p1)) then return end
+  -- (lane 83) each change of the day counter the 30-day production window counts from (TemporalComponent.daysTotal,
+  -- read by getGoodsProducedOver), stamped with this PC's wall clock: the two copies' windows roll at these moments
+  do local okD, d = pcall(function() return math.floor(S.eng.TemporalComponent.daysTotal) end)
+    if okD and d ~= X.lastDT then if X.lastDT then log("daysTotal %d at %.3f", d, A.now and A.now() or os.clock()) end; X.lastDT = d end end
   if S.role == "host" then local ok, e = pcall(hostTick, S, clock); if not ok then bump("err"); X.lastErr = tostring(e) end
   elseif S.role == "friend" then local ok, e = pcall(friendTick, S, clock); if not ok then bump("err"); X.lastErr = tostring(e) end end
+  -- (lane 83, run 11b) the fertility overlay is drawn by the game one queued cell a frame (redrawFertilitySlow); a
+  -- grown queue (spring, or a friend's carried cells) left both copies' overlays tens of seconds behind their own
+  -- grids, each in its own order. Both copies drain the queue with the game's own routine, up to cfg.gridDrain cells a
+  -- tick, so every copy draws what its grid holds within moments.
+  if on.grid and (cfg.gridDrain or 0) > 0 then
+    local okD, eD = pcall(function()
+      local q = S.eng.fertilityGridUpdateRequests; local n = #q
+      if n > 0 then
+        local k = math.min(n, cfg.gridDrain)
+        for _ = 1, k do S.eng:redrawFertilitySlow() end
+        bump("g_drawn", k)
+      end
+    end)
+    if not okD and X.drainErr ~= tostring(eD) then X.drainErr = tostring(eD); log("fertility redraw drain: %s", tostring(eD)) end
+  end
   -- a line a minute, and the bytes of each game day (the owner asked for the bytes a game day costs)
   if clock - (X.logT or 0) >= cfg.logEvery then X.logT = clock; log("%s", status()) end
   local okD, day = pcall(function() return math.floor(S.eng.TemporalComponent.daysTotal) end)
@@ -1284,7 +1434,19 @@ end
 -- 32 + bx; all of them after an ASK ALL). Friend: a block whose hash differs from the host's (the host's at least
 -- cfg.gridSettle s old) is asked for with its 32 row hashes: ST GA <bx>:<by> <h0>,...,<h31>; the host answers with the
 -- rows that differ, exact: ST GC <y> <x0> <cells>; the friend writes them (HIST GRIDSET) and the game redraws them.
-cfg.gridEvery = cfg.gridEvery or 2.0; cfg.gridSettle = cfg.gridSettle or 1.0; cfg.gridAskAgain = cfg.gridAskAgain or 6.0
+-- (lane 83) the host's answer goes cell by cell: ST GR <bx>:<by> <row mask> (the rows that differ), the friend sends a
+-- 16-bit hash of each cell of those rows (ST GQ <y> <x0> <32 x 4 hex> R <row hash>, HIST GRIDCH), the host sends only
+-- the cells that differ (ST GD <y> <x0> <cell mask> <cells>, HIST GRIDDIFF); the friend writes them (GRIDSET, masked).
+-- A whole row (ST GC) only when cfg.gridCells is false. Faster passes (1 s, settle 0.5 s, ask again after 3 s): the
+-- owner's bar is 3 s for what a friend sees.
+cfg.gridEvery = cfg.gridEvery or 1.0; cfg.gridSettle = cfg.gridSettle or 0.5; cfg.gridAskAgain = cfg.gridAskAgain or 3.0
+-- (lane 83, run 11: a forced change of 40 cells reached the friend's grid up to 4.6 s later, past the 3 s bar) the host
+-- looks every 0.5 s, and a friend compares at once when a block the host changed is cfg.gridSettle old (it no longer
+-- waits for its own 1 s pass)
+cfg.gridHostEvery = cfg.gridHostEvery or 0.5
+cfg.gridDrain = cfg.gridDrain or 48       -- (lane 83) overlay cells drawn a tick at most, by the game's own routine (tick)
+cfg.gridDrain = cfg.gridDrain or 48       -- (lane 83) overlay cells drawn a tick at most by the game's own routine (see tick)
+if cfg.gridCells == nil then cfg.gridCells = true end
 on.grid = (on.grid == nil) and true or on.grid
 local GRH = X.GRH or {}; X.GRH = GRH      -- host: [i] = hash sent
 local GRF = X.GRF or { h = {}, t = {}, asked = {}, rows = {} }; X.GRF = GRF   -- friend: the host's hashes, when, asked, rows to write
@@ -1308,30 +1470,75 @@ local function gridRows(S, tag, list)
   local path = P.dir .. "hist_grows_" .. tag .. ".txt"; os.remove(path)
   P.send("HIST GRIDROWS " .. e .. " " .. tag .. " " .. table.concat(list, ",")); P.tick()
   local out, f = {}, io.open(path, "r"); if not f then return out end
-  for l in f:lines() do local bx, by, rest = l:match("^(%d+) (%d+) (.*)$"); if bx and rest and not rest:find("BAD") then local r = {}; for h in rest:gmatch("%x+") do r[#r + 1] = h end; out[bx .. ":" .. by] = r end end
+  -- (lane 83) a row is taken only as 32 hashes of 8 hex digits each. It used to be dropped when its text held "BAD",
+  -- which a hash can (ECBAD263): that block was never answered, and the friend's grid stayed apart there for good
+  -- (lead's int5 check, coop_test_field: two fields' rye 1 % lower). The native error lines ("grid BAD", "<bx>:<by>
+  -- BAD") do not match "<bx> <by> " at all.
+  for l in f:lines() do
+    local bx, by, rest = l:match("^(%d+) (%d+) (.+)$")
+    if bx then
+      local r, ok = {}, true
+      for h in rest:gmatch("%S+") do if h:match("^%x%x%x%x%x%x%x%x$") then r[#r + 1] = h else ok = false end end
+      if ok and #r == 32 then out[bx .. ":" .. by] = r else bump("g_rowsBad") end
+    end
+  end
   f:close(); return out
 end
 function X.hostGrid(S, clock)
-  if not on.grid or clock - (HS.gridT or -1e9) < cfg.gridEvery then return end
+  if not on.grid or clock - (HS.gridT or -1e9) < (cfg.gridHostEvery or cfg.gridEvery) then return end
   HS.gridT = clock
   local t = gridHashes(S, "hg"); if not t then bump("g_noGrid"); return end
   local out, all = {}, HS.gridAll; HS.gridAll = nil
   for i = 0, #t do local h = t[i]; if h and (all or GRH[i] ~= h) then GRH[i] = h; out[#out + 1] = i .. "=" .. h end end
-  if #out > 0 then sendParts("grid", "ST GH ", out) end
+  if #out > 0 then sendParts("gridH", "ST GH ", out) end
 end
 local function hostGridAsk(S, w)
-  local key, rows = w[5], w[6]; if not (key and rows) then return end
-  local bx, by = key:match("^(%d+):(%d+)$"); if not bx then return end
+  bump("g_askIn")
+  local key, rows = w[5], w[6]; if not (key and rows) then bump("g_askBad"); return end
+  local bx, by = key:match("^(%d+):(%d+)$"); if not bx then bump("g_askBad"); return end
   local fr = {}; for h in rows:gmatch("%x+") do fr[#fr + 1] = h end
-  local mine = gridRows(S, "ha", { key })[key]; if not mine then return end
+  local mine = gridRows(S, "ha", { key })[key]
+  if not mine then bump("g_askNoRows"); if X.noRowsSaid ~= key then X.noRowsSaid = key; log("grid: no row hashes for block %s on this copy", key) end; return end
   local mask = 0
   for y = 1, 32 do if mine[y] ~= fr[y] then mask = mask + math.floor(2 ^ (y - 1)) end end
   if mask == 0 then bump("g_askSame"); return end
+  if cfg.gridCells then sendL("gridR", string.format("ST GR %s %X", key, mask)); bump("g_rmask"); return end
   local P = patchP(); local e = engHex(S); if not (P and e) then return end
   local path = P.dir .. "hist_gget_hc.txt"; os.remove(path)
   P.send(string.format("HIST GRIDGET %s hc %s %s %X", e, bx, by, mask)); P.tick()
   local f = io.open(path, "r"); if not f then return end
-  for l in f:lines() do local y, x0, cells = l:match("^(%d+) (%d+) (%x+)$"); if cells then sendL("grid", "ST GC " .. y .. " " .. x0 .. " " .. cells); bump("g_rows") end end
+  for l in f:lines() do local y, x0, cells = l:match("^(%d+) (%d+) (%x+)$"); if cells then sendL("gridC", "ST GC " .. y .. " " .. x0 .. " " .. cells); bump("g_rows") end end
+  f:close()
+end
+local function hostGridCells(S, w)
+  bump("g_qIn")
+  local y, x0, hs, r, rh = w[5], w[6], w[7], w[8], w[9]
+  if not (y and x0 and hs and #hs == 128 and tonumber(y) and tonumber(x0)) then bump("g_qBad"); return end
+  local P = patchP(); local e = engHex(S); if not (P and e) then bump("g_qNoPatch"); return end
+  local f = io.open(P.dir .. "hist_gdin_hq.txt", "w"); if not f then bump("g_qNoFile"); return end
+  f:write(y, " ", x0, " ", hs, (r == "R" and rh) and (" R " .. rh) or "", "\n"); f:close()
+  local path = P.dir .. "hist_gdiff_hq.txt"; os.remove(path)
+  P.send("HIST GRIDDIFF " .. e .. " hq"); P.tick()
+  local g = io.open(path, "r"); if not g then bump("g_qNoAnswer"); return end
+  for l in g:lines() do
+    local yy, xx, mk, cells = l:match("^(%d+) (%d+) (%x+) (%x+)$")
+    if cells then sendL("gridD", "ST GD " .. yy .. " " .. xx .. " " .. mk .. " " .. cells); bump("g_cellsSent", #cells / 32)
+    elseif l:match("^END rows 0 ") then bump("g_qSame") end
+  end
+  g:close()
+end
+-- friend: the rows the host says differ -> each cell's hash (HIST GRIDCH)
+local function friendGridRows(S, w)
+  local key, mk = w[5], w[6]; if not (key and mk) then return end
+  local bx, by = key:match("^(%d+):(%d+)$"); local mask = tonumber(mk, 16); if not (bx and mask) then return end
+  local P = patchP(); local e = engHex(S); if not (P and e) then return end
+  local list = {}
+  for yb = 0, 31 do if math.floor(mask / 2 ^ yb) % 2 == 1 then list[#list + 1] = (tonumber(by) * 32 + yb) .. ":" .. (tonumber(bx) * 32) end end
+  if #list == 0 then return end
+  local path = P.dir .. "hist_gch_fq.txt"; os.remove(path)
+  P.send("HIST GRIDCH " .. e .. " fq " .. table.concat(list, ",")); P.tick()
+  local f = io.open(path, "r"); if not f then bump("g_rNoAnswer"); return end
+  for l in f:lines() do local yy, xx, hs, rh = l:match("^(%d+) (%d+) (%x+) R (%x+)$"); if hs then sendL("gridQ", "ST GQ " .. yy .. " " .. xx .. " " .. hs .. " R " .. rh); bump("g_q") end end
   f:close()
 end
 local function friendGrid(S, clock)
@@ -1340,17 +1547,20 @@ local function friendGrid(S, clock)
   -- written at once; its redraw goes on the game's queue when it has room, else the native piece keeps it pending and
   -- this asks it every 0.25 s to move pending cells onto the queue (the game draws one a frame, none while paused)
   local P = patchP(); local e = engHex(S)
-  if P and e and next(GRF.rows) then
+  if P and e and (next(GRF.rows) or (GRF.cl and #GRF.cl > 0)) then
     local f = io.open(P.dir .. "hist_gin_fw.txt", "w")
     if f then
       local n = 0
-      for _, l in pairs(GRF.rows) do f:write(l, "\n"); n = n + 1 end; f:close()
+      for _, l in pairs(GRF.rows) do f:write(l, "\n"); n = n + 1 end
+      for _, l in ipairs(GRF.cl or {}) do f:write(l, "\n"); n = n + 1 end; f:close()
       local out = P.dir .. "hist_gset_fw.txt"; os.remove(out)
       P.send("HIST GRIDSET " .. e .. " fw"); P.tick(); bump("g_set", n)
       local g = io.open(out, "r"); local s = g and g:read("a") or ""; if g then g:close() end
       GRF.pend = tonumber(s:match("pending (%d+)") or "0") > 0; GRF.setT = os.clock()
+      -- (lane 83) how many of the cells the host sent were really different here: what a cell-wise carry would send
+      local nc, nch = s:match("cells (%d+) changed (%d+)"); if nc then bump("g_cells", tonumber(nc)); bump("g_changed", tonumber(nch)) end
     end
-    GRF.rows = {}
+    GRF.rows = {}; GRF.cl = {}
   elseif P and e and GRF.pend and os.clock() - (GRF.setT or -1e9) >= 0.25 then
     GRF.setT = os.clock()
     local out = P.dir .. "hist_gflush_ff.txt"; os.remove(out)
@@ -1358,7 +1568,9 @@ local function friendGrid(S, clock)
     local g = io.open(out, "r"); local s = g and g:read("a") or ""; if g then g:close() end
     GRF.pend = tonumber(s:match("pending (%d+)") or "0") > 0
   end
-  if clock - (X.fgridT or -1e9) < cfg.gridEvery then return end
+  local dueNow = false
+  if GRF.due then local now = os.clock(); for i, t in pairs(GRF.due) do if now >= t then dueNow = true; GRF.due[i] = nil end end end
+  if not dueNow and clock - (X.fgridT or -1e9) < cfg.gridEvery then return end
   X.fgridT = clock
   local t, nb = gridHashes(S, "fg"); if not t then return end
   local ask = {}
@@ -1369,7 +1581,7 @@ local function friendGrid(S, clock)
   end
   if #ask == 0 then return end
   local rows = gridRows(S, "fr", ask)
-  for _, key in ipairs(ask) do local r = rows[key]; if r then sendL("grid", "ST GA " .. key .. " " .. table.concat(r, ",")); bump("g_ask") end end
+  for _, key in ipairs(ask) do local r = rows[key]; if r then sendL("grid", "ST GA " .. key .. " " .. table.concat(r, ",")); bump("g_ask") else bump("g_askNoRows") end end
 end
 X.friendGrid = friendGrid
 
@@ -1469,8 +1681,10 @@ local function onMessage(S, from, kind, w)
   if kind ~= "ST" then return false end
   local sub = w[4]
   if S.role == "friend" and from == "host" then
-    if sub == "GH" then local now = os.clock(); items(w[5], function(i, h) i = tonumber(i); if i then GRF.h[i] = h; GRF.t[i] = now end end)
+    if sub == "GH" then local now = os.clock(); GRF.due = GRF.due or {}; items(w[5], function(i, h) i = tonumber(i); if i then GRF.h[i] = h; GRF.t[i] = now; GRF.due[i] = now + cfg.gridSettle end end)
     elseif sub == "H" then onH(w)
+    elseif sub == "GR" then local ok, e = pcall(friendGridRows, S, w); if not ok then bump("g_err"); X.lastErr = tostring(e) end
+    elseif sub == "GD" then if w[5] and w[6] and w[7] and w[8] then GRF.cl = GRF.cl or {}; GRF.cl[#GRF.cl + 1] = w[5] .. " " .. w[6] .. " " .. w[7] .. " " .. w[8] end
     elseif sub == "GC" then if w[5] and w[6] and w[7] then GRF.rows[w[5] .. " " .. w[6]] = w[5] .. " " .. w[6] .. " " .. w[7]; GRF.rowsT = GRF.rowsT or os.clock() end
     elseif sub == "T" then onT(w)
     elseif sub == "C" then onC(w)
@@ -1494,6 +1708,8 @@ local function onMessage(S, from, kind, w)
         else FS[what] = nil; if X.specSaid ~= (what .. h) then X.specSaid = what .. h; log("the host's %s lists hold %s, this copy's %s: not written", what, tostring(spec), tostring(mine)) end end
       end
     end
+  elseif S.role == "host" and from ~= "host" and sub == "GQ" then
+    local ok, e = pcall(hostGridCells, S, w); if not ok then bump("g_err"); X.lastErr = tostring(e) end
   elseif S.role == "host" and from ~= "host" and sub == "GA" then
     local ok, e = pcall(hostGridAsk, S, w); if not ok then bump("g_err"); X.lastErr = tostring(e) end
   elseif S.role == "host" and from ~= "host" and sub == "ASK" then
@@ -1512,7 +1728,10 @@ C.register("stats", {
     -- a new world: this copy's buildings, the friend's own-entry timers and its store of the host's lists start again
     -- (after a load the lists here are the save's; the digests after ASK ALL say which equal the host's)
     do local f = io.open((rawget(_G, "COOP_LINK_DIR") or "") .. "dev_stats_nowrite.txt", "rb"); X.noWrite = f ~= nil or os.getenv("COOP_STATS_NOWRITE") == "1"; if f then f:close() end end
-    IX = nil; L = nil; X.asked = nil; X.gotSpec = nil; X.fpass = nil; HS.pass = nil; for k in pairs(FS) do FS[k] = nil end
+    IX = nil; L = nil; X.asked = nil; X.gotSpec = nil; X.fpass = nil; HS.pass = nil; HS.firstPassDone = nil; for k in pairs(FS) do FS[k] = nil end
+    -- (lane 64, task 64d) the production subsystem of the world before is not asked again: it may be freed with that
+    -- world (its handle was kept across a load and checked with IsValid alone); readHist finds this world's afresh
+    X.subsys = nil
     for k in pairs(FT) do FT[k] = nil end; for k in pairs(FD) do FD[k] = nil end
     if S.role == "host" then for k in pairs(HT) do HT[k] = nil end; for k in pairs(HE) do HE[k] = nil end; for k in pairs(HM) do HM[k] = nil end; for k in pairs(HQ) do HQ[k] = nil end; for k in pairs(HG) do HG[k] = nil end; for k in pairs(HR) do HR[k] = nil end end
   end,

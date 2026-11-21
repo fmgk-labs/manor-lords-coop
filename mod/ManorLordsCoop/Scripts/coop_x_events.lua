@@ -30,7 +30,7 @@ local A = C.api
 local un, valid = A.un, A.valid
 local E = C.events or {}
 C.events = E
-E.version = "0.22"
+E.version = "0.27"
 E.on = E.on or {}
 local DEFAULT_ON = {
   quests = true,       -- the host's quest lists are pushed and compared
@@ -42,6 +42,7 @@ local DEFAULT_ON = {
   campRemove = true,   -- a camp gone on the host is removed here: the town module's DEMOLISH through the helper lord (lane 12)
   campMake = true,     -- a camp the friend lacks is made here: the engine's own spawnBanditCamp, then moved to the host's place (5 of 5 in sessions 4 to 7)
   campRepair = true,   -- ... and when making or removing fails (or removing is switched off) the friend asks for a resync
+  campLeftover = true, -- (lane 90) E.campAt found no camp after the game's spawn: the one squad that spawn made is asked away at once
   owners = true,       -- the host's region owners are pushed and compared
   ownerSet = true,     -- a region whose owner differs is given to the host's owner here (PawnCPP:finalizeClaim)
   people = true,       -- the host's villagers (name, role, age per family) are pushed and compared
@@ -53,9 +54,10 @@ local DEFAULT_ON = {
   notices = true,      -- lane 64: ... with the cause, and the friend's player gets the game's own death notice (PawnCPP:addLog)
   corpses = true,      -- lane 64: the host's bodies per region are pushed and compared (E PC, E PZ)
   corpseRemove = true, -- lane 64: a body here that the host has not is taken out (RTSMultiEngineCPP:destroyUnit)
+  corpseElsewhere = true, -- (lane 64, task 64d) ... but not one the host has unpaired in another region (the same person lying elsewhere)
   census = true,       -- lane 64: a friend counts its units nobody knows once a minute (logged when the count changes)
   thefts = true,       -- (lane 66) the host's bandit thefts are told (E T); a friend watches its camps' loot for a theft of its own
-
+  animalGone = true,   -- (lane 64, task 64d) an animal of a town gone from the host without a body is told (E AG) and taken out here
 }
 for k, v in pairs(DEFAULT_ON) do if E.on[k] == nil then E.on[k] = v end end
 E.stats = E.stats or {}
@@ -63,6 +65,14 @@ E.S = nil                                              -- a hot reload: state is
 local LISTS = { "quests", "proposedQuests", "questOpportunities" }
 local POLL, KEY, CAMP_EVERY, OWNER_EVERY, PEOPLE_EVERY, CAMP_TYPE = 1.0, 30.0, 3.0, 2.0, 5.0, 100
 local OFFER_WAIT = 3.0       -- (lane 66) an offer the host has and this copy lacks is started after this many seconds
+-- (lane 88) ... but only an offer this copy's own game can make by itself (it would come here a moment later and the
+-- player would get two). Every other offer is started at once: lead runs r27m83 and r27cf, day 365, the host's
+-- "raiders_near" (made by the host's raid countdown; a friend's countdown is held one day behind the host's) came
+-- 4.3 s after the host's (the wait plus two 1 s looks): a list the host did not have for more than 3 s. Known own
+-- offers: "spoils_of_war" (soldiers that loot a bandit camp: SMUnit::proximityAction on every copy). An offer this
+-- copy is seen making by itself (more often here than on the host) is added for the rest of the session (E.ownMade).
+local OWN_OFFERS = { spoils_of_war = true }
+local POLL_HOST = 0.25       -- (lane 88) the host looks at its quest lists this often (a look reads three short lists)
 
 local function log(fmt, ...) A.log("events: " .. fmt, ...) end
 local function bump(k, d) E.stats[k] = (E.stats[k] or 0) + (d or 1) end
@@ -105,16 +115,47 @@ local function qregion(q)
 end
 
 -- the lord's lists as { list = { { n = name, r = region tag }, ... } } (sorted by name) and as one line
+-- (lane 83) the day a quest was issued (Quest.issuedOnDay: with adjustDaysLeftToIssuedDay its countdown counts from it)
+local function qissued(q) local ok, d = pcall(function() return q.issuedOnDay end); return (ok and type(d) == "number") and math.floor(d) or nil end
 local function readQuests(S)
-  local t, parts = {}, {}
+  local t, parts, days = {}, {}, {}
   for _, l in ipairs(LISTS) do
     local a = S.p1[l]; local items = {}
-    for i = 1, #a do local n = qname(a[i]); if n then items[#items + 1] = { n = n, r = qregion(a[i]) } end end
-    table.sort(items, function(x, y) return x.n < y.n end); t[l] = items
-    local e = {}; for i, it in ipairs(items) do e[i] = enc(it.n) .. ":" .. (it.r or "") end
+    for i = 1, #a do local n = qname(a[i]); if n then items[#items + 1] = { n = n, r = qregion(a[i]), d = qissued(a[i]) } end end
+    table.sort(items, function(x, y) if x.n ~= y.n then return x.n < y.n end; return (x.d or -1) < (y.d or -1) end); t[l] = items
+    local e, dd = {}, {}; for i, it in ipairs(items) do e[i] = enc(it.n) .. ":" .. (it.r or ""); dd[i] = it.d and tostring(it.d) or "-" end
     parts[#parts + 1] = #e > 0 and table.concat(e, ",") or "-"
+    days[#days + 1] = #dd > 0 and table.concat(dd, ",") or "-"
   end
-  return t, table.concat(parts, " ")
+  -- (lane 83) the issued days go as a fourth word, in the items' order, lists apart by "|" (an older friend reads three)
+  return t, table.concat(parts, " ") .. " " .. table.concat(days, "|")
+end
+-- (lane 83) friend: a quest the host has with the same name gets the host's issued day (run 22: the friend started the
+-- host's "raiders_near" a moment before its own day change, so its warning counted from day 364, the host's from 365;
+-- equal only after a load). Same names are paired in the order of their days on each copy.
+local function friendIssued(S, H)
+  local n = 0
+  for _, l in ipairs(LISTS) do
+    local want = {}
+    for _, it in ipairs(H[l] or {}) do if it.d then want[it.n] = want[it.n] or {}; want[it.n][#want[it.n] + 1] = it.d end end
+    if next(want) then
+      local a = S.p1[l]; local mine = {}
+      for i = 1, #a do local q = a[i]; local nm = qname(q); if nm and want[nm] then mine[nm] = mine[nm] or {}; mine[nm][#mine[nm] + 1] = q end end
+      for nm, qs in pairs(mine) do
+        local hd = want[nm]; table.sort(qs, function(x, y) return (qissued(x) or -1) < (qissued(y) or -1) end)
+        if #qs == #hd then
+          for k, q in ipairs(qs) do
+            local d = qissued(q)
+            if d and d ~= hd[k] then
+              local ok = pcall(function() q.issuedOnDay = hd[k] end)
+              if ok and qissued(q) == hd[k] then n = n + 1; log("quest %s (%s): issued day %d -> the host's %d", nm, l, d, hd[k]); bump("q_issued") else bump("q_issuedFail") end
+            end
+          end
+        end
+      end
+    end
+  end
+  return n
 end
 
 local function findQuest(S, list, name)
@@ -125,7 +166,7 @@ end
 local function fresh(S)
   if E.S == S and E.world == S.worlds then return end
   E.S = S; E.world = S.worlds
-  E.sentQ = nil; E.tKey = -1e9; E.tPoll = 0; E.hostQ = nil; E.quiet = 0; E.lastDiff = nil; E.tried = {}; E.rows = nil
+  E.sentQ = nil; E.tKey = -1e9; E.tPoll = 0; E.hostQ = nil; E.hostQline = nil; E.quiet = 0; E.lastDiff = nil; E.tried = {}; E.rows = nil
   E.offerSince = {}; E.extraSince = {}; E.extraDone = {}; E.extraShut = {}; E.extraBase = nil
   E.sentK = nil; E.tKeyK = -1e9; E.tCamp = 0; E.scan = nil; E.hostK = nil; E.campSince = {}; E.campAsked = {}
   E.campGone = {}; E.hostKline = nil; E.listSig = nil; E.tQuick = 0
@@ -137,6 +178,7 @@ local function fresh(S)
   E.vSeen = {}; E.sentC = {}; E.tKeyC = -1e9; E.tCorpse = 0; E.tCorpseF = 0; E.hostC = {}; E.cState = {}; E.askedCorpses = false; E.tCensus = os.clock(); E.censusSig = nil; E.censusOdd = nil   -- lane 64: corpses, census
   E.vill = nil; E.tVill = 0; E.pdQ = {}
   E.animalBodies = {}; E.lastAnimalDeath = 0
+  E.animalLive = {}; E.lastAnimalGone = 0; E.animalTot = {}; E.animalScanT = {}            -- (task 64d) animals gone without a body
   E.campMap = nil; E.loot = {}; E.tTheft = 0; E.theftN = 0; E.theftSeen = {}; E.theftWant = {}; E.theftDay = nil; E.ownGrow = {}
   log("reset for world %d", S.worlds)
 end
@@ -151,19 +193,50 @@ local function hostQuests(S, clock)
 end
 
 local function index(items) local s = {}; for _, it in ipairs(items) do s[it.n] = it end; return s end
+-- (lane 88) can this copy's own game offer this quest by itself? (then the host's is started only after OFFER_WAIT)
+function E.ownOffer(name) return OWN_OFFERS[name] == true or (E.ownMade ~= nil and E.ownMade[name] == true) end
 
--- the presets the director can start (row names of its quest table); a quest with another name cannot be started by name
-local function isPreset(S, name)
-  if not E.rows then
-    E.rows = {}
+-- the presets the director can start (row names of its quest table). (lane 81) A quest's own name is not always its
+-- row's name: the row "weapons_delivery_complete" makes the quest "weapons_delivery" (live u4d: the host's offer
+-- of it never reached the friend: no row of that name). Of the table's 47 rows, 3 more do so (victory_conquest_OLD,
+-- techQuest_21_1, restoring_the_peace_storyonly). The table is the game's own data, the same on every copy, so each
+-- copy reads it once: the row of a quest name is the row of that name, else the ONE row whose quest has that name.
+-- A name made by more than one row of other names (live: "No_Title" by three message rows) is not guessed: not
+-- started, as before (logged once). presetOf(S, name) returns the row to start, or nil.
+local function readRows(S)
+  E.rows = {}; E.rowOf = {}
+  local byQ = {}
+  pcall(function()
+    S.eng.questDirector.DT_Quests:ForEachRow(function(rowName, row)
+      local rn = type(rowName) == "string" and rowName or nil; if not rn then pcall(function() rn = rowName:ToString() end) end   -- (live: the row name comes as a Lua string)
+      if rn and rn ~= "" then
+        E.rows[rn] = true
+        local qn; pcall(function() qn = row.Name:ToString() end)
+        if qn and qn ~= "" and qn ~= rn then byQ[qn] = byQ[qn] or {}; local t = byQ[qn]; t[#t + 1] = rn end
+      end
+    end)
+  end)
+  if next(E.rows) == nil then                   -- the older way (row names only), should the table walk not work
     pcall(function()
       local names = {}
       StaticFindObject("/Script/Engine.Default__DataTableFunctionLibrary"):GetDataTableRowNames(S.eng.questDirector.DT_Quests, names)
       for i = 1, #names do local n = names[i]; local s; pcall(function() s = n:get():ToString() end); if not s then pcall(function() s = n:ToString() end) end; if s then E.rows[s] = true end end
     end)
   end
-  return E.rows[name] == true
+  local amb = {}
+  for qn, t in pairs(byQ) do
+    if #t == 1 or E.rows[qn] then E.rowOf[qn] = t[1] else table.sort(t); amb[#amb + 1] = qn .. " (" .. table.concat(t, ",") .. ")" end
+  end
+  local nm = 0; for _ in pairs(E.rowOf) do nm = nm + 1 end
+  table.sort(amb)
+  log("quest table: %d rows, %d quest names made by one row of another name; not started (made by several): %s", (function() local n = 0; for _ in pairs(E.rows) do n = n + 1 end; return n end)(), nm, #amb > 0 and table.concat(amb, "; ") or "none")
 end
+local function presetOf(S, name)
+  if not E.rows then readRows(S) end
+  if E.rows[name] then return name end
+  return E.rowOf and E.rowOf[name] or nil
+end
+E.presetOf = presetOf
 
 -- friend: start here what the host has (the director's own function), and say what still differs
 -- (lane 66) is a quest message (questMessageElaborate_C) on screen? One the mod closed (taken out of its grid) keeps its
@@ -200,18 +273,24 @@ local function friendQuests(S, clock)
           -- 4dcd8c5: collapseBuilding, then Director startQuestFromPreset "spoils_of_war" for the soldiers' lord). The
           -- host's word comes about as fast as this copy's own offer (live, 2026-11-17: the mod's start 0.1 s before the
           -- camp went here, this copy's own offer a second later: two offers, two messages).
-          if want and offer then
+          if want and offer and E.ownOffer(it.n) then
             local sk = l .. "|" .. it.n .. "|" .. (mineN + 1)
             E.offerSince[sk] = E.offerSince[sk] or clock
             if clock - E.offerSince[sk] < OFFER_WAIT then want = false; E.tPoll = clock - POLL + 0.5 end
           end
-          if want and not done[it.n] and isPreset(S, it.n) then
+          local preset = want and not done[it.n] and presetOf(S, it.n)
+          if preset then
             done[it.n] = true; E.tried[key] = tried + 1    -- one per second
             local D = S.eng.questDirector
-            local reg = (it.r and regionByKey(S, it.r)) or S.p1:getClosestOwnedRegion()
-            local ok, r = pcall(function() return D:startQuestFromPreset(FName(it.n), S.p1, {}, reg, offer, -1) end)
+            -- (lane 83) the host's region, or NONE when the host's record has none: the game's own "raiders_near" has
+            -- an empty region list, and this line used to give the friend's copy the lord's closest region (run 22,
+            -- day 365: host 0 regions, friend 1). The closest region stays only for a region the host named that this
+            -- copy cannot find.
+            local reg = nil
+            if it.r then reg = regionByKey(S, it.r) or S.p1:getClosestOwnedRegion() end
+            local ok, r = pcall(function() return D:startQuestFromPreset(FName(preset), S.p1, {}, reg, offer, -1) end)
             S.modQuestT = os.clock()                             -- the speed watcher (coop.lua): the game answers a new quest message with one speed step down; that is not the player's
-            log("quest %s (%s on the host): started here%s", it.n, offer and "offered" or "running", (ok and r) and "" or (" FAILED " .. tostring(r))); bump("q_started")
+            log("quest %s (%s on the host): started here%s%s", it.n, offer and "offered" or "running", preset ~= it.n and (" from the row " .. preset) or "", (ok and r) and "" or (" FAILED " .. tostring(r))); bump("q_started")
           end
         end
       end
@@ -226,6 +305,7 @@ local function friendQuests(S, clock)
   end
   table.sort(diff); local d = table.concat(diff, " ")
   if d ~= E.lastDiff then E.lastDiff = d; if d == "" then log("quests equal to the host's") else log("quests differ from the host's: %s", d); bump("q_diff") end end
+  do local okI, eI = pcall(friendIssued, S, H); if not okI then bump("q_issuedErr"); if E.issuedErr ~= tostring(eI) then E.issuedErr = tostring(eI); log("issued days: %s", tostring(eI)) end end end   -- (lane 83)
   -- (lane 66) an offer this copy has more often than the host: its game made one of its own. The extra entry cannot be
   -- taken out of the lord's list by name (the game's removal and answer calls take the quest record by reference, which
   -- a script cannot hand over), and an answered offer stays in the list on every copy anyway; what the player sees and
@@ -242,6 +322,10 @@ local function friendQuests(S, clock)
     for n, k in pairs(cM) do
       local extra = k - (cH[n] or 0) - (E.extraShut[n] or 0)   -- (lane 66 run 1) an extra entry stays in the list after its message was closed: counted once
       local ek = n .. "|" .. k
+      if extra > 0 and not E.ownOffer(n) then                  -- (lane 88) this copy's game makes this offer by itself: wait for it from now on
+        E.ownMade = E.ownMade or {}; E.ownMade[n] = true; bump("q_ownLearned")
+        log("quest %s: this copy's own game offered it (%d here, %d on the host): the host's next one of it is started only after %.1f s", n, k, cH[n] or 0, OFFER_WAIT)
+      end
       if extra > 0 then
         E.extraSince[ek] = E.extraSince[ek] or clock
         if clock - E.extraSince[ek] >= 2.0 and not E.extraDone[ek] then
@@ -289,7 +373,7 @@ local function wshown(w) local ok, v = pcall(function() return w:IsVisible() end
 local function pressAnswer(name, verb)
   for _, w in ipairs(FindAllOf("MessageFullscreen_C") or {}) do
     if valid(w) and wshown(w) and wquest(w) == name then
-      E.replayT = os.clock() + 1.5
+      E.replayT = os.clock() + 1.5; E.replayQ = { n = name, v = verb }
       w[BUTTON[verb]](w)
       return true
     end
@@ -310,7 +394,7 @@ local function doAnswer(S, verb, name, done)
     end
   end
   if not scroll then done(false, "no message for this quest on this copy"); return end
-  E.replayT = os.clock() + 3.0
+  E.replayT = os.clock() + 3.0; E.replayQ = { n = name, v = verb }
   local okS, eS = pcall(function() scroll[SCROLL](scroll) end)
   if not okS then done(false, "the scroll could not be opened: " .. tostring(eS)); return end
   local tries = 0
@@ -327,11 +411,15 @@ end
 function E.seen(fn, self, a1)
   local S = C.s
   if fn ~= "acceptQuest" and fn ~= "refuseQuest" then return end
-  if not (S and S.on and E.on.answers) or os.clock() < (E.replayT or 0) or rawget(C, "hold") then return end
+  if not (S and S.on and E.on.answers) or rawget(C, "hold") then return end
   local okL, isLord = pcall(function() return self:get():GetAddress() == S.p1:GetAddress() end)
   if not (okL and isLord) then return end
   local verb = fn == "acceptQuest" and "A" or "R"
   local a = qname(a1:get()); if not a then return end
+  -- (lane 81) the answer the mod is replaying here is told by WHAT it is (that quest, that answer), not by time alone:
+  -- before, every answer of this player to ANY quest in the 1.5 to 3 s after a replayed answer was dropped
+  local Q = E.replayQ
+  if Q and os.clock() < (E.replayT or 0) and Q.n == a and Q.v == verb then bump("q_replayEcho"); return end
   bump("q_seen")
   if S.role == "friend" then
     A.send(string.format("E %s %s", verb, enc(a))); E.quiet = os.clock() + 3.0
@@ -501,9 +589,34 @@ end
 -- Here the building goes to the host's camp place and the game's own squad becomes the host's squad: its men are put
 -- at the host's squad's place in the same frame and sent there (the caller ties it to the host's number). Returns the
 -- squad's handle, or nil and why.
+-- (lane 90) THE TRY'S LEFT-OVER SQUAD. l83r7c, day 361: spawnBanditCamp made its squad of brigands (a new squad of
+-- the bandit lord) but no new camp was in the building list in that frame ("the game made no camp"). The core then
+-- made the host's squad itself, and the game's squad of the try stood beside it, holding a camp at the place the
+-- game rolled: the next full list found it "exists here but not on the host", the 4 s rule took 4.2 s, and the
+-- bandits read 72 (once 90) here against the host's 54. That squad is asked away at once, as campMake does with the
+-- camp's own squad (lane 48, round 3): this copy made it in this frame, nothing of it is in the air. The camp it holds
+-- is then taken away by the camp rule (its squad first, the camp after: lane 12). Only when the list was read before
+-- and after the try and exactly one squad is new; never a squad tied to a host number. -> text for the caller's log
+local function campLeftover(S, owner, before)
+  local okA, fresh = pcall(function()
+    local t, a = {}, owner.commandedSquads
+    for i = 1, #a do local v = a[i].Value; if v and v ~= 0 and not before[v] and not (S.l2h and S.l2h[v]) then t[#t + 1] = v end end
+    return t
+  end)
+  if not okA then return "; the bandit lord's squads could not be read after the try: nothing asked away" end
+  if #fresh == 0 then return "" end
+  if #fresh > 1 then return string.format("; %d new squads of the bandit lord after the try: none asked away", #fresh) end
+  local v = fresh[1]
+  if not E.on.campLeftover then return string.format("; the try's squad %d is left (item campLeftover is off)", v) end
+  S.madeHere = S.madeHere or {}; S.madeHere[v] = true
+  S.rmDone = S.rmDone or {}; S.rmDone[v] = os.clock()            -- the core's own removal does not ask a second time
+  local okR, e = pcall(function() S.sc:RequestRemoveSquad({ Value = v }) end)
+  bump("k_leftover")
+  return string.format("; the try's own squad %d asked away at once%s", v, okR and "" or (" (FAILED: " .. tostring(e) .. ")"))
+end
 function E.campAt(S, bx, by, bz, sx, sy, sz, owner)
   local before = {}
-  pcall(function() local a = owner.commandedSquads; for i = 1, #a do before[a[i].Value] = true end end)
+  local okBefore = pcall(function() local a = owner.commandedSquads; for i = 1, #a do before[a[i].Value] = true end end)
   local bb = {}
   pcall(function() local arr = S.eng.buildingArr; for i = 1, #arr do local b = un(arr[i]); if valid(b) then bb[addr(b)] = true end end end)
   S.eng:spawnBanditCamp()
@@ -513,7 +626,7 @@ function E.campAt(S, bx, by, bz, sx, sy, sz, owner)
     local b = un(arr[i])
     if valid(b) and not bb[addr(b)] and b:GetType() == CAMP_TYPE and ownerCode(S, b.ownerPawn) == "B" then new = b; break end
   end
-  if not new then return nil, "the game made no camp" end
+  if not new then return nil, "the game made no camp" .. (okBefore and campLeftover(S, owner, before) or "; the bandit lord's squads were not read before the try: nothing asked away") end
   new:K2_SetActorLocation({ X = bx, Y = by, Z = bz }, false, {}, true)
   local key = bkey(new); E.campAsked[key] = true      -- the camp list will find it here: nothing more to make
   local h
@@ -1441,15 +1554,36 @@ end
 local function animalRole(role)
   return role and ((role >= 8 and role <= 16) or (role >= 19 and role <= 22))
 end
--- An OX (12) is never killed or made dead from here. Measured on lane 2 (2026-11-18): SMUnit:just_die on one ox just
--- made, and nothing else, ended the host's copy and the friend's within 3 s (sitting an4: access violation reading
--- 0xD88). Two earlier sittings ended the same way after an ox died among other kinds (an3: chicken, sheep, lamb, ox,
--- cow, calf, of which all but the ox were killed alone later without harm; an2: all kinds). The other farm kinds
--- were killed the same way without harm. An ox the host no longer has is taken out by the facts module's count (no
--- body here). DEER (8) and HARE (20) are wild and no town
--- animals (Region.residents has none). The one run that carried a death of each (an2) ended in the ox crash, so they
--- are left alone too until someone tests them alone.
-local function animalKillable(role) return animalRole(role) and role ~= 12 and role ~= 8 and role ~= 20 end
+-- THE OX (12). SMUnit:just_die on a working ox ends the copy within seconds, and the plain game does the same with
+-- the mod not loaded (lane 2, sitting ox1: access violation reading 0xD88, the same frames as in an2, an3, an4).
+-- READ: a villager is "reserved as ox guide" by a link to its ox (+330h, not reflected); just_die sets the ox's own
+-- region (+328h) to 0 and leaves the guide's link; the guide's next idle tick (4E057F0 -> newTask_setGuideTask
+-- 4E15AB0) takes a problem off that region: a read of 0 + D88h. The engine's destroyUnit clears every such link
+-- (4CAD613). Measured in ox1: an ox that was made and killed in one call (it never lived a tick, no guide holds it)
+-- and a working ox whose guide's link was cleared first both left a body and the copy ran on for 7 game days.
+-- So a host's ox death is carried out here as: the engine's destroyUnit on this copy's living ox, then a new ox made
+-- at its place and killed in the same call (oxDies). just_die is never called on an ox that has lived a tick.
+-- THE HARE (20) is wild: no town's list holds it (Region.residents has none) and its own region is a region without
+-- a town. Measured (ox2, rl5, px1): both copies have the same number of hares per region (104 in five regions), a
+-- hare's reflected currentRegion is its own region (104 of 104), a host hare killed with just_die leaves its body on
+-- that region's corpse list, and the game itself puts a new hare there within 15 to 46 s. A host hare death is
+-- carried out on the nearest living hare of that region here (just_die: no link names a hare). The engine's
+-- SpawnLivestock does make a hare (px1), so a body this copy lacks after a reload is made like any other.
+-- DEER (8): the test save has no deer unit at all, so no deer death was measured; a deer is left alone.
+local function wildRole(role) return role == 20 end
+local function animalKillable(role) return animalRole(role) and role ~= 8 end
+local function wildAnimals(S, reg, role)
+  local list, units, ra = {}, S.eng.unitArr, addr(reg)
+  for i = 1, #units do
+    local raw = units[i]
+    local u = ptrOk(raw) and un(raw) or nil
+    if u and valid(u) and not u.dead and u.currentUnitRole == role then
+      local cr = u.currentRegion
+      if ptrOk(cr) and valid(cr) and addr(cr) == ra then list[#list + 1] = u end
+    end
+  end
+  return list
+end
 -- The town's own list (Region.residents) is what the game counts its livestock by (measured: equal to
 -- GetTotalLivestockCountOfType for six kinds on both copies). SMUnit.currentRegion is where the animal stands: an
 -- animal the facts module made beside a building of another region was "elsewhere", stayed alive and kept its count.
@@ -1500,9 +1634,10 @@ local function friendAnimalDeath(S, w)
   for _, e in ipairs(seen) do if e.role == role then count = count + 1 end end
   if count >= bodies then return end  -- a replay overlapping the save, or a death already carried in combat
   name, x, y, z = dec(name), tonumber(x), tonumber(y), tonumber(z)
-  local live = livingAnimals(S, reg, role)
+  local wild = wildRole(role)
+  local live = wild and wildAnimals(S, reg, role) or livingAnimals(S, reg, role)
   local victim, spawned
-  if #live > living then
+  if #live > living or (wild and #live > 0) then
     local best, distance, tied = -1, math.huge, false
     for _, u in ipairs(live) do
       if valid(u) then
@@ -1522,25 +1657,154 @@ local function friendAnimalDeath(S, w)
     if valid(victim) and (tied or (best <= 1 and distance > 100^2)) then bump("animalNearest") end
   else
     -- No spare living animal here. Preserve the host's survivors and create only the missing body.
-    victim = S.eng:SpawnLivestock(role, {X=x, Y=y, Z=z}, reg)
+    -- (made and killed in the same call: an ox that lived a tick may have a guide, and its just_die ends the copy)
+    pcall(function()
+      victim = S.eng:SpawnLivestock(role, {X=x, Y=y, Z=z}, reg)
+      if valid(victim) then victim:just_die() end
+    end)
     spawned = true
+    if valid(victim) and not victim.dead then pcall(function() S.eng:destroyUnit(victim) end); bump("animalFailed"); return end
   end
-  if not valid(victim) or victim.dead then bump("animalUnmatched"); log("animal death: %s role %d had no identified animal here", w[6], role); return end
-  local ok = pcall(function() victim:just_die() end)
+  if not valid(victim) or (victim.dead and not spawned) then bump("animalUnmatched"); log("animal death: %s role %d had no identified animal here", w[6], role); return end
+  if role == 12 and not spawned then
+    -- a living ox is never killed (see animalKillable): it is taken out with its guide's link, and its body is made
+    local px, py, pz = placeOf(victim)
+    if not px then bump("animalFailed"); return end
+    local gone = pcall(function() S.eng:destroyUnit(victim) end)
+    if not gone then bump("animalFailed"); log("animal death: %s: this copy's ox could not be taken out; nothing done", w[6]); return end
+    victim, spawned = nil, true
+    local made = pcall(function()
+      victim = S.eng:SpawnLivestock(role, { X = px + 0.0, Y = py + 0.0, Z = pz + 0.0 }, reg)
+      if valid(victim) then victim:just_die() end
+    end)
+    if not made or not valid(victim) or not victim.dead then
+      if valid(victim) and not victim.dead then pcall(function() S.eng:destroyUnit(victim) end) end
+      bump("animalFailed"); log("animal death: %s: the ox was taken out here, its body could not be made", w[6]); return
+    end
+    bump("oxReplaced")
+  end
+  local ok = victim.dead or pcall(function() victim:just_die() end)
   if not ok or not valid(victim) or not victim.dead then
     if spawned and valid(victim) and not victim.dead then S.eng:destroyUnit(victim) end
     bump("animalFailed"); return
   end
   if victim.DisplayName:ToString() ~= name then victim.DisplayName = name end
   bump("animalDied"); log("animal death: %s role %d died here on the host's word", w[6], role)
+  -- (lane 76, task 76h) the facts module owns the town's animal count: it is told, so that it makes no animal in the
+  -- moment before the host's count line follows the death
+  pcall(function() local Fm = rawget(C, "facts"); if Fm and Fm.liveDied then Fm.liveDied(w[6], role) end end)
+end
+-- (lane 64, task 64d) AN ANIMAL GONE WITHOUT A BODY. An animal of a town that the game takes out without a death (a
+-- sale, any destroyUnit of the game's own) leaves no body, so no E AD line: a friend lost it only by the facts
+-- module's count rule, after cfg.liveSettle (25 s; a rival's town 5 s), longer than the owner's 3 s. Now the host
+-- tells it at its next look (CORPSE_EVERY): an animal that was on the town's list (Region.residents) at the look before
+-- and is no longer a unit of the engine at all (not in this tick's unit list, read by address only):
+--   E AG <serial> <region> <role> '<name> <living of that kind now> <x>,<y>,<z> <job board key or ->
+-- Not told: an animal that died (its body stays a unit: the E AD line is its word), one that only left the town's list
+-- (it is still a unit), wild animals (hares, deer), the young (lamb 11, calf 22: whether the game grows them up by a
+-- new unit was not read; each copy's own game grows its own), and an animal whose home building has left the game's
+-- list too (a demolished or burnt house or pen: the host's DEMOLISH or fire word takes this copy's animals with it; an
+-- extra one taken here would be one too many). A friend takes out the same animal the death rule would choose (the
+-- host's name, then the job board's place, then the nearest of the kind) with the engine's destroyUnit (no body; for
+-- an ox it clears the guide's link), only while it has more of that kind than the host has now.
+local GONE_SKIP = { [11] = true, [22] = true }
+-- (cost: the scan of a town's list read every unit's fields once a second: 0.68 ms a frame on the host of session
+-- l64pin12. Now the town's own animal count (one call) is asked first and the list is read again only when that count
+-- changed, or 10 s after the last read. An animal that left in the same second another came keeps the count: it is
+-- told at the next full read, up to 10 s later, and a friend that already has no more than the host does nothing.)
+local function hostAnimalsGone(S, R, U)
+  local tot = nil; pcall(function() tot = R.r:getTotalLivestockCount() end)
+  local clock = os.clock()
+  if E.animalLive[R.k] and tot and tot == E.animalTot[R.k] and clock - (E.animalScanT[R.k] or -1e9) < 10.0 then return end
+  E.animalTot[R.k] = tot; E.animalScanT[R.k] = clock
+  local now = {}
+  local res = R.r.residents; local n = #res
+  for i = 1, n do
+    local raw = res[i]; local u = ptrOk(raw) and un(raw) or nil
+    if u and valid(u) and not u.dead then
+      local role = tonumber(u.currentUnitRole)
+      if animalKillable(role) and not wildRole(role) and not GONE_SKIP[role] then
+        local a = addr(u)
+        if a then
+          local x, y, z = placeOf(u); local nm = ""; pcall(function() nm = u.DisplayName:ToString() end)
+          local entry = C.jobs and C.jobs.byAddr and C.jobs.byAddr[a]
+          local home = nil; pcall(function() local h = u.animalAssignedTo; if ptrOk(h) and valid(h) then home = addr(h) end end)
+          now[a] = { role = role, n = nm, x = x, y = y, z = z, key = entry and entry.key or "-", home = home }
+        end
+      end
+    end
+  end
+  local old = E.animalLive[R.k]
+  E.animalLive[R.k] = now
+  if not old then return end
+  for a, e in pairs(old) do
+    if not now[a] and e.x then
+      if not U.set then
+        U.set = {}
+        local arr = S.eng.unitArr; local m = #arr
+        for i = 1, m do local raw = arr[i]; local u = ptrOk(raw) and un(raw) or nil; local ua = u and addr(u); if ua then U.set[ua] = true end end
+      end
+      local homeGone = false
+      if not U.set[a] and e.home then
+        if not U.bset then
+          U.bset = {}
+          local arr = S.eng.buildingArr or {}; local m = #arr
+          for i = 1, m do local raw = arr[i]; local b = ptrOk(raw) and un(raw) or nil; local ba = b and addr(b); if ba then U.bset[ba] = true end end
+        end
+        homeGone = not U.bset[e.home]
+        if homeGone then bump("animalGoneWithHome"); log("animal gone: %s role %d left with its home building (demolished or burnt): not told", R.k, e.role) end
+      end
+      if not U.set[a] and not homeGone then
+        local living = 0; for _, x in pairs(now) do if x.role == e.role then living = living + 1 end end
+        E.goneSerial = (E.goneSerial or 0) + 1
+        A.send(string.format("E AG %d %s %d '%s %d %d,%d,%d %s", E.goneSerial, R.k, e.role, enc(e.n), living,
+            math.floor(e.x + 0.5), math.floor(e.y + 0.5), math.floor((e.z or 0) + 0.5), e.key))
+        bump("animalGoneSent")
+        log("animal gone: %s role %d left the town without a body (no longer a unit): told (%d of the kind left)", R.k, e.role, living)
+      end
+    end
+  end
+end
+local function friendAnimalGone(S, w)
+  local serial, role, name = tonumber(w[5]), tonumber(w[7]), (w[8] or ""):match("^'(.*)$")
+  local living = tonumber(w[9])
+  local x, y = (w[10] or ""):match("^(%-?%d+),(%-?%d+),%-?%d+$")
+  if not serial or serial <= (E.lastAnimalGone or 0) or not animalKillable(role) or wildRole(role) or GONE_SKIP[role] or role ~= math.floor(role)
+      or not name or not living or living < 0 or not x or not valid(S.eng) then return end
+  E.lastAnimalGone = serial
+  local reg = regionByKey(S, w[6]); if not valid(reg) then return end
+  local live = livingAnimals(S, reg, role)
+  if #live <= living then bump("animalGoneEqual"); return end   -- no more of the kind here than the host has now
+  name, x, y = dec(name), tonumber(x), tonumber(y)
+  local victim, best, distance = nil, -1, math.huge
+  for _, u in ipairs(live) do
+    if valid(u) then
+      local key = C.jobs and C.jobs.byAddr and C.jobs.byAddr[addr(u)]
+      local ux, uy = placeOf(u)
+      local d = ux and (ux - x)^2 + (uy - y)^2 or math.huge
+      local rank = 0; pcall(function() if name ~= "" and u.DisplayName:ToString() == name then rank = 2 end end)
+      if (key and key.key or "-") == (w[11] or "-") then rank = rank + 1 end
+      if rank > best or (rank == best and d < distance) then victim, best, distance = u, rank, d end
+    end
+  end
+  if not valid(victim) then bump("animalGoneUnmatched"); log("animal gone: %s role %d had no animal to take out here", w[6], role); return end
+  local ok, er = pcall(function() S.eng:destroyUnit(victim) end)
+  if not ok then bump("animalGoneFailed"); log("animal gone: %s role %d: destroyUnit failed here (%s)", w[6], role, tostring(er)); return end
+  bump("animalGone"); log("animal gone: %s role %d left the host's town without a body: taken out here (destroyUnit), %d of the kind left on the host", w[6], role, living)
+  -- the facts module's count line may still show the host's count of before for a moment: no stand-in for 1.5 s
+  pcall(function() local Fm = rawget(C, "facts"); if Fm and Fm.liveDied then Fm.liveDied(w[6], role) end end)
 end
 local function hostCorpses(S, clock)
   local key = clock - (E.tKeyC or -1e9) >= KEY; if key then E.tKeyC = clock end
   local none = {}
+  local U = {}                                                -- (task 64d) this tick's unit addresses, read once when needed
   for _, R in ipairs(allRegions(S)) do
     local ok, list, complete = pcall(corpsesOf, R.r)
     if ok then
-      if complete and E.on.vdeaths then hostAnimalDeaths(S, R, list) end
+      if complete and E.on.vdeaths then
+        hostAnimalDeaths(S, R, list)
+        if E.on.animalGone then local okG, eG = pcall(hostAnimalsGone, S, R, U); if not okG then bump("animalGoneErr"); E.lastErr = "animal gone: " .. tostring(eG) end end
+      end
       local parts, ages, hasAge, len, whole = {}, {}, false, 0, complete and 1 or 0
       for _, e in ipairs(list) do
         local p = string.format("%s~%d~%d~%d", enc(e.n), e.role, math.floor((e.x or 0) + 0.5), math.floor((e.y or 0) + 0.5))
@@ -1574,6 +1838,7 @@ end
 -- animal body back (the host had 2, the reloaded friend 0), and a death line can find no animal to kill. The body is
 -- made the way the death line makes it: the engine's own SpawnLivestock at the host's place, then the game's own
 -- just_die. The host's list has no height: the nearest unit's height stands in for the ground.
+local BODY_MAX = 12
 local function makeAnimalBody(S, reg, role, h)
   local z, best = nil, math.huge
   local units = S.eng.unitArr
@@ -1604,9 +1869,32 @@ local function friendCorpses(S, clock)
   if S.replay then return end
   local waiting = next(E.pdQ) ~= nil
   local taken = 0
-  for _, R in ipairs(allRegions(S)) do
+  -- (lane 64, task 64d; research/.../lane_s21_64/design_deathregion.txt) every region's bodies first, and for each role
+  -- and name the host's bodies that no body of this copy pairs with in THEIR region. A person's body here that the
+  -- host has not in this region but has unpaired in another one is the same person lying elsewhere (a fight across a
+  -- border: l64pin20, sel and wald): it is not taken out, as many of them as the host has unpaired. Taken out, a
+  -- person's body is never made again here (only an animal's is), and the units count stays short for as long as the
+  -- host's body lies (lane 83's run A fits that: unproven). A body the host removed goes as before; a true extra goes
+  -- as before; a kept one goes by the rule as before once the host's pair is gone.
+  local regions, pre, elsewhere = allRegions(S), {}, {}
+  if E.on.corpseElsewhere ~= false then
+    for _, R in ipairs(regions) do
+      local okP, listP, completeP = pcall(corpsesOf, R.r)
+      pre[R.k] = { ok = okP, list = listP, complete = completeP }
+      local H = E.hostC[R.k]
+      if okP and completeP and H and H.whole then
+        local hk, lk = {}, {}
+        for _, h in ipairs(H.list) do local k = h.role .. "~" .. h.n; hk[k] = (hk[k] or 0) + 1 end
+        for _, e in ipairs(listP) do local k = e.role .. "~" .. e.n; lk[k] = (lk[k] or 0) + 1 end
+        for k, n in pairs(hk) do local d = n - (lk[k] or 0); if d > 0 then elsewhere[k] = (elsewhere[k] or 0) + d end end
+      end
+    end
+  end
+  for _, R in ipairs(regions) do
     local H = E.hostC[R.k]
-    local ok, list, complete = pcall(corpsesOf, R.r)
+    local P0 = pre[R.k]
+    local ok, list, complete
+    if P0 then ok, list, complete = P0.ok, P0.list, P0.complete else ok, list, complete = pcall(corpsesOf, R.r) end
     if H and ok then
       -- per role: the host's count and names; this copy's bodies
       local hostN, hostNames, hostDays, mine, localNames = {}, {}, {}, {}, {}
@@ -1676,7 +1964,9 @@ local function friendCorpses(S, clock)
       if missing > 0 and st.missT and clock - st.missT < 0.4 then E.tCorpseF = clock - CORPSE_EVERY + 0.45 end   -- look again as soon as the wait is over
       if missing > 0 and not waiting and complete and H.whole and E.on.vdeaths and not C.hold and st.missT
           and clock - st.missT >= 0.4 and clock - (S.worldT or 0) >= 1.0 and clock - (st.bodyTry or -1e9) >= 5.0 then   -- (an5: with 1.0 and 3.0 the bodies were back 3.3 s after a reload)
-        local tried = 0
+        -- (ox2: six animal bodies after a reload came three at 1.2 s and three at 6.7 s: at most CORPSE_MAX were made at
+        --  one look and the next look waited 5 s. Up to BODY_MAX are made at one look; the 5 s wait follows a failure only.)
+        local tried, madeN = 0, 0
         for role, n in pairs(hostN) do
           local have = mine[role] and #mine[role] or 0
           if animalKillable(role) and n > have and clock - (st.lost[role] or -1e9) >= 2.5 then
@@ -1688,16 +1978,28 @@ local function friendCorpses(S, clock)
               end
             end
             for i = 1, math.min(#lack, n - have) do
-              if tried < CORPSE_MAX and lack[i].x and lack[i].y then
+              if tried < BODY_MAX and lack[i].x and lack[i].y then
                 tried = tried + 1
-                if makeAnimalBody(S, R.r, role, lack[i]) then taken = taken + 1 end
+                if makeAnimalBody(S, R.r, role, lack[i]) then taken = taken + 1; madeN = madeN + 1 end
               end
             end
           end
         end
-        if tried > 0 then st.bodyTry = clock; st.missT = nil end
+        if tried > 0 then st.bodyTry = madeN == tried and (clock - 4.5) or clock; st.missT = nil end
       end
       -- bodies here that the host has not
+      -- (lane 64, task 64d) a person's body the host has unpaired in another region stays (see the head of this function)
+      if #surplus > 0 and E.on.corpseElsewhere ~= false then
+        local rest = {}
+        for _, e in ipairs(surplus) do
+          if not e.hostRemoved and not animalKillable(e.role) and (elsewhere[e.key] or 0) > 0 then
+            elsewhere[e.key] = elsewhere[e.key] - 1; bump("c_elsewhere")
+            E.elseSaid = (E.elseSaid or 0) + 1
+            if E.elseSaid <= 10 then log("corpses: %s: the body of %s (role %d) at %d,%d is not on the host's list of this region, and the host has one of that role and name unpaired in another region: kept (the same person lying elsewhere)", R.k, e.n ~= "" and e.n or "?", e.role, math.floor((e.x or 0) / 100), math.floor((e.y or 0) / 100)) end
+          else rest[#rest + 1] = e end
+        end
+        surplus = rest
+      end
       if #surplus > 0 and complete and H.whole and not waiting and E.on.corpseRemove then
         local sig = #surplus .. "/" .. #list .. "/" .. #H.list
         if st.sig ~= sig then st.sig = sig; st.t = clock end
@@ -2048,7 +2350,7 @@ function M.tick(S, clock)
     elseif clock - (E.tCorpseF or 0) >= CORPSE_EVERY then E.tCorpseF = clock; guarded("corpses", friendCorpses, S, clock) end
   end
   if not host and E.on.census and clock - (E.tCensus or 0) >= 60.0 then E.tCensus = clock; friendCensus(S, clock) end
-  if clock - E.tPoll < POLL then return end
+  if clock - E.tPoll < (host and POLL_HOST or POLL) then return end
   E.tPoll = clock
   if E.on.quests then guarded("quests", host and hostQuests or friendQuests, S, clock) end
 end
@@ -2060,12 +2362,18 @@ function M.onMessage(S, from, kind, w, line)
     local sub = w[4]
     if sub == "Q" then
       local H = {}
+      local dayParts = {}; for p in ((w[8] or "") .. "|"):gmatch("([^|]*)|") do dayParts[#dayParts + 1] = p end   -- (lane 83)
       for i, l in ipairs(LISTS) do
         local items = {}; local s = w[4 + i] or "-"
         if s ~= "-" then for n, r in s:gmatch("([^,:]+):([^,]*)") do items[#items + 1] = { n = dec(n), r = r ~= "" and r or nil } end end
+        local dl = {}; for d in (dayParts[i] or ""):gmatch("[^,]+") do dl[#dl + 1] = tonumber(d) or false end
+        if #dl == #items then for k, it in ipairs(items) do it.d = dl[k] or nil end end
         H[l] = items
       end
       E.hostQ = H
+      -- (lane 88) a changed list from the host is looked at in this copy's next tick, not up to 1 s later
+      local qline = table.concat({ w[5] or "-", w[6] or "-", w[7] or "-" }, " ")
+      if qline ~= E.hostQline then E.hostQline = qline; E.tPoll = -1e9 end
     elseif sub == "DID" then
       local ok, e = pcall(friendDid, S, w); if not ok then log("answer from the host failed: %s", tostring(e)) end
     elseif sub == "POP" then
@@ -2099,6 +2407,8 @@ function M.onMessage(S, from, kind, w, line)
       if E.on.thefts then local ok, e = pcall(friendTheft, S, w); if not ok then log("thefts: the host's line failed here: %s", tostring(e)) end end
     elseif sub == "AD" then
       if E.on.vdeaths and not C.hold and not (C.stale and C.stale("host", w)) then guarded("animal death", friendAnimalDeath, S, w) end
+    elseif sub == "AG" then                                    -- (task 64d) an animal gone from the host's town without a body
+      if E.on.vdeaths and E.on.animalGone and not C.hold and not (C.stale and C.stale("host", w)) then guarded("animal gone", friendAnimalGone, S, w) end
     elseif sub == "PD" then
       if w[5] and E.on.vdeaths then
         -- (lane 64) the region, the notice (tag and text key: plain words only, or none) and the host's place

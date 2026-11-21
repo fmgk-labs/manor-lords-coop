@@ -57,14 +57,13 @@ local function regionById(S, id)
 end
 X.hook(X.P .. "SMBuildingMaster:changeTrainConnectionRegion", { "TRAINREG" }, X.seeObj("TRAINREG", "i"))
 -- (the id itself differs between copies: the same region was 154019 on the host and 154356 on the friend)
-X.def { name = "TRAINREG", status = "console2", ref = "lane_s21_1", argt = "i",
+X.def { name = "TRAINREG", status = "console2", ref = "lane_s21_1", argt = "i", abs = true,
   ready = function(S, rec)
     local b = rec.obj; if not valid(b) then return nil, "building gone" end
     if not X.owned(b) then return nil, "not the lord's" end
     local id = int(rec.args[1]); local r = regionById(S, id)
     local key = r and T.rkey(r) or ("#" .. id)
-    local ek = "TRAINREG@" .. tostring(rec.addr) .. ":" .. key
-    if T.expect[ek] and T.expect[ek] > os.clock() then T.expect[ek] = nil; return nil, "echo" end
+    if T.isEcho("TRAINREG", rec.addr, key) then return nil, "echo" end   -- (lane 81) the same region a replay just set
     return X.bkeyOf(rec.snap) .. " " .. key
   end,
   apply = function(S, job)
@@ -398,8 +397,9 @@ local function trainPoll(S)
       T.trainSeen[a] = v
       if was and was ~= v then
         local mine = T.trainTool[a] and os.clock() - T.trainTool[a] < 60.0
-        local replayed = T.touched[a] and os.clock() - T.touched[a] < 2.0
-        if mine and not replayed and T.isOn("TRAINCON") then
+        -- (lane 81) no 2 s skip after a replay any more: the replay writes the pair it set into T.trainSeen itself, so
+        -- its own change is never seen here; a change seen now is this player's tool (it was skipped for 2 s before)
+        if mine and T.isOn("TRAINCON") then
           local s, t = v:match("^(.-)|(.*)$")
           T.emitAction(S, "TRAINCON", bk(b) .. " " .. s .. " " .. t)
         end

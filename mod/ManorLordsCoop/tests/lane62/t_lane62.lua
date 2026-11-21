@@ -87,7 +87,8 @@ spit(dir .. "coop_steam.cfg", "linkdir=" .. dir:gsub("/", "\\"):gsub("\\$", "") 
 
 dofile(scripts .. "coop.lua")
 local C = _G.Coop
-check(C and C.version == "0.2.3" and type(C.countErr) == "function", "coop.lua loads outside the game; version 0.2.3")
+-- (lane 64, 2026-11-19) the version is no longer written out here (the test failed from 0.2.4 on for that alone)
+check(C and type(C.version) == "string" and C.version:match("^%d+%.%d+%.%d+$") ~= nil and type(C.countErr) == "function", "coop.lua loads outside the game; it has a version (" .. tostring(C and C.version) .. ")")
 C.start("idle", "idle", {})
 local S = C.s
 for _, f in ipairs({ "coop_steam.lua", "coop_session.lua", "coop_ui.lua" }) do
@@ -309,9 +310,9 @@ do
   check(first == "steamlog", "they are listed first, right after report_info.txt (the first after it is '" .. tostring(first) .. "')")
   check(not job:find("steamlog " .. d .. "coop_steam.log.old", 1, true), "a file that is not there (coop_steam.log.old) is not listed")
   local info = slurp(dir .. "patch_report_info.txt") or ""
-  check(info:find("Mod version:       0.2.3", 1, true) ~= nil and info:find("Steam piece files: 2 file(s), Steam names taken out by the shape of the line", 1, true) ~= nil and
+  check(info:find("Mod version:       " .. C.version, 1, true) ~= nil and info:find("Steam piece files: 2 file(s), Steam names taken out by the shape of the line", 1, true) ~= nil and
         info:find("14 tick error(s) this run; the last: the tick: ", 1, true) ~= nil and info:find("  coop_steam.log  ", 1, true) ~= nil,
-        "report_info.txt: version 0.2.3, the Steam files, the error count with the last error")
+        "report_info.txt: the mod's version, the Steam files, the error count with the last error")
   check((logOf("idle")):find("errors: ", 1, true) ~= nil, "the log has its error lines before the report copies it")
   check(info:find("This process:      pid 4242, run " .. tostring(C.runT), 1, true) ~= nil and info:find("current_idle_log.txt  this run's log as idle; written by process 4242, run " .. tostring(C.runT), 1, true) ~= nil,
         "report_info.txt says which process this is and which process and run wrote each log")

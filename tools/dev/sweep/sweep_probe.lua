@@ -60,7 +60,10 @@ local CLICK = "BndEvt__W_MaterialButton_Button_K2Node_ComponentBoundEvent_4_OnBu
 local SKIP_HUD = { BuildingFloater_C = true, castleFloater_C = true, castleFloater_platformLevel_C = true, castleFloater_wallOptionWidget_C = true,
   minimapIcon_C = true, MinimapTree_C = true, TownName_C = true, regionName_BP_C = true, GateControl_C = true, workAreaConfirmationBlop_C = true,
   constructionFeedbackWidget_C = true, W_ToolTipContainer_C = true, W_ToolTipV2_C = true, MLSharedToolTipContainerWidget = true, CustomTooltip_C = true,
-  CustomTooltipLarge_C = true, squadTooltip_C = true, Inventory_C = true, HideCursorWidget_C = true, MD_NaviConsoleCursor_C = true }
+  CustomTooltipLarge_C = true, squadTooltip_C = true, Inventory_C = true, HideCursorWidget_C = true, MD_NaviConsoleCursor_C = true,
+  -- (lane 81) the control hints ("Town Centers [T]", ...) follow what the owner's real mouse pointer hovers in that
+  -- window: each player's own pointer rightly decides them; they are not game state and differ by where the pointer is
+  ControlTooltipPanel_C = true }
 local SKIP_PANEL = { W_ToolTipContainer_C = true, W_ToolTipV2_C = true, MLSharedToolTipContainerWidget = true, CustomTooltip_C = true, CustomTooltipLarge_C = true }
 -- screens that are not inside the main HUD; dumped when one is in the viewport after an opener
 local VIEW_CLASSES = { "mercenaryScreen_C", "retinueEditor_C", "census_C", "legacyViewWidget_C", "BP_PerkOverviewPanel_C", "BP_PerkSelectionPanel_C",
@@ -217,6 +220,23 @@ do
   end
 end
 table.sort(keys)
+-- (lane 81) nothing of the sweep may depend on the owner's real mouse pointer: edge scrolling off (a pointer resting at
+-- a window's edge scrolled that copy's camera to the map's edge in some starts), the camera on the place SW_CAM gives
+-- (the host's, the same on both copies), and the town region chosen by name (the lowest tag among the player's own
+-- regions), so that the development tree and the map view open on it and not on the region under the pointer
+G.setup = {}
+pcall(function() local l = lord:K2_GetActorLocation(); G.setup[#G.setup + 1] = string.format("camera before %.0f,%.0f,%.0f", l.X, l.Y, l.Z) end)
+pcall(function() local gi = StaticFindObject("/Script/Engine.Default__GameplayStatics"):GetGameInstance(lord); gi:SetEdgeScrolling(false); G.setup[#G.setup + 1] = "edge scrolling off" end)
+if rawget(_G, "SW_CAM") and SW_CAM ~= "" then
+  local x, y, z = SW_CAM:match("^(-?[%d%.]+),(-?[%d%.]+),(-?[%d%.]+)$")
+  if x then pcall(function() lord:K2_SetActorLocation({ X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }, false, {}, true); G.setup[#G.setup + 1] = "camera " .. SW_CAM end) end
+end
+do
+  local tags = {}
+  local arr = e.regions; local n = #arr
+  for i = 1, n do local r = un(arr[i]); if alive(r) and mine(r, lord) then tags[#tags + 1] = rkey(r) end end
+  table.sort(tags); G.town = tags[1]; G.setup[#G.setup + 1] = "town region " .. tostring(G.town)
+end
 local tl, nmine = {}, 0; for t, c in pairs(types) do tl[#tl + 1] = t .. ":" .. c; nmine = nmine + c end; table.sort(tl)
 local C = rawget(_G, "Coop")
 local role = (C and C.s and C.s.role) or rawget(_G, "SW_ROLE") or "?"
@@ -228,6 +248,7 @@ local speed = ok1(function() return e.gameSpeed end)
 emit(string.format("#H role=%s day=%s dayfield=%s paused=%s speed=%s buildings=%d mine=%d swept=%d types=%s only=%s screens=%s ver=1",
   tostring(role), tostring(day), tostring(hour), tostring(paused), tostring(speed), all, nmine, #keys, table.concat(tl, ","), tostring(rawget(_G, "SW_ONLY") or ""), tostring(rawget(_G, "SW_SCREENS") or "0")))
 if not (paused and (tonumber(speed) or 1) <= 0.001) then emit("#WARN this copy is not paused: values move while the sweep reads them") end
+emit("#S setup: " .. table.concat(G.setup or {}, ", "))          -- (lane 81) what the sweep set so that the pointer decides nothing
 flush()
 
 G.jobs[#G.jobs + 1] = { kind = "hud" }
@@ -337,8 +358,16 @@ local function stepScreen(J, e2, l2)
       G.prevRegion = nil; pcall(function() local s = l2.selectedRegion; if alive(s) then G.prevRegion = rkey(s) end end)
       local r = findR(e2, J.tag); if not r then ok, er = false, "region gone" else ok, er = pcall(function() l2:changeSelectedRegionUI(r) end) end
     elseif J.kind == "army" then ok, er = pcall(function() l2:selectSquad({ Value = J.h }, true, false) end)
-    elseif J.kind == "dev" then ok, er = pcall(function() l2:toggleDevelopmentPanel() end)
-    else ok, er = pcall(function() l2:setMapMode(true) end) end
+    elseif J.kind == "dev" then
+      -- (lane 81) on the town region by name (the game's own openDevelopmentPanel(Region)); the toggle opens it on the
+      -- region under the pointer
+      local r = G.town and findR(e2, G.town)
+      if r then ok, er = pcall(function() l2:openDevelopmentPanel(r) end) end
+      if not (r and ok) then ok, er = pcall(function() l2:toggleDevelopmentPanel() end) end
+    else
+      local r = G.town and findR(e2, G.town); if r then pcall(function() l2:changeSelectedRegionUI(r) end) end   -- (lane 81) the town region selected first
+      ok, er = pcall(function() l2:setMapMode(true) end)
+    end
     if not ok then emit("E\t" .. pk .. "\tOPENFAIL " .. tostring(er)); G.fails = G.fails + 1; G.phase = "undo"; return end
     G.phase = "read"; G.wait = WAIT; return
   end

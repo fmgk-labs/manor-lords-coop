@@ -213,102 +213,18 @@ S.sc = { IsValid = function() return true end, IsValidSquad = function(_, t) ret
 S.worldT = T - 60
 T = T + 3.0; men.tick(S, T)
 local function line(kind, text) T = T + 0.25; sentCmds = {}; merch.onMessage(S, "host", kind, words("9 " .. string.format("%.3f", C.api.now()) .. " " .. kind .. " " .. text)); return table.concat(sentCmds, " | ") end
-local one = "77:1000,2000,30:91000,2000,30:0,0"
-local both = one .. ";u500:3000,2000,30:92000,2000,30:0,0"       -- u500: a merchant of the host's without a squad (made after the save)
-line("FM", "1 " .. both)
-check(#made == 0 and #destroyed == 0, "a host merchant this copy lacks: not made in the first second (and a merchant on this copy only: not taken out at the first full list)")
-for _ = 1, 5 do line("FM", "0 " .. both) end
-local mm = C.merch.made["u500"]
-check(#made == 1 and mm and mm.u.realPos.X == 3000 and mm.animal and mm.animal.currentUnitRole == 15 and mm.animal.realPos.X == 3150,
-      "made after 1 s with the game's own spawnFreeMerchant, tied to the host's key, he and his pack animal put at the host's place")
-got = line("FM", "0 " .. both)
-check(#made == 1 and C.merch.set["5200"] ~= nil and C.merch.set["5200"][1] == 92000, "the made merchant is set to the host's path end, and no second one is made")
--- a merchant here with a squad that the host's full list does not name (95): seen in two full lists, then taken out
-T = T + 1.5; line("FM", "1 " .. both)
-check(#destroyed == 0, "default: the merchant already on this copy survives a full list after a replacement was made")
-C.m58destroy = true
-T = T + 1.5; line("FM", "1 " .. both)
-check(#destroyed == 1 and destroyed[1] == m95, "a merchant of this copy only, seen in two full lists in a row: taken out with the game's own destroyUnit")
--- the host no longer names u500: after two full lists the made merchant goes, his pack animal first
-C.m58destroy = nil
-line("FM", "1 " .. one); check(#destroyed == 1, "the host no longer names the made merchant's key: not taken out at the first full list")
-T = T + 1.5; got = line("FM", "1 " .. one)
-check(#destroyed == 1 and C.merch.made["u500"] == mm, "default: the made merchant and his animal also survive missing lists")
-C.m58destroy = true
-T = T + 1.5; got = line("FM", "1 " .. one)
-check(#destroyed == 3 and destroyed[2] == mm.animal and destroyed[3] == mm.u and C.merch.made["u500"] == nil and got:find("MEN DROP 5200", 1, true) ~= nil,
-      "at the second full list: the pack animal, then the merchant, taken out; both out of the native table (" .. got .. ")")
-local stray = 0; for _, u in ipairs(S.eng.unitArr) do if u.currentUnitRole == 15 then stray = stray + 1 end end
-check(stray == 0 and #S.eng.freeMerchants == 1, "no stray unit is left: no pack animal, one merchant")
--- a make that gives nothing: one try, never again for that key
-spawnGives = false; made = {}
-local bad = one .. ";u600:3000,2000,30:92000,2000,30:0,0"
-for _ = 1, 12 do line("FM", "1 " .. bad) end
-check(#made == 1 and C.merch.failed["u600"] == "tried", "spawnFreeMerchant gives nothing: ONE try, then he is left missing (12 more lists, no second try)")
-spawnGives = true
--- a merchant made here that the game takes away: said once, not made again
-made = {}
-local gone = one .. ";u650:3000,2000,30:92000,2000,30:0,0"
-for _ = 1, 6 do line("FM", "0 " .. gone) end
-local m650 = C.merch.made["u650"]
-m650.u.IsValid = function() return false end
-for _ = 1, 8 do line("FM", "0 " .. gone) end
-check(#made == 1 and C.merch.made["u650"] == nil and C.merch.failed["u650"] == "gone", "a made merchant the game took away is not made again")
--- after a load of the host's save: this copy has the merchant without a squad, with the host's unit id: taken as he is
-made = {}
-local saved = mk(0x7000, 0, 3000); saved.UniqueID = 700
-S.eng.freeMerchants[#S.eng.freeMerchants + 1] = saved; S.eng.unitArr[#S.eng.unitArr + 1] = saved
-got = line("FM", "0 " .. one .. ";u700:3000,2000,30:93000,2000,30:0,0")
-check(#made == 0 and C.merch.made["u700"] and C.merch.made["u700"].u == saved and got:find("7000=93000,2000,30,3", 1, true) ~= nil, "a merchant of this copy without a squad and with the host's unit id is the one for that key: none is made (" .. got .. ")")
--- (game run 11) after a load the host's merchant without a squad HAS a squad number here: still the one for the key,
--- none is made, and he is not taken out as "on this copy only"
-local saved2 = mk(0x7100, 1523397618, 40000); saved2.UniqueID = 710; squads[1523397618] = saved2
-S.eng.freeMerchants[#S.eng.freeMerchants + 1] = saved2; S.eng.unitArr[#S.eng.unitArr + 1] = saved2
-local l710 = one .. ";u700:3000,2000,30:93000,2000,30:0,0;u710:40000,2000,30:93000,2000,30:0,0"
-line("FM", "1 " .. l710); T = T + 1.6; line("FM", "1 " .. l710); T = T + 1.6; line("FM", "1 " .. l710)
-local out2 = false; for _, u in ipairs(destroyed) do if u == saved2 then out2 = true end end
-check(#made == 0 and C.merch.made["u710"] and C.merch.made["u710"].u == saved2 and not out2, "a merchant here with a squad number the host does not name and the host's unit id is the one for that key: none made, not taken out")
-C.m58spawn = false; made = {}
-for _ = 1, 8 do line("FM", "1 " .. one .. ";u700:3000,2000,30:93000,2000,30:0,0;u710:40000,2000,30:93000,2000,30:0,0;u800:3000,2000,30:92000,2000,30:0,0") end
-check(#made == 0, "Coop.m58spawn = false: none is made")
--- (lane 64's live finding) after a load EVERY merchant of this copy has a number the host's list does not name, and
--- this copy has one merchant FEWER than the host: nobody is taken out, however many lists say so
-local base = one .. ";u700:3000,2000,30:93000,2000,30:0,0;u710:40000,2000,30:93000,2000,30:0,0"
-local strangers = {}
-for i = 1, 3 do local u = mk(0x7200 + i * 0x100, 300 + i, 50000 + i * 1000); strangers[i] = u; S.eng.freeMerchants[#S.eng.freeMerchants + 1] = u; S.eng.unitArr[#S.eng.unitArr + 1] = u end
-local hostOnly = ""; for i = 1, 4 do hostOnly = hostOnly .. string.format(";%d:%d,2000,30:93000,2000,30:0,0", 200 + i, 50000 + i * 1000) end
-local nd0 = #destroyed
-for _ = 1, 4 do T = T + 1.6; line("FM", "1 " .. base .. hostOnly) end
-check(#destroyed == nd0 and (S.stats.m73extraHeld or 0) >= 4 and S.stats.m58extraNow == 3,
-      "three merchants here that the host's list does not name while the host names more merchants than this copy has: none is taken out (4 full lists), and the count says 3 here only now")
--- the same three with a host that has three fewer: they are this copy's surplus; out after two such lists, not at the first
-line("FM", "1 " .. base); check(#destroyed == nd0, "the first list that makes them a surplus: not taken out yet (the 1.5 s start again)")
-T = T + 1.6; line("FM", "1 " .. base)
-check(#destroyed == nd0 + 3 and S.stats.m58extraNow == 3, "three merchants over the host's count, in two full lists in a row: the three are taken out")
-line("FM", "1 " .. base); check(S.stats.m58extraNow == 0, "then none is here only")
--- a full list in two lines (over 3000 characters): the keys of the first line count too
-local nd1 = #destroyed
-for _ = 1, 3 do T = T + 1.6; line("FM", "0 " .. one); line("FM", "1 u700:3000,2000,30:93000,2000,30:0,0;u710:40000,2000,30:93000,2000,30:0,0") end
-check(#destroyed == nd1, "a full list that comes in two lines: a merchant named in the first line is not taken out")
+-- (lane 82) The making and the taking out of free merchants are no longer the business of the FM lines: the host's
+-- whole list (FI) is paired with this copy's merchants by M.plan. The checks that stood here (lane 73: a merchant
+-- made for a key, the "on this copy only" rule, the surplus rule) are in tests/lane82/t_merch82.lua, which also runs
+-- the module of lane 73 on the load case that destroyed a merchant from the save.
 C.m58spawn = nil; C.m73lvspawn = true; made = {}; destroyed = {}
--- the livestock merchant
-line("FL", "4100,4100,0:79,4000,4000"); check(#made == 0, "a livestock merchant this copy lacks: not made in the first second")
-T = T + 1.0; line("FL", "4100,4100,0:79,4000,4000")
-check(#made == 1 and made[1] == "livestock at the trader" and S.eng.livestockMerchants[1].realPos.X == 4100, "made after 1 s with spawnLivestockMerchant at the building the host names, put at the host's place")
-line("FL", "4100,4100,0:79,4000,4000"); check(#made == 1, "the same number as the host: nothing more is made")
-local nd = #destroyed
-line("FL", "-"); check(#destroyed == nd, "the host has none any more: not taken out at the first list")
-T = T + 1.5; line("FL", "-")
-check(#destroyed == nd + 1 and #S.eng.livestockMerchants == 0, "in two lists in a row: taken out with destroyUnit")
-line("FL", "4100,4100,0:12,1,1"); T = T + 1.0; made = {}; line("FL", "4100,4100,0:12,1,1")
-check(#made == 0, "the building the host names is not here: none is made (said in the log, tried again after 30 s)")
+-- (lane 82: the livestock merchant's line is FV now; its checks are in tests/lane82/t_merch82.lua, section G)
 -- the unit counts each minute
 line("FN", "3 1 2")
 T = T + 61.0; merch.tick(S, T)
 local lg = slurp(dir .. "friend1_log.txt")
 check(lg:find("free merchants %d+ / 3, livestock merchants 0 / 1, pack animals %d+ / 2: DIFFERENT") ~= nil, "the minute line compares the unit counts of roles 6, 7 and 15 with the host's")
-check(lg:find("the host's merchant u500 had none here: made one", 1, true) ~= nil and lg:find("the host no longer names u500: the merchant made here for it goes", 1, true) ~= nil
-      and lg:find("spawnFreeMerchant gave nothing", 1, true) ~= nil and lg:find("for the host's u650 is gone", 1, true) ~= nil, "one log line per made, removed, failed and lost merchant")
+-- (lane 82: the log lines of a made, removed, failed and lost merchant are checked in tests/lane82/t_merch82.lua)
 -- host: the livestock list and the counts go out
 T = T + 20.0
 C.start("host", "host", { "friend1" })
@@ -321,7 +237,7 @@ S.sc = { IsValid = function() return true end }
 local fh = io.open(dir .. "host.txt", "wb"); if fh then fh:close() end
 T = T + 3.0; merch.tick(S, T)
 local ht = slurp(dir .. "host.txt")
-check(ht:find(" FL 700,2000,30:79,4000,4000\n", 1, true) ~= nil and ht:find(" FN 2 1 0\n", 1, true) ~= nil, "host: the livestock merchants (place, workplace) with a full list, and the unit counts of roles 6, 7, 15")
+check(ht:find(" FN 2 1 0" .. string.char(10), 1, true) ~= nil, "host: the unit counts of roles 6, 7, 15 go out")
 check(ht:find(" FM 1 u431:900,2000,30:5000,6000,0:0,0\n", 1, true) ~= nil, "host: a merchant without a squad is sent under the key u<his unit id> (before, he was never sent)")
 
 os.clock = clock0

@@ -19,7 +19,7 @@ local R = C.realm
 R.on = R.on or { perk = true, tax = true, policy = true, name = true, fams = true, mercs = true, lords = true, notices = true }
 if R.on.logAll == nil then R.on.logAll = true end   -- (lane 66) a joining or reloading friend gets the host's whole notice list once (needs NOLOG on)
 R.stats = R.stats or { set = 0, is = 0, applied = 0, failed = 0, repairs = 0 }
-R.gHost = R.gHost or {}; R.claimSent = R.claimSent or {}; R.famHost = R.famHost or {}; R.known = R.known or {}; R.want = R.want or {}
+R.gHost = R.gHost or {}; R.claimSent = R.claimSent or {}; R.claimAck = R.claimAck or {}; R.famHost = R.famHost or {}; R.known = R.known or {}; R.want = R.want or {}
 local POLL, KEYFRAME, VERIFY = 0.5, 30.0, 3.0
 local TAXES = { "land", "tithe" }          -- names read in the game's own tax routine (lane_t2 report, T11a)
 local famKeys                               -- defined with the family rule below
@@ -219,7 +219,11 @@ local function take(S, key, rk, item, value, why)
   if not valid(r) then return end
   local cur = readRegion(r)[item]
   if cur == value then R.want[key] = nil; return end
-  local ok, done, err = pcall(apply, S, r, item, value)
+  -- (lane 81) inside the town module's quiet wrapper: its TAX hook must not take this write for the player's own change
+  -- (it was dropped only by the 0.75 s time rule before, lane_s21_3 friend log 1794434507.249)
+  local Tn = C.town
+  local ok, done, err
+  if Tn and Tn.quiet then ok, done, err = pcall(Tn.quiet, apply, S, r, item, value) else ok, done, err = pcall(apply, S, r, item, value) end
   if ok and done then R.stats.applied = R.stats.applied + 1 else R.stats.failed = R.stats.failed + 1 end
   if ok and done and C.panels and C.panels.touched then pcall(C.panels.touched, "R:" .. (item:match("^(%a+)") or item), nil) end   -- (lane 69) open panels redraw
   log("realm: %s %s %s -> %s (%s)%s", why, rk, item, value, tostring(cur), (ok and done) and "" or (" FAILED " .. tostring(ok and err or done)))
@@ -261,7 +265,11 @@ end
 --   writing each field of an existing record in place is safe (number, text, list of names, object reference: each
 --     tried separately). That is what is done here: the copy's own records are edited to become the host's.
 -- `only`: compare just these names (the host may hold fewer records than this copy; records cannot be added or removed).
-local function mercsStr(S, only)
+-- (lane 88) With the native MERCCUT a friend's list is cut to the host's length and its records are put in the host's
+-- order (lead runs r27m83, r27cf: a rival lord's hire on the host left the friend with 3 offers against 2 for the
+-- whole session; the hire window shows the cards in list order). Then the whole list is compared, in list order
+-- (`ordered`); without MERCCUT (another game build) as before: sorted, only the host's names.
+local function mercsStr(S, only, ordered)
   local a = S.eng.availableMercs; local t = {}
   for i = 1, #a do
     local m = a[i]; local n = m.Name:ToString()
@@ -271,8 +279,26 @@ local function mercsStr(S, only)
       t[#t + 1] = table.concat({ enc2(n), m.cost, m.colorA, m.colorB, m.emblemA, m.emblemB, m.arrivesIn, enc2(reg), enc2(banner), names(m.units), names(m.traits) }, ";")
     end
   end
-  table.sort(t)
+  if not ordered then table.sort(t) end
   return #t == 0 and "0" or table.concat(t, "|")
+end
+-- (lane 88) can this copy cut its offer list (the native MERCCUT is there)? Only a friend asks.
+-- R.mercNoCut: a cut or a refill did not take once in this session: the old rule (the host's companies only) from then on,
+-- so that a list this copy cannot make equal never asks for a resync
+local function mercCutOk() if R.mercNoCut then return false end; local P = rawget(C, "patch"); return P ~= nil and P.mercAvail ~= nil and P.mercAvail() == true end
+-- (lane 88) may this player's own hire be on its way to the host? Only that makes this copy's list SHORTER than the
+-- host's (the hired company left here first; coop.lua S.mercGone names it, for 5 s, until the host hires it too).
+-- A longer list or other companies are never this player's doing: taken from the host at once.
+local function recCount(v) if not v or v == "0" then return 0 end; local n = 1; for _ in v:gmatch("|") do n = n + 1 end; return n end
+local function ownHireOnWay(S, clock, mine, hostv)
+  if recCount(mine) >= recCount(hostv) then return false end
+  if (S.hireSent ~= nil and next(S.hireSent) ~= nil) or S.freshT ~= nil then return true end
+  -- this copy's list got shorter at a look of the mod in the last 5 s, by nobody's write of the mod (mercHold): the
+  -- player's hire, seen before the core's own offer scan has named the company
+  if R.mercDropT and clock - R.mercDropT < 5.0 then return true end
+  -- the company gone from this list must still be on the host's (the host has not hired it yet)
+  local g = S.mercGone
+  return g ~= nil and clock - (g.t or -99) < 5.0 and hostv ~= nil and ("|" .. hostv):find("|" .. enc2(g.name) .. ";", 1, true) ~= nil
 end
 local function mercNames(value)
   local set = {}
@@ -283,10 +309,57 @@ local function nameList(s) local t = {}; for u in (s or ""):gmatch("[^,]+") do t
 local function mercsApply(S, value)
   local a = S.eng.availableMercs
   local want = {}; if value ~= "0" then for _, rec in ipairs(split(value, "|")) do want[#want + 1] = split(rec, ";") end end
+  local cut = mercCutOk()
+  -- (lane 88) fewer offers here than on the host (the host's game refilled its offers, or this copy's list was cut
+  -- after a hire on the host and the host refilled since): the game's own refill first; if the list is still shorter
+  -- after it, the old rule from then on (below)
+  -- (run l88c: 263 calls while the friend stood shorter) once for each list of the host, never at every look
+  local rolled = false
+  if cut and #a < #want and R.mercRefillFor ~= value then
+    R.mercRefillFor = value
+    local n0 = #a
+    -- (lane 87) Engine::refillMercenaries is an empty routine in this build (the linker's shared stub, C2 00 00: it never
+    -- made an offer, lane 88's runs l88b and l88c). With NOROLL on here (coop_x_values.lua) the game's own roll is let
+    -- through once (P.noRollPass): it empties the list and makes up to three offers, which take the host's records
+    -- below in this same tick (no frame shows them); what it made beyond the host's count is cut at once. Without
+    -- NOROLL: the refill as before (R.mercShort when it makes none).
+    local P = rawget(C, "patch")
+    local how, ok, e = "refillMercenaries", nil, nil
+    if P and P.noRollPass and P.noRollPass() then
+      how = "rerollMercenaries (NOROLL PASS)"
+      R.mercRolling = true                                               -- (lane 88's hook on the routine: not entered)
+      ok, e = pcall(function() S.eng:rerollMercenaries() end)
+      R.mercRolling = nil
+      rolled = ok
+      R.stats.mercRoll = (R.stats.mercRoll or 0) + 1
+    else
+      ok, e = pcall(function() S.eng:refillMercenaries() end)
+      R.stats.mercRefill = (R.stats.mercRefill or 0) + 1
+    end
+    a = S.eng.availableMercs
+    log("realm: offers %d here, %d on the host: the game's %s %s (now %d)", n0, #want, how, ok and "ran" or ("failed: " .. tostring(e)), #a)
+  end
   local wanted = mercNames(value); local byName, free = {}, {}
-  for i = 1, #a do local n = a[i].Name:ToString(); if wanted[n] and not byName[n] then byName[n] = a[i] else free[#free + 1] = a[i] end end
-  for _, f in ipairs(want) do
-    local n = dec(f[1]); local m = byName[n] or table.remove(free, 1)
+  local slots = {}
+  if cut then
+    -- (lane 88) the host's records go into this copy's first slots, in the host's order (each slot's fields written
+    -- in place, as before); the slots past the host's count are cut off below
+    -- (run l88b) still fewer after the game's refill (it makes no offer when the game sees no reason): the host's
+    -- first records go into the slots there are; the rest cannot be made by script. That is no failure of this copy
+    -- (R.mercShort: not counted towards a resync, which the old rule asked for here)
+    R.mercShort = #a < #want
+    if R.mercShort then
+      R.stats.mercShort = (R.stats.mercShort or 0) + 1
+      if R.mercShortFor ~= value then R.mercShortFor = value; log("realm: offers %d here, %d on the host after the game's refill: the host's first %d are written, the rest cannot be made here", #a, #want, #a) end
+    end
+    for i = 1, math.min(#a, #want) do slots[i] = a[i] end
+  end
+  if not cut then
+    for i = 1, #a do local n = a[i].Name:ToString(); if wanted[n] and not byName[n] then byName[n] = a[i] else free[#free + 1] = a[i] end end
+  end
+  for j, f in ipairs(want) do
+    local n = dec(f[1]); local m = slots[j] or byName[n] or table.remove(free, 1)
+    if not m and cut then break end                                     -- (lane 88: R.mercShort, above)
     if not m then error("this copy holds fewer offers than the host") end
     if m.Name:ToString() ~= n then m.Name = n end
     local nums = { cost = f[2], colorA = f[3], colorB = f[4], emblemA = f[5], emblemB = f[6], arrivesIn = f[7] }
@@ -296,6 +369,43 @@ local function mercsApply(S, value)
     if b ~= "-" and (not valid(m.banner) or (m.banner:GetFullName():match("^%S+%s+(.+)$")) ~= b) then local tex = StaticFindObject(b); if valid(tex) then m.banner = tex end end
     if names(m.units) ~= (f[10] or "") then m.units = nameList(f[10]) end
     if names(m.traits) ~= (f[11] or "") then m.traits = nameList(f[11]) end
+  end
+  -- (lane 88) more offers here than on the host: the list is cut to the host's count (native MERCCUT: the count only;
+  -- the records past it stay whole in the list's memory). The list is read again in this tick, never past its end.
+  if cut then
+    a = S.eng.availableMercs
+    local now = #a
+    -- (run l88b) the host's list stood shorter for 0.6 s at its own month roll, the friend cut to it and then could
+    -- not grow again: a cut only once the host's shorter count has stood for 1.5 s (R.mercHostN, set when it came)
+    -- (run l88c) nor within 2 s after this copy's own game changed its list (its month roll: the host rolls in the same
+    -- moment and its new list comes a moment later; cut to the host's old count, this copy could not grow again)
+    local stood = R.mercHostN == #want and os.clock() - (R.mercHostNT or -99) >= 1.5 and os.clock() - (R.mercOwnT or -99) >= 2.0
+    -- (lane 87) the slots this copy's own roll has just made (NOROLL PASS above) beyond the host's count are cut at once:
+    -- the waits are for a host list that may still grow and for this copy's own month roll, not for records made now.
+    -- And with NOROLL on here no wait at all: the waits came from a copy that could not grow its list again after a cut
+    -- (the refill makes nothing) and from its own month roll; with NOROLL this copy does not roll by itself and grows by
+    -- the pass above. Waiting showed, after a rival's hire on the host (3 offers to 2), the host's two records over the
+    -- first two slots and the third slot of before for 1.5 s: a list the host never had.
+    local Pn = rawget(C, "patch")
+    if rolled or (Pn and Pn.noRollOn and Pn.noRollOn()) then stood = true end
+    if now > #want and not stood then R.stats.mercCutWait = (R.stats.mercCutWait or 0) + 1 end
+    if now > #want and stood then
+      local okA, la = pcall(function() return a:GetArrayAddress() end)
+      local ea = S.eng:GetAddress()
+      if not (okA and type(la) == "number") then la = ea + 0xBF0; R.stats.mercAddrGuess = (R.stats.mercAddrGuess or 0) + 1 end
+      local P = rawget(C, "patch")
+      local sent = P.mercCut(ea, la, now, #want)
+      local after = #S.eng.availableMercs
+      R.stats.mercCut = (R.stats.mercCut or 0) + 1
+      log("realm: offers %d here, %d on the host: cut to the host's (MERCCUT %s; now %d)", now, #want, sent and "sent" or "unavailable", after)
+      if after ~= #want then R.mercNoCut = true; log("realm: the cut did not take: from now on only the host's companies are compared (as before lane 88)") end
+    end
+    -- the names this copy now offers are the core's "last seen" names (coop.lua): a company the mod wrote over or cut
+    -- off is not "gone from this copy's offers" (that is how the core tells this player's own hire)
+    local okN, set = pcall(function() local t = {}; local b = S.eng.availableMercs; for i = 1, #b do t[b[i].Name:ToString()] = true end; return t end)
+    if okN and S.role == "friend" then S.mercNames = set end
+    R.mercPrevN = #S.eng.availableMercs                                  -- (mercHold: the mod's own cut is no drop)
+    local okS, ms = pcall(mercsStr, S, nil, true); if okS then R.mercPrevS = ms end
   end
   pcall(function() S.p1:updateMercenayCompanyUI() end)                  -- the game's own spelling
 end
@@ -359,7 +469,7 @@ end
 
 local function readGlobal(S)
   local t = {}
-  if R.on.mercs then local ok, v = pcall(mercsStr, S); if ok then t.mercs = v end end
+  if R.on.mercs then local ok, v = pcall(mercsStr, S, nil, true); if ok then t.mercs = v end end     -- (lane 88) in list order
   if R.on.lords then
     for code, pw in pairs(lords(S)) do
       local ok, v = pcall(function()
@@ -385,6 +495,23 @@ local function applyGlobal(S, item, value)
 end
 local function switchKind(item) return item == "mercs" and "mercs" or "lords" end
 
+-- (lane 79) is a claim of this player's on its way to the host (see the claims rule in pollGlobal)?
+local CLAIM_GRACE = 1.0
+local function claimPending(clock)
+  local H = R.gHost.claims_P
+  local theirs = H and H.v and claimTags(H.v) or {}
+  for tag, t in pairs(R.claimSent) do
+    -- answered "laid": on its way only until the host's list has shown it once (at most GRACE after the answer)
+    local ack = R.claimAck[tag]
+    if ack and ack ~= "seen" and theirs[tag] then R.claimAck[tag] = "seen"; ack = "seen" end
+    local onWay = (ack == nil) or (ack ~= "seen" and clock - ack < GRACE)
+    if clock - t < 10.0 and onWay then return true end
+  end
+  local Lm = C.lord
+  if Lm and Lm.letterT and clock - Lm.letterT < 10.0 then return true end
+  if Lm and Lm.claimHow then for _, x in pairs(Lm.claimHow) do if x.t and clock - x.t < 30.0 then return true end end end
+  return false
+end
 local function pollGlobal(S, clock, key30)
   local cur = readGlobal(S)
   if S.role == "host" then
@@ -397,7 +524,17 @@ local function pollGlobal(S, clock, key30)
     end
     return
   end
-  local function mine(item, H) if item == "mercs" then return mercsStr(S, (mercNames(H.v))) end; return readGlobal(S)[item] end
+  -- (lane 88) the mercenary offers: with MERCCUT the whole list in list order against the host's; without it, as
+  -- before, the host's companies only and sorted (so the host's list, which now comes in list order, is sorted too)
+  local cutOk = R.on.mercs and mercCutOk()
+  local function hostV(item, H)
+    if item ~= "mercs" or cutOk or H.v == "0" then return H.v end
+    local t = split(H.v, "|"); table.sort(t); return table.concat(t, "|")
+  end
+  local function mine(item, H)
+    if item == "mercs" then if cutOk then return mercsStr(S, nil, true) end; return mercsStr(S, (mercNames(H.v))) end
+    return readGlobal(S)[item]
+  end
   for item, v in pairs(cur) do
     local H = R.gHost[item]
     if H then
@@ -422,7 +559,7 @@ local function pollGlobal(S, clock, key30)
             local seen = Lm and Lm.claimHow and Lm.claimHow[tag]
             if seen and os.clock() - seen.t < 30.0 then
               local how = seen.fav and "f" or "i"
-              R.claimSent[tag] = clock; H.since = clock      -- give the host a moment before this copy is put back
+              R.claimSent[tag] = clock; R.claimAck[tag] = nil; H.since = clock      -- give the host a moment before this copy is put back
               A.send(string.format("R SET _ claim %s:%s", tag, how)); R.stats.set = R.stats.set + 1
               log("realm: this player laid a claim on %s (%s): sent to the host", tag, how == "f" and "king's favour" or "influence")
             elseif R.claimNote ~= tag then
@@ -432,14 +569,27 @@ local function pollGlobal(S, clock, key30)
           end
         end
       end
-      if v == H.v then H.since = nil; H.fails = 0
+      local hv = hostV(item, H)
+      if v == hv then H.since = nil; H.fails = 0
       else
         H.since = H.since or clock
-        if clock - H.since >= GRACE then
+        -- (lane 79) the player's claims: GRACE is there for a claim of this player's on its way to the host. With
+        -- none on its way (none sent in the last 10 s and not yet answered, no letter, no own layClaim in 30 s) a
+        -- difference is the host's own change (a claim that ended, a war that took it) and is taken after 1 s: the
+        -- 3 s of GRACE plus a poll left a claim on the friend 3.5 s after the host's had gone (lane 79 run g).
+        local grace = GRACE
+        if item == "claims_P" and not claimPending(clock) then grace = CLAIM_GRACE end
+        -- (lane 88) the offers: GRACE is there for this player's own hire on its way to the host (this copy's list is
+        -- one shorter until the host has hired the same company). With no company gone from this copy's list in the
+        -- last 10 s (coop.lua S.mercGone) the host's list is taken at the next look: a rival's hire on the host left
+        -- the friend's list longer for the whole session (lead runs r27m83, r27cf)
+        if item == "mercs" and cutOk and not ownHireOnWay(S, clock, v, hv) then grace = 0 end
+        if clock - H.since >= grace then
           H.since = clock
           local ok, e = pcall(applyGlobal, S, item, H.v)
           local after = mine(item, H)
-          if ok and after == H.v then R.stats.applied = R.stats.applied + 1; H.fails = 0
+          if ok and item == "mercs" and cutOk and (R.mercShort or recCount(after) > recCount(hv)) then H.fails = 0   -- (lane 88) fewer than the host, or a cut not yet due: no failure
+          elseif ok and after == hv then R.stats.applied = R.stats.applied + 1; H.fails = 0
           else
             H.fails = (H.fails or 0) + 1; R.stats.failed = R.stats.failed + 1
             log("realm: %s did not take the host's value (%s); here %s, host %s", item, ok and "no error" or tostring(e), tostring(after):sub(1, 80), H.v:sub(1, 80))
@@ -764,7 +914,7 @@ local function fresh(S)
   if R.S == S and R.world == S.worlds and R.logSubscribers then return end
   R.S = S; R.world = S.worlds; R.logN = nil; R.logLast = nil; R.relayed = {}; R.pruneBase = nil; R.bCache = {}; R.logAll = nil
   R.logSubscribers = {}; R.askWorld = nil; R.logSerial = nil; R.expectedLogN = nil; R.pendingLogDraw = nil
-  R.known = {}; R.want = {}; R.famHost = {}; R.gHost = {}; R.claimSent = {}; R.regions = nil; R.tPoll = 0; R.tKey = -1e9
+  R.known = {}; R.want = {}; R.famHost = {}; R.gHost = {}; R.claimSent = {}; R.claimAck = {}; R.atkHost = {}; R.atkMine = {}; R.atkSince = {}; R.atkKeyT = nil; R.regions = nil; R.tPoll = 0; R.tKey = -1e9
 end
 
 local function poll(S, clock)
@@ -811,9 +961,113 @@ end
 
 local M = {}
 function M.onWorld(S) fresh(S) end
+-- ---- (lane 79) a region's "under attack" flag (Region.isUnderAttack: keeps villagers at home, mutes the fire call)
+-- The game sets it only when it recomputes it: at a squad's border crossing, a removal, a war or peace, a load, a
+-- retreat, and its 50 s "villager stuck at home" rule. It is not recomputed when the last enemy squad is taken away:
+-- in lane 79's run g both copies kept "under attack" with no enemy present (the host 3, 15 and 43 s), and each copy
+-- cleared it at its own next recompute. The host's came when a rival's re-raised squads entered the region's list,
+-- which the friend's list never gets (lane 79 report, case b), so the friend kept it 17 s longer than the host
+-- (82 s in all). No reflected routine recomputes it (Region's functions: dumps/Region.txt). So the host tells its
+-- flags, and a friend whose own flag has differed from the host's for over ATK_WAIT s takes the host's value (a
+-- plain bool field; the friend's game may set it again at its own next recompute, which is then corrected again).
+-- Host: every ATK_POLL s, the regions whose flag changed ("R ATK <tag>=<0|1>,..."), all of them every 30 s.
+-- Switch: Coop.realm.on.attack = false (both sides).
+local ATK_POLL, ATK_WAIT, ATK_KEY = 0.25, 1.0, 30.0
+if R.on.attack == nil then R.on.attack = true end
+R.atkHost = R.atkHost or {}; R.atkMine = R.atkMine or {}; R.atkSince = R.atkSince or {}
+R.stats.atkWrites = R.stats.atkWrites or 0
+local function atkRead(r) local ok, v = pcall(function() return r.isUnderAttack end); if ok and type(v) == "boolean" then return v end end
+local function attackTick(S, clock)
+  local arr = S.eng.regions; local n = #arr
+  if S.role == "host" then
+    local key = clock - (R.atkKeyT or -1e9) >= ATK_KEY
+    if key then R.atkKeyT = clock end
+    local out = {}
+    for i = 1, n do
+      local r = un(arr[i])
+      if valid(r) then
+        local k = rkey(r); local v = atkRead(r)
+        if k and v ~= nil and (key or R.atkMine[k] ~= v) then R.atkMine[k] = v; out[#out + 1] = k .. "=" .. (v and "1" or "0") end
+      end
+    end
+    if #out > 0 then A.send("R ATK " .. table.concat(out, ",")) end
+    return
+  end
+  for i = 1, n do
+    local r = un(arr[i])
+    if valid(r) then
+      local k = rkey(r); local h = k and R.atkHost[k]; local v = atkRead(r)
+      if h == nil or v == nil or v == h then R.atkSince[k or "?"] = nil
+      else
+        R.atkSince[k] = R.atkSince[k] or clock
+        if clock - R.atkSince[k] >= ATK_WAIT then
+          local ok, e = pcall(function() r.isUnderAttack = h end)
+          R.atkSince[k] = nil
+          R.stats.atkWrites = R.stats.atkWrites + 1
+          R.atkN = R.atkN or {}; R.atkN[k] = (R.atkN[k] or 0) + 1
+          log("realm: %s under attack here %s, the host's %s for over %.1f s: the host's taken (%d in this region)%s", k, tostring(v), tostring(h), ATK_WAIT, R.atkN[k], ok and "" or (" FAILED " .. tostring(e)))
+        end
+      end
+    end
+  end
+end
+
+-- (lane 88) friend: the offer list looked at every 0.1 s, and the host's last list written at once when it differs.
+-- A friend's own game rolls new offers at its own month change (run l88a: the host's list changed at +0.000 s, the
+-- friend's own game rolled three other companies at +0.085 s, and the friend showed them until +3.9 s); the host's
+-- new list arrives up to 0.5 s after the host's change. So the friend writes back the host's last list (which the
+-- host had a moment ago) in the tick its own game changed it, and the host's new list in the tick after it arrives.
+-- Left to the 0.5 s look (and its grace) while this player's own hire may be on its way (ownHireOnWay: this copy's
+-- list got shorter at one of these looks by nobody's write of the mod, or the core has named the hired company). A
+-- list that does not take is tried again after 2 s, not at every look.
+local function mercHold(S, clock)
+  local H = R.gHost and R.gHost.mercs
+  if not (H and H.v) or clock - (R.mercT or -99) < 0.1 then return end
+  R.mercT = clock
+  if not mercCutOk() then return end
+  local mine = mercsStr(S, nil, true)
+  local n = recCount(mine)
+  if R.mercPrevN and n < R.mercPrevN then R.mercDropT = clock end      -- shorter since the last look, and not by the mod
+  if R.mercPrevS and mine ~= R.mercPrevS then R.mercOwnT = clock end   -- changed since the last look, and not by the mod
+  R.mercPrevS = mine
+  R.mercPrevN = n
+  if mine == H.v then R.mercTry = nil; return end
+  if ownHireOnWay(S, clock, mine, H.v) then return end
+  local key = mine .. "/" .. H.v
+  if R.mercTry and R.mercTry.k == key and clock - R.mercTry.t < 2.0 then return end
+  R.mercTry = { k = key, t = clock }
+  local ok, e = pcall(applyGlobal, S, "mercs", H.v)
+  local after = mercsStr(S, nil, true)
+  R.mercPrevN = recCount(after)                                         -- the mod's own write is no drop
+  R.mercPrevS = after
+  R.stats.mercHold = (R.stats.mercHold or 0) + 1
+  if ok and after == H.v then H.since = nil; R.mercTry = nil else log("realm: the host's offers did not take at once (%s): the 0.5 s look follows", ok and "no error" or tostring(e)) end
+end
+
+-- (lane 88, round 2) the game's own roll of offers on a friend (its month change) is shown for one frame before the
+-- next 0.1 s look writes the host's list back (66 ms, run p88a). If the game calls its roll through the script layer,
+-- these hooks run in the same frame and write the host's list back at once. Registered once; each call is counted and
+-- logged once, so a run shows whether the game's month roll passes here at all.
+local function mercRollHooks(S)
+  if R.mercHooked or S.role ~= "friend" then return end
+  R.mercHooked = true
+  for _, fn in ipairs({ "rerollMercenaries", "refillMercenaries" }) do
+    local ok, e = pcall(RegisterHook, "/Script/ManorLords.RTSMultiEngineCPP:" .. fn, function()
+      R.stats["mercRollHook_" .. fn] = (R.stats["mercRollHook_" .. fn] or 0) + 1
+      if not R.mercRollSaid then R.mercRollSaid = true; log("realm: the game's %s passed the hook: the host's offers are written in the same frame", fn) end
+      local S2 = C.s
+      if S2 and S2.role == "friend" and R.on.mercs and not C.hold and not R.mercRolling then R.mercT = nil; pcall(mercHold, S2, os.clock()) end   -- (lane 87: not inside the mod's own roll)
+    end)
+    if not ok then log("realm: no hook on %s (%s)", fn, tostring(e)) end
+  end
+end
+
 function M.tick(S, clock)
   fresh(S)
+  pcall(mercRollHooks, S)                                  -- (lane 88, round 2)
   if C.hold then return end                                -- a join or repair is running
+  if S.role == "friend" and R.on.mercs then local okM, eM = pcall(mercHold, S, clock); if not okM then R.lastErr = tostring(eM) end end   -- (lane 88)
+  if R.on.attack and clock - (R.atkT or 0) >= ATK_POLL then R.atkT = clock; local okA, eA = pcall(attackTick, S, clock); if not okA then R.lastErr = tostring(eA) end end
   if clock - R.tPoll >= POLL then R.tPoll = clock; poll(S, clock) end
   if S.role == "host" and R.on.notices and clock - (R.tLog or 0) >= 0.1 then R.tLog = clock; local okL, eL = pcall(logPoll, S); if not okL then R.lastErr = tostring(eL) end end
   -- (lane 66) a friend asks once per world for the host's whole notice list, once NOLOG is on here
@@ -829,10 +1083,72 @@ function M.tick(S, clock)
   end
   if S.role == "friend" and clock - (R.tPrune or 0) >= 0.1 then R.tPrune = clock; local okP, eP = pcall(ownLocalPrune, S, clock); if not okP then R.lastErr = tostring(eP) end end   -- (lane 66)
 end
+-- ---- (lane 79) "no claim while enemy units are present", asked on the host
+-- The map's region view (regionViewOverlay_C:updateRegionDetails) asks the region Region:areAnyEnemySquadsPresent and
+-- switches both claim buttons off (by influence, by king's favour) while it is true, with the tooltip below. The rule
+-- lives in that screen only: the game's layClaim does not ask again (lane 79: on the host, with raiders in the region
+-- and the buttons off, layClaim still laid the claim). The host carries out a friend's claim through layClaim, so a
+-- friend whose copy does not (yet) hold an enemy squad the host holds could lay a claim the host's screen forbids.
+-- So the host asks its own game first. The region view's flag is read only for these two buttons (lane 79,
+-- out/bp_enemiesPresent.txt: four reads, all in updateRegionDetails / updateOptionVisibility, for claim_inf and
+-- claim_favour); no other friend action the host replays is switched off by it. A host player's own claim goes
+-- through the game's screen as before.
+local CLAIM_ENCAMPED = true                     -- includeEncamped, as the region view asks it (see the lane 79 report)
+local CLAIM_ENEMY_TEXT = "Can't claim when enemy units are present"   -- the claim box's tooltip, the game's own words
+local function claimForbidden(reg)
+  local ok, v = pcall(function() return reg:areAnyEnemySquadsPresent(CLAIM_ENCAMPED) end)
+  if not ok then
+    -- the question could not be asked: the claim goes through as before (logged, so a run shows it)
+    log("realm: the game's \"enemies present\" question failed (%s): the claim is not checked", tostring(v))
+    return nil
+  end
+  if v == true then return CLAIM_ENEMY_TEXT end
+  return nil
+end
+-- friend: the host refused this player's claim. Tell the player, and take the host's claims and the lord's influence
+-- and favour at once (this copy's own layClaim already laid the claim and spent the favour or influence here); the
+-- usual correction would come only after GRACE.
+local function claimRefused(S, value, to, text)
+  if to ~= S.name then return end
+  local tag = tostring(value):match("^([^:]+)")
+  local why = text and dec(text) or CLAIM_ENEMY_TEXT
+  log("realm: the host refused this player's claim on %s: %s", tostring(tag), why)
+  R.stats.refusedHere = (R.stats.refusedHere or 0) + 1
+  local Lm = C.lord
+  if tag then
+    if Lm and Lm.claimHow then Lm.claimHow[tag] = nil end      -- not sent again by the 10 s rule
+    R.claimSent[tag] = os.clock()
+  end
+  for _, item in ipairs({ "claims_P", "lord_P" }) do
+    local H = R.gHost[item]
+    if H and H.v then
+      local ok, e = pcall(applyGlobal, S, item, H.v)
+      if ok then H.since = nil else log("realm: after the refused claim, %s not taken from the host at once (%s): the usual correction follows", item, tostring(e)) end
+    end
+  end
+  if C.notify then C.notify("refused", why) end
+end
+
+-- friend: the host laid this player's claim. From now on the host's list decides about it: the claim is no longer
+-- "on its way" (claimPending), so a later change of the host's (a war that takes the claim) is followed after 1 s.
+local function claimAccepted(S, value, to)
+  if to ~= S.name then return end
+  local tag = tostring(value):match("^([^:]+)")
+  if not tag then return end
+  local Lm = C.lord
+  if Lm and Lm.claimHow then Lm.claimHow[tag] = nil end
+  R.claimAck[tag] = os.clock()
+  log("realm: the host laid this player's claim on %s", tag)
+end
+
 function M.onMessage(S, from, kind, w, line)
   if kind ~= "R" then return false end
   fresh(S)
   local verb, rk, item, value = w[4], w[5], w[6], w[7]
+  if verb == "ATK" then                                     -- (lane 79) the host's "under attack" flags
+    if S.role == "friend" and w[5] then for k, v in w[5]:gmatch("([^,=]+)=([01])") do R.atkHost[k] = (v == "1") end end
+    return true
+  end
   if verb == "LOGASK" then                                  -- (lane 66) a friend's join or reload: the whole list once
     if S.role == "host" and R.on.notices and w[5] then
       logPoll(S)
@@ -890,16 +1206,29 @@ function M.onMessage(S, from, kind, w, line)
     if S.role == "friend" and verb == "IS" then
       local H = R.gHost[item]; if not H then H = {}; R.gHost[item] = H end
       if H.v ~= value then H.v = value; if not (item == "claims_P" and H.since) then H.since = nil end end
+      if item == "mercs" then local n = recCount(value); if n ~= R.mercHostN then R.mercHostN = n; R.mercHostNT = os.clock() end end   -- (lane 88)
+    elseif S.role == "friend" and verb == "NO" and item == "claim" then
+      claimRefused(S, value, w[8], w[9])
+    elseif S.role == "friend" and verb == "OK" and item == "claim" then
+      claimAccepted(S, value, w[8])
     elseif S.role == "host" and verb == "SET" and item == "claim" then
       local tag, how = value:match("^([^:]+):(%a)$")
       local reg = tag and regionByKey(S, tag)
       -- a region the lord already holds is never claimed from a message: the game itself would take the claim
       -- (lane 16, measured: layClaim on the own home region adds a claim of 14 days)
       local own = reg and valid(reg.ownerPawn) and addr(reg.ownerPawn) == addr(S.p1)
+      local why = (reg and not own) and claimForbidden(reg) or nil
       if reg and own then log("realm: %s's claim on %s refused: the lord already holds that region", tostring(from), tag)
+      elseif why then
+        -- (lane 79) the region view's own rule, asked on the host's game: the friend is told in the game's words
+        log("realm: %s's claim on %s with %s refused: %s (the host's game: enemy units of the region's owner stand in it)",
+          tostring(from), tag, how == "f" and "king's favour" or "influence", why)
+        A.send(string.format("R NO _ claim %s:%s %s %s", tag, how or "i", tostring(from), enc(why)))
+        R.stats.refused = (R.stats.refused or 0) + 1
       elseif reg and not claimTags(claimsStr(S.p1))[tag] then
         local ok, e = pcall(function() S.p1:layClaim(reg, how == "f", true) end)
         log("realm: %s lays a claim on %s with %s%s", tostring(from), tag, how == "f" and "king's favour" or "influence", ok and "" or (" FAILED " .. tostring(e)))
+        if ok then A.send(string.format("R OK _ claim %s:%s %s", tag, how or "i", tostring(from))) end   -- (lane 79) the sender's claim is the host's now
         if ok and C.panels and C.panels.touched then pcall(C.panels.touched, "R:claim", nil) end   -- (lane 69) open panels redraw
       end
     end

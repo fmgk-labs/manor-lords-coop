@@ -115,6 +115,16 @@ end
 --   spread    friend: gives that come from host lines pass a queue: at most cfg.giveMax and cfg.giveMs a frame, the
 --             villager nearest to the camera first, none waiting longer than cfg.giveWait wall seconds
 --   evLog     friend: one log line per call-up and per send-home of this copy (what came of each man's host lines)
+-- Let the scene reserve registered carts at the host's stands and the game finish their pickup and return.
+-- ON by default (lane 74, round 3: sessions don1 to don3, hand cart rows 0 late and 0 never; with it off 1,237 late).
+-- Development only, like COOP_ROLE: COOP_TEST_CARTPUT=0 in a test copy's environment switches it off from the load
+-- on (the runs with the feature off); any other value, or none, leaves it on.
+if J.cfg.cartPut == nil then J.cfg.cartPut = (os.getenv("COOP_TEST_CARTPUT") ~= "0") end
+-- (lane 74) with cartPut: also the timber carts of the oxen. ON by default since round 4: the friend's ox no longer
+-- takes its timber cart by its own choice (native OXCART in PICK, 0.9.12; before it the game gave the ox that pickup
+-- about every 0.55 s while it stood at the cart, 33 times in 6 s in session l74on). Development only, like COOP_ROLE:
+-- COOP_TEST_CARTTIMBER=0 in a test copy's environment switches it off from the load on.
+if J.cfg.cartTimber == nil then J.cfg.cartTimber = (os.getenv("COOP_TEST_CARTTIMBER") ~= "0") end
 for k, v in pairs({ keep = true, solTell = true, hereWait = 8.0, spread = true, giveMs = 2.0, giveMax = 6, giveWait = 1.0, evLog = true, evAfter = 12.0 }) do
   if J.cfg[k] == nil then J.cfg[k] = v end
 end
@@ -179,7 +189,9 @@ local function traderNoLoad(u, s)
   if m ~= nil and got(function() return m:IsValid() end, false) then return false end
   J.n.trader_no_load = (J.n.trader_no_load or 0) + 1; return true
 end
-local function setHands(u, s)
+local setHands
+function J.setHands(u, s) return setHands(u, s) end
+setHands = function(u, s)
   if traderNoLoad(u, s) then return end                        -- (lane 54, round two)
   local want = {}
   if s ~= "0" then for g, n in s:gmatch("(%-?%d+)x(%-?%d+)") do want[#want + 1] = { Type = math.tointeger(tonumber(g)), amt = math.tointeger(tonumber(n)) } end end
@@ -194,6 +206,10 @@ local function setHands(u, s)
   end
   -- what a player sees: the carried good is the equipment of its slot (lane 23 probe: slot 1 holds the good carried,
   -- e.g. 228 while 228x1 is in hands, 0 when empty): the game's own equip / unequip
+  -- (lane 74) not while the villager holds a hand cart: its goods ride in the cart and the slot shows the cart. The
+  -- unequip of that slot is the game's cart drop (sitting word_b2: a load cleared 0.2 s after the cart was given
+  -- left the cart standing loose where the villager walked, twice in 300 s)
+  if got(function() return u:isEquipped(218) end, false) then return end
   if #want > 0 then pcall(function() u:equip(want[1].Type, true, true) end)
   elseif old ~= 0 then pcall(function() u:unequip(u:GetItemEquipmentSlot(old, true)) end) end
 end
@@ -210,7 +226,12 @@ local function here(o)
   if not valid(o) then return false end
   if J.test and J.test.noHere then return true end
   local ok, gone = pcall(function() return o:IsActorBeingDestroyed() end)
-  return not (ok and gone == true)
+  if ok and gone == true then return false end
+  -- (lane 88, run l88o: the friend crashed reading through a freed object) the call above answered false for every
+  -- destroyed felled tree in lane 88's probe p88a; the reflected field told all 7 apart. A destroyed actor (by the
+  -- ground module on a friend, or by the game) must never reach setTask or the resource index
+  local okF, f = pcall(function() return o.bActorIsBeingDestroyed end)
+  return not (okF and f == true)
 end
 local function bHere(b)
   if not here(b) then return false end
@@ -225,7 +246,17 @@ local function bHere(b)
   return false
 end
 local BREF = { targetBuilding = true, finalBuilding = true }
-local function refHere(k, o) if BREF[k] then return bHere(o) end; return here(o) end
+-- (lane 64, task 64d) a task record's resource is of no native table, so the guard of kept handles in valid() cannot
+-- know that it was used up and freed: its address is looked up in the engine's object array first (coop_snap.lua
+-- N.aliveNow, at most one native look a tick); a freed one is never touched and the record does not reach the game
+local function refHere(k, o)
+  if BREF[k] then return bHere(o) end
+  if k == "Resource" then
+    local Ns = rawget(C, "snap"); local a = got(function() return o:GetAddress() end, nil)
+    if Ns and Ns.aliveNow and a then local v = Ns.aliveNow({ a })[a]; if v == false then bump("res_freed"); return false end end
+  end
+  return here(o)
+end
 
 -- ---------------------------------------------------------------- names that are equal on every copy
 local function bkey(b) local l = b:K2_GetActorLocation(); return string.format("%d,%d,%d", A.btype(b), rnd(l.X), rnd(l.Y)) end
@@ -244,48 +275,92 @@ end
 
 -- a resource (berries, stone, fish, a felled tree ...) by its place: an index of every Resource actor, by whole metres,
 -- rebuilt when a place is not found (at most every 10 s). The engine's findResourceByPos did not find them.
+-- (lane 64, task 64d) THE INDEX KEEPS HANDLES PAST THEIR TICK (up to the next rebuild, which comes only when a place
+-- is not found): a resource used up, a felled tree cut up, a hand cart taken away is freed by the engine later, and
+-- valid() on such a handle reads freed memory (IsValid has said "true" there, lane 47; the call behind it then ends
+-- the copy). Resources are in no native table, so the guard in valid() cannot know. Each entry now keeps the handle
+-- with its address and its place at the rebuild; the candidates are taken by place in the index (nothing touched),
+-- their addresses are looked up in the engine's object array (coop_snap.lua N.aliveNow: one native look for all of
+-- them, at most one a tick), and only a living one is touched (valid(), its place, as before). A freed one leaves the
+-- index untouched. An index made in this very tick needs no look. Without a native answer valid() decides, as before.
 local function resKey(x, y) return rnd(x / 100) .. ":" .. rnd(y / 100) end
+local function resAlive(cands)
+  local Ns = rawget(C, "snap")
+  if J.resTick == C.s.ticks or not (Ns and Ns.aliveNow) then return nil end
+  local list = {}; for i, e in ipairs(cands) do list[i] = e.a end
+  return Ns.aliveNow(list)
+end
+local function resEntry(r)
+  local ok, l = pcall(function() return r:K2_GetActorLocation() end); local okA, a = pcall(function() return r:GetAddress() end)
+  if ok and l and okA and a then return { r = r, a = a, x = l.X, y = l.Y, k = resKey(l.X, l.Y) } end
+end
 local function findRes(s, clock)
   local x, y = s:match("^(%-?%d+),(%-?%d+),"); if not x then return nil end
   x, y = tonumber(x), tonumber(y)
+  local function usable(r)
+    if not here(r) then return false end
+    if not (C.cartStands and C.cartStands.ready(C.s)) then return true end
+    return not C.cartStands.isCart(C.s, r)
+  end
   for pass = 1, 2 do
     local idx = J.res
     if idx then
-      for dx = -1, 1 do for dy = -1, 1 do
-        local r = idx[resKey(x + dx * 100, y + dy * 100)]
-        if valid(r) then local l = r:K2_GetActorLocation(); if math.abs(l.X - x) < 60 and math.abs(l.Y - y) < 60 then return r end end
-      end end
-    end
-    if idx and (J.cfg.resNear or 0) > 0 and (pass == 2 or clock - (J.resT or -100) < 10.0) then   -- after a rebuild only
-      -- (lane 19, gap 3) not at that place: the nearest resource within cfg.resNear (a felled tree lies where it fell
-      -- on this copy, a hand cart where this copy's villager left it)
-      local R = math.ceil(J.cfg.resNear / 100); local best, bd
-      for dx = -R, R do for dy = -R, R do
-        local r = idx[resKey(x + dx * 100, y + dy * 100)]
-        if valid(r) then local l = r:K2_GetActorLocation(); local d = (l.X - x) ^ 2 + (l.Y - y) ^ 2
-          if d <= J.cfg.resNear * J.cfg.resNear and (not bd or d < bd) then best, bd = r, d end end
-      end end
-      if best then bump("res_near"); return best end
-      -- (lane 23, gap b) a felled tree falls another way on each copy: the probe on two copies (out/bfix_pend_friend1.txt)
-      -- found the friend's felled tree 5 to 20 m from the host's in 50 of 78 waits. The nearest felled tree within
-      -- cfg.resFar is taken (only felled trees: other resources keep the 5 m rule)
+      -- the candidates: the 3 x 3 metres at the place; after a rebuild only (lane 19, gap 3) every resource within
+      -- cfg.resNear (a felled tree lies where it fell on this copy, a hand cart where this copy's villager left it) and
+      -- (lane 23, gap b) every felled tree within cfg.resFar (a felled tree falls another way on each copy: the probe on
+      -- two copies, out/bfix_pend_friend1.txt, found the friend's felled tree 5 to 20 m from the host's in 50 of 78
+      -- waits; only felled trees: other resources keep the 5 m rule)
+      -- (lane 74) a hand cart of the cart module is never a task's resource: the place and the near look take only what
+      -- usable() above allows (here, and no cart while the cart module is ready); the felled trees keep valid() alone
+      local near = (J.cfg.resNear or 0) > 0 and (pass == 2 or clock - (J.resT or -100) < 10.0)
       local RF = J.cfg.resFar or 0
-      if RF > 0 and J.fallen then
+      local c1, c2, c3 = {}, {}, {}
+      for dx = -1, 1 do for dy = -1, 1 do local e = idx[resKey(x + dx * 100, y + dy * 100)]; if e then c1[#c1 + 1] = e end end end
+      if near then
+        local R = math.ceil(J.cfg.resNear / 100)
+        for dx = -R, R do for dy = -R, R do local e = idx[resKey(x + dx * 100, y + dy * 100)]; if e then c2[#c2 + 1] = e end end end
+        if RF > 0 and J.fallen then
+          for _, e in ipairs(J.fallen) do if not e.gone and (e.x - x) ^ 2 + (e.y - y) ^ 2 <= RF * RF then c3[#c3 + 1] = e end end
+        end
+      end
+      local all = {}; for _, t in ipairs({ c1, c2, c3 }) do for _, e in ipairs(t) do all[#all + 1] = e end end
+      local alive = resAlive(all)
+      -- an entry is touched only after the look: a freed one leaves the index untouched; a living one then answers
+      -- lane 74's usable() (the place and the near look) or valid() (the felled trees), as before
+      local function entryOk(e, felled)
+        if e.gone then return false end
+        if alive and alive[e.a] == false then
+          e.gone = true; if idx[e.k] == e then idx[e.k] = nil end; bump("res_freed")
+          return false
+        end
+        if felled then return here(e.r) end           -- (lane 88, l88o crash: valid() alone let a destroyed felled tree reach setTask)
+        return usable(e.r)
+      end
+      for _, e in ipairs(c1) do
+        if entryOk(e) then local l = e.r:K2_GetActorLocation(); if math.abs(l.X - x) < 60 and math.abs(l.Y - y) < 60 then return e.r end end
+      end
+      if near then
+        local best, bd
+        for _, e in ipairs(c2) do
+          if entryOk(e) then local l = e.r:K2_GetActorLocation(); local d = (l.X - x) ^ 2 + (l.Y - y) ^ 2
+            if d <= J.cfg.resNear * J.cfg.resNear and (not bd or d < bd) then best, bd = e.r, d end end
+        end
+        if best then bump("res_near"); return best end
         local fb, fd
-        for _, r in ipairs(J.fallen) do
-          if valid(r) then local l = r:K2_GetActorLocation(); local d = (l.X - x) ^ 2 + (l.Y - y) ^ 2
-            if d <= RF * RF and (not fd or d < fd) then fb, fd = r, d end end
+        for _, e in ipairs(c3) do
+          if entryOk(e, true) then local l = e.r:K2_GetActorLocation(); local d = (l.X - x) ^ 2 + (l.Y - y) ^ 2
+            if d <= RF * RF and (not fd or d < fd) then fb, fd = e.r, d end end
         end
         if fb then bump("res_fallen_near"); return fb end
       end
     end
     if pass == 2 or (idx and clock - (J.resT or -100) < (J.cfg.resIndexEvery or 10.0)) then return nil end
-    idx = {}; J.resT = clock
+    idx = {}; J.resT = clock; J.resTick = C.s.ticks
     for _, r in ipairs(FindAllOf("Resource") or {}) do
-      if valid(r) then local ok, l = pcall(function() return r:K2_GetActorLocation() end); if ok and l then idx[resKey(l.X, l.Y)] = r end end
+      if valid(r) then local e = resEntry(r); if e then idx[e.k] = e end end
     end
     J.res = idx; bump("resource_index")
-    local fl = {}; for _, r in ipairs(FindAllOf("FallenTreeBP_C") or {}) do if valid(r) then fl[#fl + 1] = r end end
+    local fl = {}; for _, r in ipairs(FindAllOf("FallenTreeBP_C") or {}) do if valid(r) then local e = resEntry(r); if e then fl[#fl + 1] = e end end end
     J.fallen = fl
   end
   return nil
@@ -402,7 +477,20 @@ local function encPT(p) return string.format("%d,%d,%d,%d,%d", rnd(p.Pos.X), rnd
 local PLOTPLACE = { [11] = true, [12] = true, [46] = true }
 local function fin(v) v = tonumber(v) or 0; return v == v and v < 1e12 and v > -1e12 end
 local function z(v) return fin(v) and rnd(v) or 0 end
-local function encPlot(e, t, ty, tu, fu, res)
+-- (lane 74) what kind of resource a start names, as the line's last word: "c" a hand cart, "t" a felled tree, "r" any
+-- other, "-" none. A friend's own carts stand where its own villagers left them (the scene module draws the host's):
+-- by the place alone the board found no cart there and the start waited 12 s for nothing (game run: every start "not
+-- given" with the change on was a 23 at the cart's stand beside the storehouse; lane 19's lines show the trip: 23 at
+-- the cart, the fetch 22, then 47 "drop" of good 218 at the same place).
+local function resKind(ro)
+  local cls = valid(ro) and ro:GetClass()
+  local n = valid(cls) and cls:GetFName():ToString() or ""
+  if n:find("Handcart", 1, true) then return "c" end
+  if n:find("TimberCart", 1, true) then return "w" end       -- (lane 74) the timber cart an ox pulls
+  if n:find("FallenTree", 1, true) then return "t" end
+  return "r"
+end
+local function encPlot(e, t, ty, tu, fu, res, rk)
   local TL, FL, el, p = t.TargetLocation, t.finalLocation, t.targetEntityLocation, e.u.realPos
   if not (fin(TL.Pos.X) and fin(TL.Pos.Y) and fin(TL.Pos.Z) and fin(p.X) and fin(p.Y) and fin(p.Z)) then bump("plot_bad_tl"); return nil end
   local tb, fb = t.targetBuilding, t.finalBuilding
@@ -412,8 +500,8 @@ local function encPlot(e, t, ty, tu, fu, res)
     for _, x in ipairs(v) do if not fin(x) then bad = true; bump("plot_bad_" .. k); break end end
   end
   if bad then bump("plot_named") end
-  return string.format("%s %d %d %d %s %s %s %s %s %s %s %d,%d,%d %d %d,%d,%d %s", e.key, ty, t.resourceType, t.resourceAmt, valid(tb) and bkey(tb) or "-", valid(fb) and bkey(fb) or "-",
-    tu, fu, res, pt(TL), pt(FL), z(el.X), z(el.Y), z(el.Z), t.bPaidInAdvance and 1 or 0, z(p.X), z(p.Y), z(p.Z), e.hs or "0")
+  return string.format("%s %d %d %d %s %s %s %s %s %s %s %d,%d,%d %d %d,%d,%d %s %s", e.key, ty, t.resourceType, t.resourceAmt, valid(tb) and bkey(tb) or "-", valid(fb) and bkey(fb) or "-",
+    tu, fu, res, pt(TL), pt(FL), z(el.X), z(el.Y), z(el.Z), t.bPaidInAdvance and 1 or 0, z(p.X), z(p.Y), z(p.Z), e.hs or "0", rk or "-")
 end
 local function encTask(e, t, ty)
   if not GIVE[ty] then return nil, "type" .. ty end
@@ -421,23 +509,31 @@ local function encTask(e, t, ty)
   local tu, fu = uref(t.targetUnit), uref(t.finalUnit)
   if not tu or not fu then return nil, ty == FOLLOW and "animal" or "unit" end
   if valid(t.targetBuildingPart) then return nil, "part" end
-  local res = "-"; local ro = t.Resource
+  local res, rk = "-", "-"; local ro = t.Resource
   if valid(ro) then
     local ok, l = pcall(function() return ro:K2_GetActorLocation() end); if not ok then return nil, "resource" end
-    res = string.format("%d,%d,%d", rnd(l.X), rnd(l.Y), rnd(l.Z))
+    res = string.format("%d,%d,%d", rnd(l.X), rnd(l.Y), rnd(l.Z)); rk = resKind(ro)
   end
   local tb, fb = t.targetBuilding, t.finalBuilding; local el = t.targetEntityLocation
   -- (lane 23) a place that is not a finite number (seen once a run on the host: "bad argument #13 to 'format'", the
   -- entity place) cannot be named: the start goes out as unnamed instead of failing in format
   -- (seen again in d4 at encPT: the target or final place) every place of the line is checked
-  if PLOTPLACE[ty] and J.cfg.plotPlace ~= false then local okP, sP = pcall(encPlot, e, t, ty, tu, fu, res); if okP and sP then return sP end end   -- (lane 54, round two)
+  if PLOTPLACE[ty] and J.cfg.plotPlace ~= false then local okP, sP = pcall(encPlot, e, t, ty, tu, fu, res, rk); if okP and sP then return sP end end   -- (lane 54, round two)
   local p0, TL, FL = e.u.realPos, t.TargetLocation, t.finalLocation
   for _, v in ipairs({ el.X, el.Y, el.Z, TL.Pos.X, TL.Pos.Y, TL.Pos.Z, TL.Rotation.Yaw, FL.Pos.X, FL.Pos.Y, FL.Pos.Z, FL.Rotation.Yaw, p0.X, p0.Y, p0.Z, tonumber(TL.floor) or 0, tonumber(FL.floor) or 0 }) do
     if v ~= v or v > 1e12 or v < -1e12 then return nil, "place" end   -- (lane 46) also a finite place too large for %d
   end
   local p = e.u.realPos
-  return string.format("%s %d %d %d %s %s %s %s %s %s %s %d,%d,%d %d %d,%d,%d %s", e.key, ty, t.resourceType, t.resourceAmt, valid(tb) and bkey(tb) or "-", valid(fb) and bkey(fb) or "-",
-    tu, fu, res, encPT(t.TargetLocation), encPT(t.finalLocation), rnd(el.X), rnd(el.Y), rnd(el.Z), t.bPaidInAdvance and 1 or 0, rnd(p.X), rnd(p.Y), rnd(p.Z), e.hs or "0")
+  local stand = ty == 23 and rk == "c" and C.scene and C.scene.cartStart and C.scene.cartStart(ro)
+  if ty == 23 and rk == "c" then e.cartOrigin = stand end
+  if ty == 47 and tonumber(t.resourceType) == 218 then stand = e.cartOrigin or "-" end
+  local cartState = stand and (" " .. stand .. " " .. C.s.worlds .. (e.u:isEquipped(218) and " 1" or " 0")) or ""
+  if stand and ty == 47 and C.cartStands then
+    local total,region,count=C.cartStands.dropStarted(C.s,e,t,stand)
+    if total then cartState=cartState..string.format(" %d,%d,%d",total,region,count) end
+  end
+  return string.format("%s %d %d %d %s %s %s %s %s %s %s %d,%d,%d %d %d,%d,%d %s %s%s", e.key, ty, t.resourceType, t.resourceAmt, valid(tb) and bkey(tb) or "-", valid(fb) and bkey(fb) or "-",
+    tu, fu, res, encPT(t.TargetLocation), encPT(t.finalLocation), rnd(el.X), rnd(el.Y), rnd(el.Z), t.bPaidInAdvance and 1 or 0, rnd(p.X), rnd(p.Y), rnd(p.Z), e.hs or "0", rk, cartState)
 end
 
 -- (lane 74) the host's side of the call-up and send-home log lines (cfg.evLog): when each villager became a soldier or
@@ -848,6 +944,7 @@ function J.regAudit(S, clock)
 end
 
 local function gateClose(S, why)                               -- the plain game again: the list first, then the byte
+  if C.cartStands then C.cartStands.reset(S) end
   if not J.gateOn then return end
   chooseOff()
   local n = got(function() return emptyList(J.gateEng) end, -1)
@@ -975,6 +1072,17 @@ end
 -- fallen here (its felling ends) the felling is not cut by the board (every give and walkThere waits; the host's
 -- latest start is queued and given at the felling's end) and FELL is sent again every 0.2 s, at most cfg.fellWait game s.
 -- Coop.jobs.cfg.fell = false (console only) gives the before of a test.
+-- (lane 88) has a tree fallen here already at this standing place? (a felled tree whose standing tree stood within 1 m;
+-- handles from FindAllOf in this call, read only)
+local function fellenHere(el)
+  for _, r in ipairs(FindAllOf("FallenTreeBP_C") or {}) do
+    if valid(r) then
+      local ok, x, y = pcall(function() local tr = r.TreeFallingInitialTransform; return tr.Translation.X, tr.Translation.Y end)
+      if ok and x and math.abs(x - el.X) <= 100 and math.abs(y - el.Y) <= 100 then return true end
+    end
+  end
+  return false
+end
 local function fellRegion(t)
   local b = t.targetBuilding; if not bHere(b) then return nil end
   local rg = got(function() return b:GetRegion() end, nil); if not valid(rg) then return nil end
@@ -991,7 +1099,21 @@ local function fellAtHostEnd(w, clock)
   end
   local u = e.u; if not valid(u) then return end
   local n, ty, _, t = peek(u)
-  if n == 0 or ty ~= 3 then bump("fell_not_felling"); return end
+  if n == 0 or ty ~= 3 then
+    bump("fell_not_felling")
+    -- (lane 88) the host's felling ended and this copy's woodcutter is on another task: the tree would never fall here
+    -- (probe p88c: 11 of 83 fellings; 5 trees the host had stayed host-only until used up, both towns). It gets the
+    -- host's felling now (the board's own give; the pending felling lets this one give pass, fellHolds) and FELL is sent
+    -- once it fells, within cfg.fellWait game s. Design: lanes/lane_s21_88/design_trees_fell.txt (B).
+    if J.cfg.fellLate ~= false and J.giveLate and not fellenHere(el) then
+      J.fellP = J.fellP or {}
+      J.fellP[e.key] = { x = el.X, y = el.Y, t0 = clock, tl = clock, late = true, rec = h.rec }
+      local ok = J.giveLate(e, { rec = h.rec, ident = h.ident, t = clock, hp = h.hp }, clock)
+      if not ok then J.fellP[e.key] = nil end
+      bump(ok and "fell_late_given" or "fell_late_refused")
+    end
+    return
+  end
   local te = t.targetEntityLocation
   if math.abs(te.X - el.X) > 2 or math.abs(te.Y - el.Y) > 2 then bump("fell_other_tree"); return end
   local rg = fellRegion(t); if not rg then bump("fell_no_region"); return end
@@ -1000,12 +1122,16 @@ local function fellAtHostEnd(w, clock)
   bump(C.patch.fell(rg, te.X, te.Y) and "fell_sent" or "fell_unavailable")
 end
 -- every friend tick: each pending felling still on its tree gets FELL again (0.2 s); one whose felling ended is done
+-- (lane 88) a late felling (fellAtHostEnd gave it) waits for its woodcutter to start it, within cfg.fellWait game s
 local function fellTick(clock, speed)
   for k, p in pairs(J.fellP) do
     local e = J.byKey and J.byKey[k]; local u = e and e.u; local done = not (u and valid(u))   -- (never a handle kept from an earlier list)
     local n, ty, tx, t
     if not done then n, ty, tx, t = peek(u); done = n == 0 or ty ~= 3 or math.abs(t.targetEntityLocation.X - p.x) > 2 or math.abs(t.targetEntityLocation.Y - p.y) > 2 end
-    if done then
+    if p.late and not done then p.late = nil; bump("fell_late_started") end
+    if p.late and done and u and valid(u) then
+      if (clock - p.t0) * speed > (J.cfg.fellWait or 30.0) then J.fellP[k] = nil; bump("fell_late_timeout") end
+    elseif done then
       -- the board's next look sees the end and gives the queued start (after_prev); the felled tree: the index again
       J.fellP[k] = nil; bump("fell_done"); bump("fell_done_ms", math.floor((clock - p.t0) * 1000)); J.resT = nil
     elseif (clock - p.t0) * speed > (J.cfg.fellWait or 30.0) then J.fellP[k] = nil; bump("fell_timeout")
@@ -1019,6 +1145,7 @@ end
 -- host is kept as the queued one (given when the felling ends), a "stand here" is dropped
 local function fellHolds(e, q)
   local p = J.fellP and J.fellP[e.key]; if not p then return false end
+  if p.late and q and q.rec == p.rec then return false end      -- (lane 88) the late felling itself is given
   if q and not q.hold and not q.again then e.q = { rec = q.rec, ident = q.ident, t = q.t or os.clock(), hp = q.hp, carry = q.carry } end
   if q and not q.hold and q.again and e.host then e.q = { rec = e.host.rec, ident = e.host.ident, t = e.host.t or os.clock(), hp = e.host.hp } end
   bump("fell_held"); return true
@@ -1149,14 +1276,25 @@ local function give(e, q, clock)
   -- A record may have waited (at most cfg.grace game seconds): a building demolished or a felled tree used up in that
   -- time must not reach the game.
   for _, k in ipairs(REFS) do if q.rec[k] ~= nil and not refHere(k, q.rec[k]) then e.q = nil; e.host = nil; bump("skip_gone"); return false end end
+  if C.cartStands and not C.cartStands.canGive(C.s,q.rec,e,q.rec.Resource) then
+    if e.q == q then e.q=nil end
+    bump("cart_give_refused"); return false
+  end
   if not q.hold and not q.again then place(C.s, e, q.hp) end
   if C.traceF then C.trace("jobs setTask give " .. e.key .. " " .. tostring(q.ident)) end
   local ok, er = pcall(function() e.u:setTask(q.rec) end)
   e.q = nil
-  if not ok then bump("errors"); J.lastErr = tostring(er); return false end
+  if not ok then
+    bump("errors"); J.lastErr = tostring(er); return false
+  end
+  if C.cartStands and C.cartStands.afterGive then C.cartStands.afterGive(e) end   -- (lane 74) a hand cart that waited for this give
   if tonumber(q.rec.Type) == FOLLOW then pcall(guideGive, e, q.rec) end   -- (lane 49) the leader holds the ox
   -- (lane 23, diagnosis) test only: every give, one line, when J.giveLog is an open file (set from the console)
   if J.giveLog then pcall(function() J.giveLog:write(string.format("G\t%.3f\t%s\t%s\t%s\t%s\n", A.now(), e.key, tostring(q.rec.Type), q.hold and "hold" or (q.again and "again" or "given"), why or "-")) end) end
+  if type(J.giveLog) == "table" and J.giveLog.cartGiven then
+    local seq = q.from or (e.host and e.host.rec == q.rec and e.host.from)
+    J.giveLog.cartGiven(e.key,seq,q.rec)
+  end
   e.given = q.ident; e.givenT = clock; e.isHold = q.hold or nil
   q.kept = nil; q.inq = nil; e.fp = nil                         -- (lane 74)
   local R = e.evR; if R and not q.hold and not R.give then R.give = clock; R.gty = tonumber(q.rec.Type) end
@@ -1237,7 +1375,10 @@ local function giveNow(e, q, clock)
   if q.inqT then local w = clock - q.inqT; if w > (J.gqWaitMax or 0) then J.gqWaitMax = w end; local R = e.evR; if R then R.qw = w end end
   return ok
 end
-local function later(e, q, why, clock)
+local later
+-- (lane 88) the late felling's give, through the board's own queue (set below, after the queue's functions)
+J.giveLate = function(e, q, clock) if not later then return false end; later(e, q, "fell_late", clock); return true end
+later = function(e, q, why, clock)
   q.gw = why
   local F = J.gf; if not F then F = { n = 0, ms = 0 }; J.gf = F end
   local G = J.gq
@@ -1411,6 +1552,21 @@ local function evLook(e, u, n, ty, t, clock)
   end
 end
 
+-- Remove the old position only when the moved cart held that resource-index entry.
+-- (lane 64, task 64d) the index's entries are records { r, a, x, y, k } (findRes above): the entry at the old place is
+-- a handle kept from the index's last rebuild, so it is compared by its address only and never touched; the moved cart
+-- (a handle of this tick: the cart module has just moved it) goes in as such a record, so the native look covers it
+-- like every other entry (a bare handle there would be read by findRes after the engine may have freed the cart)
+function J.cartMoved(cart,from,to)
+  if not J.res or not here(cart) then return end
+  local a = got(function() return cart:GetAddress() end, nil)
+  if not a then return end
+  local k = resKey(from.X,from.Y)
+  local old = J.res[k]
+  if type(old) == "table" and old.a == a then J.res[k] = nil end
+  local nk = resKey(to.X,to.Y)
+  J.res[nk] = { r = cart, a = a, x = to.X, y = to.Y, k = nk }
+end
 local function onStart(S, w, clock)
   if J.skip and J.skip[w[5]] then J.skipW = J.skipW or {}; J.skipW[w[5]] = w; bump("skip_test"); return end   -- (lane 23, diagnosis) test only
   local e = J.byKey and J.byKey[w[5]]
@@ -1428,6 +1584,20 @@ local function onStart(S, w, clock)
   local hp; local hx, hy, hz = (w[18] or ""):match("^(%-?%d+),(%-?%d+),(%-?%d+)$")
   if hx then hp = { X = hx + 0.0, Y = hy + 0.0, Z = hz + 0.0 } end
   local function skip(why) bump(why); bump(why .. (e.own and "_own" or "_other")); e.free = true; e.host = nil; e.q = nil; if e.evR then e.evR.drop = why end; walkThere(e, ty == FOLLOW and hp or T.Pos, clock) end
+  -- (lane 74) HAND CARTS ON THE HOST'S WORD (cfg.cartPut). The host's villager goes to take a hand cart (23, kind "c")
+  -- or to park it (47 of good 218). This copy's villager only walks to that place: it never takes or parks by itself
+  -- (it did so seconds before or after the host's: three sittings, 53 of 78 returns right). The cart changes hands
+  -- when the host's snapshot says so (coop_cart_stands.lua).
+  local timber = C.cartStands and C.cartStands.timber()        -- (lane 74) an ox and its timber cart (good 345) the same way
+  local ox = e.key:sub(1, 1) == "o"                            -- an ox's lines are never turned into a walk by the hand cart rule
+  if C.cartStands and ((ty == 23 and ((w[20] == "c" and not ox) or (timber and w[20] == "w"))) or (ty == 47 and ((rec.resourceType == 218 and not ox) or (timber and (rec.resourceType == 345 or ox)))))
+     and C.cartStands.ready(S) then
+    C.cartStands.intent(S, e, ty == 23 and "pickup" or "return", w[21], T.Pos, clock)
+    bump(ty == 23 and "cart_walk_pickup" or "cart_walk_return")
+    e.pend = nil; e.free = true; e.host = nil; e.q = nil
+    walkThere(e, T.Pos, clock)
+    return
+  end
   -- (lane 74) a building or a unit the line names that is not here YET (a site the host's line for it has not made
   -- here so far, a family just moved in, the lists a rebuild behind): the start waits and looks again every half
   -- second, as a start does for its resource (lane 23), for cfg.hereWait wall seconds; until this lane it was dropped
@@ -1448,7 +1618,7 @@ local function onStart(S, w, clock)
   if w[11] ~= "-" then local x = J.byKey[w[11]]; if not (x and valid(x.u)) then if notHere("unit") then return end; return skip(w[11]:match("^[oa]") and "skip_no_animal" or "skip_no_unit") end; rec.targetUnit = x.u end
   if w[12] ~= "-" then local x = J.byKey[w[12]]; if not (x and valid(x.u)) then if notHere("unit") then return end; return skip("skip_no_unit") end; rec.finalUnit = x.u end
   if w[13] ~= "-" then
-    local r = findRes(w[13], clock)
+    local r = findRes(w[13],clock)
     if not valid(r) then
       -- (lane 23, gap b) a felled tree exists here only once this copy's own villager has felled it (it may still be
       -- chopping: the start lag): the start waits and the resource is looked for again, for cfg.resWait seconds
@@ -1468,7 +1638,7 @@ local function onStart(S, w, clock)
   e.pend = nil
   e.free = nil; bump("received"); if e.own then bump("received_own") end
   if e.evR and e.evR.home and not e.evR.line then e.evR.line = clock end   -- (lane 74) the send-home's log line
-  local q = { rec = rec, ident = ty .. "|" .. w[9] .. "|" .. w[10] .. (ty == FOLLOW and ("|" .. w[11]) or ""), t = clock, hp = hp }
+  local q = { rec = rec, ident = ty .. "|" .. w[9] .. "|" .. w[10] .. (ty == FOLLOW and ("|" .. w[11]) or ""), t = clock, hp = hp, from = w[1] }
   stamp(rec)                                                   -- (lane 59) this record is this world's
   -- (lane 49, round four) the target building's address, taken now while the handle is this frame's (ENDHOLD's list
   -- is made later from addresses only: no call on a handle kept from an earlier frame)
@@ -1746,6 +1916,7 @@ local function fresh(S)
   J.list, J.rlist, J.byKey, J.byAddr, J.listT, J.res, J.helloFor, J.carryTo, J.fallen, J.chSent = nil, nil, nil, nil, nil, nil, nil, nil, nil, nil
   J.mnt, J.arrB, J.fellP, J.goneU, J.va, J.vaFor, J.chSet, J.skipW, J.resT = nil, nil, nil, nil, nil, nil, nil, nil, nil
   J.kept, J.gq, J.gf, J.gqDirty, J.ev, J.evDone, J.orph, J.orphT, J.cam, J.frameT, J.hev, J.hevDone = nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil   -- (lane 74) every table that holds a unit or a record
+  J.carts = nil                                                  -- (lane 74) the hand carts looked at
   J.world = S.worlds; J.loadN = S.loads
 end
 local function tick(S, clock)
@@ -1777,10 +1948,12 @@ local function tick(S, clock)
     J.pzT = J.pzT or clock
     if clock - J.pzT > 3.0 and not J.pzAll then
       J.pzAll = true; local all = {}
-      for _, l in ipairs({ J.list or {}, J.rlist or {} }) do for _, e in ipairs(l) do
+      -- (lane 64, task 64d) a unit of the board's lists (kept up to cfg.refresh s) may have left the game since: live()
+      -- first (valid(): the guard of kept handles), then its load; a unit that left is not looked at
+      for _, l in ipairs({ J.list or {}, J.rlist or {} }) do for _, e in ipairs(l) do if live(e.u) then
         local hs = got(function() return handsOf(e.u) end, "0")
         if hs ~= "0" then all[#all + 1] = e.key .. "=" .. hs .. "@" .. got(function() return e.u.currentRegion.regionUniqueTag:ToString() end, "?") end
-      end end
+      end end end
       table.sort(all)
       log("jobs: paused 3 s, every board unit with a load (%d): %s", #all, table.concat(all, " "))
     end
@@ -1790,10 +1963,10 @@ local function tick(S, clock)
     J.pzT = J.pzT or clock
     if clock - J.pzT > 3.0 and not J.pzSaid then
       J.pzSaid = true; local o, n = {}, 0
-      for _, l in ipairs({ J.list or {}, J.rlist or {} }) do for _, e in ipairs(l) do
+      for _, l in ipairs({ J.list or {}, J.rlist or {} }) do for _, e in ipairs(l) do if live(e.u) then   -- (lane 64, task 64d: as above)
         local hs = got(function() return handsOf(e.u) end, "?")
         if (e.hl == nil and hs ~= "0") or (e.hl ~= nil and hs ~= e.hl) then n = n + 1; if #o < 8 then o[#o + 1] = string.format("%s have %s host %s%s", e.key, hs, tostring(e.hl), pwOn(e, clock) and " (pickup wait)" or "") end end
-      end end
+      end end end
       -- (round two) and every unit with a load that is on none of the board's lists (once per pause: the region dump's
       -- "units standing in the region" count units the board never names: l46s4..6, one good 16 off)
       local x, nx = {}, 0
@@ -1885,7 +2058,7 @@ local function onMessage(S, from, kind, w, line)
     end
     return true
   end
-  if S.role ~= "friend" or not J.cfg.on or not (valid(S.eng) and valid(S.p1)) then return true end
+  if S.role ~= "friend" or from ~= "host" or not J.cfg.on or not (valid(S.eng) and valid(S.p1)) then return true end
   if J.world ~= S.worlds then fresh(S) end                     -- (lane 59) never a line onto another world's entries
   local clock = os.clock()
   J.lastU = clock
@@ -1917,6 +2090,7 @@ local function onMessage(S, from, kind, w, line)
     if e.q and (e.q.kept or e.q.inq or (J.cfg.keep ~= false and valid(e.u) and notReady(e) == "soldier")) then e.q = nil; bump("kept_ended") end; e.fp = nil end end
   return true
 end
+J.replayCart = onMessage
 function J.orphLook(S, clock)
   for k, o in pairs(J.orph) do
     local e = J.byKey and J.byKey[k]
@@ -1938,5 +2112,6 @@ if C.stop ~= J.stopWrap then
   C.stop = J.stopWrap
 end
 -- (lane 59) idle: when the world the gate was opened in is gone, its units and engine are not called
+J.testFns = { findRes = findRes, refHere = refHere }   -- (lane 64, task 64d) for the desk test tests/lane64/t_fresh.lua only
 C.register("jobs", { onWorld = function(S) fresh(S) end, tick = tick, idle = function(S, clock) if J.gateOn then if not S.eng or J.loadN ~= S.loads then J.arrB = nil; J.gateEng = nil end; gateClose(S, "no world") end end, onMessage = onMessage })
 return "coop job board loaded"

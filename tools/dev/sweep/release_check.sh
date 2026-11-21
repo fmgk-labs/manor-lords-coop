@@ -34,6 +34,11 @@ for s in $SAVES; do
   V="PASS"; { [ "$HARD" != 0 ] || [ "$TH" != 0 ] || [ "$TF" != 0 ] || [ "$RS" != 0 ]; } && { V="FAIL"; FAIL=1; }
   say ""
   say "== $s: $V   $SUM   town lines host $TH friend $TF   resyncs $RS   warnings $WARN"
+  # (lane 81) the owner's real pointer at the sweep's start (read only): a pointer inside a test window decides that
+  # copy's hover; the sweep sets the camera and the town region itself and leaves the control hints out
+  PT=$(grep -a "^pointer at the start:" "$RUN/release_${LBL}_${s}_sweep.txt" | head -1 | sed 's/^pointer at the start: //')
+  case "$PT" in *INSIDE*) say "  pointer: $PT (cursor inside a test window)";; "") say "  pointer: not read";; *) say "  pointer: $PT";; esac
+  grep -a "^camera of both copies:" "$RUN/release_${LBL}_${s}_sweep.txt" | head -1 | sed 's/^/  /' | tee -a "$OUT" > /dev/null
   sed -n '/^BY KIND OF WIDGET/,/^$/p' "$D" | tee -a "$OUT"
   if [ "$HARD" != 0 ]; then
     say "  hard differences (panel | tab | widget | host / friend):"

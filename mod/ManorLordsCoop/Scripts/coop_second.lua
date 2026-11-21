@@ -16,12 +16,15 @@ local function addr(o) local ok, a = pcall(function() return o:GetAddress() end)
 local function ftext(s) return StaticFindObject("/Script/Engine.Default__KismetTextLibrary"):Conv_StringToText(s) end
 
 local function step()
-  local m = X.menu
-  if not valid(m) then
-    X.menu = nil; X.rows = {}
-    for _, w in ipairs(FindAllOf("mainMenu_widget_C") or {}) do if valid(w) then X.menu = w end end
-    m = X.menu
-  end
+  -- (lane 64, task 64d) the menu is found afresh at every step (once a second): a menu widget kept from a step before
+  -- may have been freed with its level, and valid() on freed memory can say "true"; this process has no native piece
+  -- to ask. The rows were made on the menu at one address: they are kept, and looked at, only while the menu found now
+  -- is at that address
+  local m
+  for _, w in ipairs(FindAllOf("mainMenu_widget_C") or {}) do if valid(w) then m = w end end
+  local ma = m and addr(m) or nil
+  if ma ~= X.menuA then X.rows = {}; X.menuA = ma end
+  X.menu = m
   if not valid(m) then return end
   local shown = false; pcall(function() shown = m:IsInViewport() end)
   if not shown then return end

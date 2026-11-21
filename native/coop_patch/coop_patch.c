@@ -40,7 +40,7 @@
 #include <limits.h>
 #include "coop_scan.h"
 
-#define COOP_PATCH_VERSION "0.9.7"    /* 0.9.7 (lane 71): COLLAPSE, SITEHP, MROLL, FAMROLL (coop_rolls.h); FIELD's audit puts the counted numbers back; status buffers 16 KB
+#define COOP_PATCH_VERSION "0.9.19"   /* 0.9.19 (lane 74, round 8; renumbered by the lead): PICK TIMBER 0 and PICK HANDCART 0 also drop the kept records (a new world, the module not ruling: no record of an old world is given); 0.9.18 (lane 83): TRK also skips a friend's own work-time adds (TADD1 4bcf780, TADD2 4bcf7f0: the time pie); 0.9.17 (lane 74, round 7; renumbered by the lead): HANDCART in PICK (a friend's villager takes a hand cart only on the host's word: PICK HANDCART); 0.9.16 (lane 87): BARNAN (a friend's site with no parts yet reads the game's own bar with no work done, not 0/0); 0.9.15 (lane 83): TRK (TRKHOLD ON|OFF: a friend's own production entries skipped, the host's carried; coop_trk.h); 0.9.14 (lane 87): NOROLL (a friend's own mercenary month roll returns at once; one call through on PASS for the realm module); 0.9.13 (lane 87): SITEHP takes a site of up to 1024 parts (was 64: every church, manor, tavern and large house was refused), HOLDX (the exact hold, the parts filled in list order), POLL by the fraction's bits, FILL (a site's parts full ahead of its finish); 0.9.12 (lane 74, round 3): OXCART in PICK (a friend's ox takes a timber cart only on the board's word: PICK OXEN, PICK TIMBER); 0.9.11 (lane 88): MERCCUT (a friend's mercenary offer count set to the host's); 0.9.10 (lane 64, round 5): NOMOURN (site NM: a friend's game no longer counts a home's mourning days itself); 0.9.9 (lane 83): the fertility history sends only the cells that differ (coop_hist.h); 0.9.8 (lane 76): GOODS pile rule (a new pile is not frozen at the game's first call; switch GOODS PILERULE); 0.9.7 (lane 71): COLLAPSE, SITEHP, MROLL, FAMROLL (coop_rolls.h); FIELD's audit puts the counted numbers back; status buffers 16 KB
                                        * 0.9.6 (lane 72; lane 66 adds the NOLOG site LOGPOP, the event window): HIST items, TRYADD/MAPADD (test copies) */
 /* 0.9.5 (lane 64): NODEATH */
 /* 0.9.4 and before: 0.9.2 (lane 62): a bug report takes the Steam piece's log and status; 0.9.3 (lane 66, provisional): NOTHEFT, NOLOG
@@ -248,6 +248,8 @@ static int goods_gone_status(char *buf, size_t len); /* lane 46: the goodsgone l
 static int totals_status(char *buf, size_t len);     /* the TOTALS lines (lane 22) */
 static int cursor_status(char *buf, size_t len);     /* lane 26: the CURSOR lines */
 static int hold_status(char *buf, size_t len);       /* lane 31: the HOLD lines */
+static int trk_status(char *buf, size_t len);        /* lane 83: the TRK line */
+static void trk_reset(void);                         /* lane 83: a new scan, nothing armed */
 static int cursor_scan(void);
 static int l28_status(char *buf, size_t len);        /* lane 28: the DRAW / ORDER lines */
 static int l53_status(char *buf, size_t len);        /* lane 53: the WALLSET line */
@@ -283,6 +285,8 @@ static int guide_status(char *buf, size_t len);      /* lane 49: the GUIDE line 
 static int guide_scan(void);
 static int fell_status(char *buf, size_t len);       /* lane 54: the FELL line */
 static int fell_scan(void);
+static int merc_status(char *buf, size_t len);       /* lane 88: the MERCCUT line */
+static int merc_scan(void);
 static int endhold_status(char *buf, size_t len);    /* lane 49, round four: the ENDHOLD line */
 static int maint_status(char *buf, size_t len);      /* lane 67: the MAINT line (coop_maint.h) */
 static int maint_scan(void);
@@ -307,6 +311,13 @@ static void mroll_tick(void);
 static int famroll_status(char *buf, size_t len);    /* lane 71: the FAMROLL line (coop_rolls.h) */
 static int famroll_scan(void);
 static void famroll_off(const char *why);
+static int noroll_status(char *buf, size_t len);     /* lane 87: the NOROLL line (coop_rolls.h) */
+static int noroll_scan(void);
+static void noroll_off(const char *why);
+static void noroll_tick(void);
+static int barnan_status(char *buf, size_t len);     /* lane 87 (the bar's cure 2): the BARNAN line (coop_rolls.h) */
+static int barnan_scan(void);
+static void barnan_off(const char *why);
 static int report_status(char *buf, size_t len);     /* lane 61: the REPORT line (coop_report.h) */
 static int nodeath_status(char *buf, size_t len);    /* lane 64: the NODEATH line (coop_die.h) */
 static int nodeath_scan(void);
@@ -356,6 +367,7 @@ static int write_status(void)              /* lane 45: 0 = not written yet (only
     n += snap_status(buf + n, sizeof(buf) - (size_t)n);     /* lane 47 */
     n += guide_status(buf + n, sizeof(buf) - (size_t)n);    /* lane 49 */
     n += fell_status(buf + n, sizeof(buf) - (size_t)n);     /* lane 54 */
+    n += merc_status(buf + n, sizeof(buf) - (size_t)n);     /* lane 88 */
     n += endhold_status(buf + n, sizeof(buf) - (size_t)n);  /* lane 49, round four */
     n += nodeath_status(buf + n, sizeof(buf) - (size_t)n);  /* lane 64 */
     n += nolog_status(buf + n, sizeof(buf) - (size_t)n);    /* lane 66 */
@@ -364,8 +376,11 @@ static int write_status(void)              /* lane 45: 0 = not written yet (only
     n += sitehp_status(buf + n, sizeof(buf) - (size_t)n);   /* lane 71 */
     n += mroll_status(buf + n, sizeof(buf) - (size_t)n);    /* lane 71 */
     n += famroll_status(buf + n, sizeof(buf) - (size_t)n);  /* lane 71 */
+    n += noroll_status(buf + n, sizeof(buf) - (size_t)n);   /* lane 87 */
+    n += barnan_status(buf + n, sizeof(buf) - (size_t)n);   /* lane 87 (the bar's cure 2) */
     n += report_status(buf + n, sizeof(buf) - (size_t)n);   /* lane 61 */
     n += hist_status(buf + n, sizeof(buf) - (size_t)n);     /* lane 72 */
+    n += trk_status(buf + n, sizeof(buf) - (size_t)n);      /* lane 83 */
     n += _snprintf(buf + n, sizeof(buf) - (size_t)n, "process %lu version %s\r\n", GetCurrentProcessId(), COOP_PATCH_VERSION);
 have_text:
     if (n < 0 || n > (int)sizeof(buf)) n = (int)strlen(buf);
@@ -565,15 +580,19 @@ static void scan_end(void)
     snap_scan();                   /* lane 47 (SNAP: reads only; does not count as a patch) */
     if (guide_scan()) any = 1;     /* lane 49 */
     if (fell_scan()) any = 1;      /* lane 54 */
+    if (merc_scan()) any = 1;      /* lane 88 */
     if (endhold_scan()) any = 1;   /* lane 49, round four */
     if (nodeath_scan()) any = 1;   /* lane 64 */
     if (nolog_scan()) any = 1;     /* lane 66 */
     if (maint_scan()) any = 1;     /* lane 67 */
     hist_scan();                   /* lane 72 (HIST: probes; does not count as a patch) */
+    trk_reset();                   /* lane 83 (TRK: armed on its first TRKHOLD ON) */
     if (collapse_scan()) any = 1;  /* lane 71 */
     if (sitehp_scan()) any = 1;    /* lane 71 */
     if (mroll_scan()) any = 1;     /* lane 71 */
     if (famroll_scan()) any = 1;   /* lane 71 */
+    if (noroll_scan()) any = 1;    /* lane 87 */
+    if (barnan_scan()) any = 1;    /* lane 87 (the bar's cure 2) */
     if (!any) {
         g_off = 1;
         _snprintf(g_off_reason, sizeof(g_off_reason), "nothing matches this game build (timestamp %X)", g_stamp);
@@ -620,6 +639,7 @@ static void internal_failure(const char *what);
 static void goods_off(const char *why);              /* GOODS: take both hooks out (defined with the switch) */
 static void totals_drop(int recount, const char *why); /* TOTALS: recount (or forget) and take the hook out */
 static void hold_drop(int recount, const char *why);   /* HOLD (lane 31): recount approval (or forget) and take the hooks out */
+static void trk_off(const char *why);                  /* TRK (lane 83): the production routine's bytes back */
 
 /* turn one site on (want_on = 1) or off; state is always taken from the bytes in memory, never from a cached flag */
 static void set_site(int k, int want_on)
@@ -685,6 +705,12 @@ static void restore_all(void)
     __except (EXCEPTION_EXECUTE_HANDLER) { log_line("MROLL restore raised exception %08lX", GetExceptionCode()); }
     __try { famroll_off("all patches off"); }   /* lane 71 */
     __except (EXCEPTION_EXECUTE_HANDLER) { log_line("FAMROLL restore raised exception %08lX", GetExceptionCode()); }
+    __try { noroll_off("all patches off"); }    /* lane 87 */
+    __except (EXCEPTION_EXECUTE_HANDLER) { log_line("NOROLL restore raised exception %08lX", GetExceptionCode()); }
+    __try { barnan_off("all patches off"); }    /* lane 87 (the bar's cure 2) */
+    __except (EXCEPTION_EXECUTE_HANDLER) { log_line("BARNAN restore raised exception %08lX", GetExceptionCode()); }
+    __try { trk_off("all patches off"); }        /* lane 83 */
+    __except (EXCEPTION_EXECUTE_HANDLER) { log_line("TRK restore raised exception %08lX", GetExceptionCode()); }
     for (k = S_P1; k <= S_PATCH_LAST; k++) {
         site_eval *e = &g_site[k];
         if (e->len == 0 || e->patch_rva == 0 || e->orig[0] == 0 || !g_base) continue;   /* never evaluated: nothing to restore */
@@ -827,7 +853,8 @@ static struct {
     snap_t *pend[PEND_MAX]; int npend;
     unsigned used, frozen;
     unsigned long long calls, own_n, putback, units, appended, dropped, deferred, fixed, unfixable, autoreg, stale, toobig,
-                       otherthread, nodelta, faults, audits, leaks, leak_units, pilegone;
+                       otherthread, nodelta, faults, audits, leaks, leak_units, pilegone, pilefree;
+    int pile_rule_off;              /* test switch (GOODS PILERULE OFF) */
 } G;
 static snap_t   g_snap[SNAP_SLOTS];
 static writer_t g_wr[WR_MAX];
@@ -843,9 +870,11 @@ static int goods_status(char *buf, size_t len)
     else n += _snprintf(buf + n, len - (size_t)n, "GOODS %s\r\n", goods_bytes_on() ? "on" : goods_bytes_off() ? "off" : "unavailable its two entries are in different states");
     n += _snprintf(buf + n, len - (size_t)n,
                    "goods frozen=%u calls=%llu own=%llu putback=%llu units=%llu appended=%llu dropped=%llu deferred=%llu fixed=%llu unfixable=%llu "
-                   "autoreg=%llu stale=%llu toobig=%llu otherthread=%llu nodelta=%llu faults=%llu audits=%llu leaks=%llu leakunits=%llu pilegone=%llu\r\n",
+                   "autoreg=%llu stale=%llu toobig=%llu otherthread=%llu nodelta=%llu faults=%llu audits=%llu leaks=%llu leakunits=%llu pilegone=%llu "
+                   "pilefree=%llu pilerule=%s\r\n",
                    G.frozen, G.calls, G.own_n, G.putback, G.units, G.appended, G.dropped, G.deferred, G.fixed, G.unfixable,
-                   G.autoreg, G.stale, G.toobig, G.otherthread, G.nodelta, G.faults, G.audits, G.leaks, G.leak_units, G.pilegone);
+                   G.autoreg, G.stale, G.toobig, G.otherthread, G.nodelta, G.faults, G.audits, G.leaks, G.leak_units, G.pilegone,
+                   G.pilefree, G.pile_rule_off ? "off" : "on");
     return n < 0 ? 0 : n;
 }
 
@@ -1111,7 +1140,16 @@ static void goods_event(uint8_t *b, uint64_t *frame, int refresh)
         return;
     }
     if (!s) {
-        if (G.pawn && *(uint8_t **)(b + OWNER_OFF) == G.pawn) { s = snap_add(b); if (s) { snap_take(s, b); G.autoreg++; } }
+        if (G.pawn && *(uint8_t **)(b + OWNER_OFF) == G.pawn) {
+            /* lane 76 (task 76f, lane_s21_76/design_pile_first_fill.txt): a new pile (what a demolished building
+             * leaves) is NOT taken in by the game's own call. The game's demolish creates the pile and then moves the
+             * goods in; taken in at its first call the pile was remembered EMPTY and every fill was put back, so a
+             * friend showed an empty pile until the host's stock was written (a state the host never has; session
+             * l76m: 20 piles, autoreg 20). Now the pile keeps what this copy's own game puts into it until the mod's
+             * first write (the host's stock, or the registration write of amount 0) takes it in. */
+            if (!G.pile_rule_off && *(int32_t *)(b + BTYPE_OFF) == PILE_TYPE) { G.pilefree++; return; }
+            s = snap_add(b); if (s) { snap_take(s, b); G.autoreg++; }
+        }
         return;
     }
     if (s->n < 0) return;
@@ -3708,6 +3746,58 @@ static void uncamp_cmd(int argc, char **argv)
 #define PICK_RING     8
 #define PICK_GONE_MAX 256           /* round six: addresses of objects that left the game, remembered */
 #define PICK_TASKS    0x898         /* SMUnit Tasks: data pointer; +8A0h its count (setTask, 4e1cab0) */
+/* (lane 74, round 3) OXCART: a friend's ox does not take a timber cart by its own choice (design: research/2026-11-10-
+ * game-probe/lanes/lane_s21_74/design_oxcart.txt). Part of PICK; nothing new is hooked or written in the game's code.
+ *   PICK OXEN <unit>,...|-   the board's oxen (hex), the whole list. For each listed ox the hook keeps the board's last
+ *                            reflected setTask of type 17 (GoToLocation: the cart module's "stand here") and of type 23
+ *                            (Gathering: the board's own pickup, with its resource).
+ *   PICK TIMBER <class>      the timber cart's class (hex; 0 = unset). Only while it is set and SETTHUNK is known:
+ *                            a setTask the GAME makes on a listed ox is counted (type, caller, timber or not, current
+ *                            task type); a Gathering (23) of a timber cart is let through when the board's own 23 for
+ *                            that cart is fresh ("board"), else it gets the kept stand record ("replaced", never
+ *                            refused: FOLLOW's rule), else it goes through ("left").
+ *   An exception in this part switches OXCART off (not PICK). ALLOFF empties the list and unsets the class.
+ * Status: "OXCART set|unset|faulted timber= oxen= seen= replaced= left= board= stands= picks= faults=" and
+ * "OXSEEN <type>/<caller rva>/<timber 0|1>/<current type>x<n> ..." (the 6 most frequent), never the word "on". */
+#define OX_MAX        64
+#define OX_RES        0xC0          /* FTask.Resource (lane 35's offsets, PICK GONE) */
+#define OX_CLASS      0x10          /* UObject ClassPrivate */
+#define OX_PICK_MS    60000
+#define OX_STAND_MS   120000
+#define OX_SEEN_MAX   32
+typedef struct { uint8_t *unit; ULONGLONG stand_t, pick_t; uint64_t pick_res; uint8_t stand[PICK_REC]; } ox_ent;
+typedef struct { uint32_t rva; uint8_t type, timber; int16_t cur; unsigned n; } ox_seen;
+/* (lane 74, round 7) HANDCART: a friend's villager does not take a hand cart by its own choice (design: research/2026-11-
+ * 10-game-probe/lanes/lane_s21_74/design_handcart_pickup.txt). Part of PICK; nothing new is hooked or written in the
+ * game's code.
+ *   PICK HANDCART <class>   the hand cart's class (hex; 0 = unset). Only while it is set, SETTHUNK is known and
+ *                           HANDCART has not faulted: a record the GAME sets (setTask's return address is not SETTHUNK's)
+ *                           of type 23 (Gathering) whose resource (+C0h) has that class (+10h of the resource) is
+ *                           replaced, never refused (FOLLOW's rule), by the PICK list's kept record of that unit when it
+ *                           is fresh ("byboard"), else by the unit's current task (Tasks[0], copied: "bycur"), else by
+ *                           its last reflected record when that is a "stand here" (17, GoToLocation) of the last
+ *                           HC_STAND_MS ("bystand": the board's or the cart module's last word for it; renewed when used,
+ *                           dropped when any other task the game sets goes through for that unit, as its place may have
+ *                           changed), each only when it names nothing gone and is not itself a Gathering of a hand cart;
+ *                           else it goes through ("left"). setTask runs on into the game's code after the hook, so a stand-in that makes the
+ *                           game set the pickup again recurs: a replacement at a deeper stack frame than the unit's last
+ *                           one (within 1 s) is "nested", and the 4th nested one in a row is let through ("loop"); one
+ *                           within 1 s that is not nested is counted as "again". A call through the reflected setTask is
+ *                           never touched; a game-made one nested in such a call of the same unit is counted "inboard".
+ *   An exception in this part switches HANDCART off (not PICK). ALLOFF unsets the class.
+ * Status: "HANDCART set|unset|faulted cart= seen= byboard= bycur= bystand= left= loop= again= nested= inboard= chooser=
+ * faults= sets=", "HCSEEN <caller rva>/<current type>/<inboard 0|1>x<n> ..." (the 6 most frequent) and "HCLOG <unix
+ * ms>/<unit>/<caller rva>/<current type>/<nest depth>/<inboard><chooser>/<B|C|S|L|N> ..." (the last HC_LOG events, oldest
+ * first: B byboard, C bycur, S bystand, L left, N loop), never the word "on" (the host's everything-off rule looks for it). */
+#define HC_UNITS      256
+#define HC_LOG        32
+#define HC_SEEN_MAX   32
+#define HC_NEST_MS    1000
+#define HC_NEST_MAX   3
+#define HC_STAND_MS   30000
+typedef struct { uint8_t *unit; ULONGLONG t, last_t; uint64_t frame; int nest; uint8_t last[PICK_REC]; } hc_unit;   /* last: its last reflected record */
+typedef struct { uint32_t rva; int16_t cur; uint8_t inboard; unsigned n; } hc_seen;
+typedef struct { uint64_t ms, unit; uint32_t rva; int16_t cur; uint8_t nest, inboard, chooser; char what; } hc_ev;
 typedef void (*pick_settask_fn)(uint8_t *unit, const uint8_t *rec);
 typedef struct { uint8_t *unit; uint64_t tu; int type; ULONGLONG kept_t; uint8_t kept[PICK_REC]; } pick_ent;
 static struct {
@@ -3723,6 +3813,14 @@ static struct {
     uint64_t gone[PICK_GONE_MAX]; int ngone, gonei;   /* round six: the last PICK_GONE_MAX addresses named gone */
     unsigned gonecmds, dropped, stale;                /* GONE commands; entries dropped by them; kept records refused */
     uint64_t thunk_ret; unsigned follow, followok, followleft;  /* round seven: the reflected setTask's return address; Follows replaced / the board's leader's / left (no task to keep) */
+    ox_ent ox[OX_MAX]; volatile LONG nox; uint64_t timber; volatile LONG oxdown;    /* lane 74: OXCART (oxdown: switched off by a fault) */
+    unsigned oxseen, oxrepl, oxleft, oxboard, oxstands, oxpicks, oxfaults, oxsets;
+    ox_seen see[OX_SEEN_MAX]; int nsee;
+    uint64_t handcart; volatile LONG hcdown;            /* lane 74, round 7: HANDCART (hcdown: switched off by a fault) */
+    unsigned hcseen, hcboard, hccur, hcstand, hcleft, hcloop, hcagain, hcnested, hcinboard, hcchooser, hcfaults, hcsets;
+    hc_unit hcu[HC_UNITS]; hc_seen hcs[HC_SEEN_MAX]; int nhcs;
+    hc_ev hcl[HC_LOG]; int hcli, hcln;
+    uint8_t *hclastu; ULONGLONG hclastt; uint64_t hclastf;   /* the last call through the reflected setTask: unit, time, frame */
 } PK;
 
 static int pick_bytes_on(void)  { return PK.stub_set && memcmp(PK.settask, PK.jmp_set, PICK_HOOK_LEN) == 0 && memcmp(PK.callsite, PK.call_new, PICK_HOOK_LEN) == 0; }
@@ -3744,6 +3842,45 @@ static int pick_status(char *buf, size_t len)
         n += _snprintf(buf + n, len - (size_t)n, " %dx%u", best, done[best]); done[best] = 0; shown++;
     }
     if (!shown) n += _snprintf(buf + n, len - (size_t)n, " -");
+    n += _snprintf(buf + n, len - (size_t)n, "\r\n");
+    /* lane 74: OXCART (never the word "on": the host's everything-off rule looks for it) */
+    n += _snprintf(buf + n, len - (size_t)n, "OXCART %s timber=%llX oxen=%ld seen=%u replaced=%u left=%u board=%u stands=%u picks=%u faults=%u sets=%u\r\nOXSEEN",
+                   PK.oxdown ? "faulted" : (PK.timber ? "set" : "unset"), (unsigned long long)PK.timber, PK.nox, PK.oxseen, PK.oxrepl,
+                   PK.oxleft, PK.oxboard, PK.oxstands, PK.oxpicks, PK.oxfaults, PK.oxsets);
+    {   int used[OX_SEEN_MAX] = { 0 }, s = 0, i;
+        while (s < 6) {
+            int best = -1;
+            for (i = 0; i < PK.nsee; i++) if (!used[i] && (best < 0 || PK.see[i].n > PK.see[best].n)) best = i;
+            if (best < 0) break;
+            used[best] = 1; s++;
+            n += _snprintf(buf + n, len - (size_t)n, " %u/%X/%u/%dx%u", PK.see[best].type, PK.see[best].rva, PK.see[best].timber, PK.see[best].cur, PK.see[best].n);
+        }
+        if (!s) n += _snprintf(buf + n, len - (size_t)n, " -");
+    }
+    n += _snprintf(buf + n, len - (size_t)n, "\r\n");
+    /* lane 74, round 7: HANDCART (never the word "on") */
+    n += _snprintf(buf + n, len - (size_t)n, "HANDCART %s cart=%llX seen=%u byboard=%u bycur=%u bystand=%u left=%u loop=%u again=%u nested=%u inboard=%u chooser=%u faults=%u sets=%u\r\nHCSEEN",
+                   PK.hcdown ? "faulted" : (PK.handcart ? "set" : "unset"), (unsigned long long)PK.handcart, PK.hcseen, PK.hcboard,
+                   PK.hccur, PK.hcstand, PK.hcleft, PK.hcloop, PK.hcagain, PK.hcnested, PK.hcinboard, PK.hcchooser, PK.hcfaults, PK.hcsets);
+    {   int used[HC_SEEN_MAX] = { 0 }, s = 0, i;
+        while (s < 6) {
+            int best = -1;
+            for (i = 0; i < PK.nhcs; i++) if (!used[i] && (best < 0 || PK.hcs[i].n > PK.hcs[best].n)) best = i;
+            if (best < 0) break;
+            used[best] = 1; s++;
+            n += _snprintf(buf + n, len - (size_t)n, " %X/%d/%ux%u", PK.hcs[best].rva, PK.hcs[best].cur, PK.hcs[best].inboard, PK.hcs[best].n);
+        }
+        if (!s) n += _snprintf(buf + n, len - (size_t)n, " -");
+    }
+    n += _snprintf(buf + n, len - (size_t)n, "\r\nHCLOG");
+    {   int i, first = PK.hcln < HC_LOG ? 0 : PK.hcli;
+        for (i = 0; i < PK.hcln; i++) {
+            const hc_ev *v = &PK.hcl[(first + i) % HC_LOG];
+            n += _snprintf(buf + n, len - (size_t)n, " %llu/%llX/%X/%d/%u/%u%u/%c", (unsigned long long)v->ms, (unsigned long long)v->unit,
+                           v->rva, v->cur, v->nest, v->inboard, v->chooser, v->what);
+        }
+        if (!PK.hcln) n += _snprintf(buf + n, len - (size_t)n, " -");
+    }
     n += _snprintf(buf + n, len - (size_t)n, "\r\n");
     return n;
 }
@@ -3829,10 +3966,162 @@ static int pick_match(const pick_ent *e, const uint8_t *rec)
     memcpy(&tu, rec + PICK_TU, 8);
     return (int)rec[0] == e->type && (e->tu == 0 || tu == e->tu);
 }
+/* lane 74, OXCART: the board's oxen; a game-made pickup of a timber cart gets the board's stand record. Returns 1 when
+ * the record was replaced (the hook then lets the call through with it and does nothing else). */
+static ox_ent *ox_find(const uint8_t *unit)
+{
+    LONG i, n = PK.nox;
+    for (i = 0; i < n; i++) if (PK.ox[i].unit == unit) return &PK.ox[i];
+    return NULL;
+}
+static void ox_note(uint8_t type, uint32_t rva, uint8_t timber, int cur)
+{
+    int i;
+    for (i = 0; i < PK.nsee; i++)
+        if (PK.see[i].type == type && PK.see[i].rva == rva && PK.see[i].timber == timber && PK.see[i].cur == cur) { PK.see[i].n++; return; }
+    if (PK.nsee < OX_SEEN_MAX) { ox_seen *s = &PK.see[PK.nsee++]; s->type = type; s->rva = rva; s->timber = timber; s->cur = (int16_t)cur; s->n = 1; }
+}
+static int ox_hook(uint8_t *unit, uint64_t *frame)
+{
+    ox_ent *ox;
+    const uint8_t *rec = (const uint8_t *)(uintptr_t)frame[2];
+    if (!PK.timber || !PK.thunk_ret || PK.oxdown || !rec || PK.nox == 0) return 0;   /* nothing new is read while unset */
+    __try {
+        ox = ox_find(unit);
+        if (!ox) return 0;
+        if (frame[4] == PK.thunk_ret) {                 /* the board's give: kept for this ox */
+            if (rec[0] == 17) { memcpy(ox->stand, rec, PICK_REC); ox->stand_t = GetTickCount64(); PK.oxstands++; }
+            else if (rec[0] == 23) { memcpy(&ox->pick_res, rec + OX_RES, 8); ox->pick_t = GetTickCount64(); PK.oxpicks++; }
+            return 0;
+        } else {                                        /* the game's own call on a listed ox */
+            uint64_t res, cls = 0;
+            const uint8_t *data; int32_t cnt; int cur = -1, timber;
+            memcpy(&res, rec + OX_RES, 8);
+            if (res) memcpy(&cls, (const uint8_t *)(uintptr_t)res + OX_CLASS, 8);
+            timber = res && cls == PK.timber;
+            memcpy(&data, unit + PICK_TASKS, 8); memcpy(&cnt, unit + PICK_TASKS + 8, 4);
+            if (cnt > 0 && cnt < 64 && data) cur = data[0];
+            PK.oxseen++;
+            ox_note(rec[0], (uint32_t)(frame[4] - (uint64_t)(uintptr_t)g_base), (uint8_t)timber, cur);
+            if (rec[0] != 23 || !timber) return 0;
+            if (ox->pick_t && GetTickCount64() - ox->pick_t < OX_PICK_MS && ox->pick_res == res) { PK.oxboard++; return 0; }
+            if (ox->stand_t && GetTickCount64() - ox->stand_t < OX_STAND_MS && !pick_rec_gone(ox->stand)) {
+                uint8_t *b = PK.ring[PK.ringi]; PK.ringi = (PK.ringi + 1) % PICK_RING;
+                memcpy(b, ox->stand, PICK_REC); frame[2] = (uint64_t)(uintptr_t)b; PK.oxrepl++;
+                return 1;
+            }
+            PK.oxleft++;
+            return 0;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { PK.oxfaults++; InterlockedExchange(&PK.oxdown, 1); }
+    return 0;
+}
+
+/* lane 74, round 7, HANDCART: a game-made Gathering of a hand cart gets the board's kept record or the unit's current
+ * task instead. Returns 1 when the record was replaced (the hook then lets the call through with it and does nothing
+ * else); 0 lets the PICK code below see the call as before. */
+static uint64_t hc_unix_ms(void)
+{
+    FILETIME ft; ULARGE_INTEGER u;
+    GetSystemTimeAsFileTime(&ft); u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+    return (u.QuadPart - 116444736000000000ull) / 10000ull;
+}
+static int hc_is_pickup(const uint8_t *r)             /* a Gathering (23) whose resource has the hand cart's class */
+{
+    uint64_t res, cls = 0;
+    if (r[0] != 23) return 0;
+    memcpy(&res, r + OX_RES, 8);
+    if (!res) return 0;
+    memcpy(&cls, (const uint8_t *)(uintptr_t)res + OX_CLASS, 8);
+    return cls == PK.handcart;
+}
+static ULONGLONG hc_used(const hc_unit *h) { return h->t > h->last_t ? h->t : h->last_t; }
+static hc_unit *hc_unit_find(const uint8_t *unit)
+{
+    int i;
+    for (i = 0; i < HC_UNITS; i++) if (PK.hcu[i].unit == unit) return &PK.hcu[i];
+    return NULL;
+}
+static hc_unit *hc_unit_get(uint8_t *unit)           /* the unit's entry; a new one takes a free or the least recently used place */
+{
+    int i, old = 0;
+    for (i = 0; i < HC_UNITS; i++) if (PK.hcu[i].unit == unit) return &PK.hcu[i];
+    for (i = 0; i < HC_UNITS; i++) {
+        if (!PK.hcu[i].unit) { old = i; break; }
+        if (hc_used(&PK.hcu[i]) < hc_used(&PK.hcu[old])) old = i;
+    }
+    memset(&PK.hcu[old], 0, sizeof(PK.hcu[old])); PK.hcu[old].unit = unit;
+    return &PK.hcu[old];
+}
+static void hc_note(uint32_t rva, int cur, uint8_t inboard)
+{
+    int i;
+    for (i = 0; i < PK.nhcs; i++)
+        if (PK.hcs[i].rva == rva && PK.hcs[i].cur == cur && PK.hcs[i].inboard == inboard) { PK.hcs[i].n++; return; }
+    if (PK.nhcs < HC_SEEN_MAX) { hc_seen *s = &PK.hcs[PK.nhcs++]; s->rva = rva; s->cur = (int16_t)cur; s->inboard = inboard; s->n = 1; }
+}
+static int hc_hook(uint8_t *unit, uint64_t *frame)
+{
+    const uint8_t *rec = (const uint8_t *)(uintptr_t)frame[2];
+    if (!PK.handcart || !PK.thunk_ret || PK.hcdown || !rec) return 0;   /* nothing new is read while unset */
+    __try {
+        ULONGLONG now = GetTickCount64();
+        uint64_t fa = (uint64_t)(uintptr_t)frame;
+        if (frame[4] == PK.thunk_ret) {                 /* a reflected give: noted (the unit's last record), untouched */
+            hc_unit *hl = hc_unit_get(unit);
+            memcpy(hl->last, rec, PICK_REC); hl->last_t = now;
+            PK.hclastu = unit; PK.hclastt = now; PK.hclastf = fa;
+            return 0;
+        }
+        if (!hc_is_pickup(rec)) {                       /* another game-made task: the unit's stand record no longer holds */
+            hc_unit *ho = hc_unit_find(unit);
+            if (ho) ho->last_t = 0;
+            return 0;
+        }
+        {
+            const uint8_t *data, *alt = NULL; int32_t cnt; int cur = -1, depth;
+            uint8_t inboard = unit == PK.hclastu && fa < PK.hclastf && now - PK.hclastt <= 16;
+            uint8_t chooser = PK.depth > 0;
+            uint32_t rva = (uint32_t)(frame[4] - (uint64_t)(uintptr_t)g_base);
+            pick_ent *e = pick_find(unit);
+            hc_unit *hu = hc_unit_get(unit);
+            int recent = hu->t && now - hu->t < HC_NEST_MS, nested = recent && fa < hu->frame;
+            char what;
+            memcpy(&data, unit + PICK_TASKS, 8); memcpy(&cnt, unit + PICK_TASKS + 8, 4);
+            if (cnt > 0 && cnt < 64 && data) cur = data[0]; else data = NULL;
+            PK.hcseen++;
+            if (inboard) PK.hcinboard++;
+            if (chooser) PK.hcchooser++;
+            if (nested) PK.hcnested++; else if (recent) PK.hcagain++;
+            hc_note(rva, cur, inboard);
+            depth = nested ? hu->nest + 1 : 1;
+            if (depth > HC_NEST_MAX) { what = 'N'; PK.hcloop++; }
+            else if (e && e->kept_t && now - e->kept_t < PICK_FRESH_MS && !pick_rec_gone(e->kept) && !hc_is_pickup(e->kept)) { alt = e->kept; what = 'B'; PK.hcboard++; }
+            else if (data && !pick_rec_gone(data) && !hc_is_pickup(data)) { alt = data; what = 'C'; PK.hccur++; }
+            else if (hu->last_t && now - hu->last_t < HC_STAND_MS && hu->last[0] == 17 && !pick_rec_gone(hu->last)) { alt = hu->last; what = 'S'; PK.hcstand++; hu->last_t = now; }
+            else { what = 'L'; PK.hcleft++; }
+            {   hc_ev *v = &PK.hcl[PK.hcli];
+                v->ms = hc_unix_ms(); v->unit = (uint64_t)(uintptr_t)unit; v->rva = rva; v->cur = (int16_t)cur; v->nest = (uint8_t)depth;
+                v->inboard = inboard; v->chooser = chooser; v->what = what;
+                PK.hcli = (PK.hcli + 1) % HC_LOG; if (PK.hcln < HC_LOG) PK.hcln++;
+            }
+            g_dirty = 1;
+            if (!alt) return 0;
+            hu->t = now; hu->frame = fa; hu->nest = depth;
+            {   uint8_t *b = PK.ring[PK.ringi]; PK.ringi = (PK.ringi + 1) % PICK_RING;
+                memcpy(b, alt, PICK_REC); frame[2] = (uint64_t)(uintptr_t)b; }
+            return 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { PK.hcfaults++; InterlockedExchange(&PK.hcdown, 1); }
+    return 0;
+}
+
 static int pick_hook_wd(uint8_t *unit, uint64_t *frame)
 {
     if (!PK.enabled) return 1;
     if (GetCurrentThreadId() != PK.thread) { PK.other++; return 1; }
+    if (ox_hook(unit, frame)) return 1;                 /* lane 74: OXCART replaced a game-made pickup of a timber cart */
+    if (hc_hook(unit, frame)) return 1;                 /* lane 74, round 7: HANDCART replaced a game-made pickup of a hand cart */
     __try {
         pick_ent *e = pick_find(unit);
         const uint8_t *rec = (const uint8_t *)(uintptr_t)frame[2];
@@ -3927,7 +4216,10 @@ static void pick_off(const char *why)
     if (PK.stub_set && memcmp(PK.settask, PK.jmp_set, PICK_HOOK_LEN) == 0) r1 = write_bytes(PK.settask, PK.jmp_set, PICK_SET_ORIG, PICK_HOOK_LEN, w, sizeof(w));
     if (r1 != 1) { log_line("PICK: setTask's entry could not be restored: %s", w); if (r1 < 0) internal_failure("pick restore failed"); }
     InterlockedExchange(&PK.enabled, 0); PK.cur = NULL; PK.depth = 0;
-    if (strcmp(why, "all patches off") == 0) InterlockedExchange(&PK.n, 0);
+    if (strcmp(why, "all patches off") == 0) {
+        InterlockedExchange(&PK.n, 0); InterlockedExchange(&PK.nox, 0); PK.timber = 0;      /* lane 74: OXCART too */
+        PK.handcart = 0; memset(PK.hcu, 0, sizeof(PK.hcu)); PK.hclastu = NULL;              /* lane 74, round 7: HANDCART */
+    }
     log_line("PICK off (%s): same %u subst %u left %u", why, PK.same, PK.subst, PK.left);
     g_dirty = 1;
 }
@@ -4026,10 +4318,59 @@ static void pick_gone(const char *list)
     log_line("PICK GONE: %ld of %ld entries dropped, %d addresses remembered", n - j, n, PK.ngone);
 }
 
+/* lane 74: PICK OXEN a,b,c|- (the whole list; a listed ox keeps its stand and pickup records) and PICK TIMBER <class> */
+static void ox_set(const char *list)
+{
+    static ox_ent tmp[OX_MAX];
+    int k = 0, i;
+    const char *s = list;
+    g_dirty = 1;
+    if (strcmp(list, "-") != 0) {
+        while (*s) {
+            char *e;
+            unsigned long long u = _strtoui64(s, &e, 16);
+            ox_ent *old;
+            if (e == s || u == 0 || (u & 7) != 0 || (*e != ',' && *e != 0)) { PK.bad++; log_line("PICK OXEN refused: '%.40s' is not a list of hex addresses", s); return; }
+            if (k >= OX_MAX) { PK.bad++; log_line("PICK OXEN refused: more than %d oxen", OX_MAX); return; }
+            old = ox_find((const uint8_t *)(uintptr_t)u);
+            if (old) tmp[k] = *old; else { memset(&tmp[k], 0, sizeof(tmp[k])); tmp[k].unit = (uint8_t *)(uintptr_t)u; }
+            k++;
+            s = *e ? e + 1 : e;
+        }
+    }
+    /* the hook runs on this thread only (the game thread, which also ticks this DLL) */
+    InterlockedExchange(&PK.nox, 0);
+    for (i = 0; i < k; i++) PK.ox[i] = tmp[i];
+    InterlockedExchange(&PK.nox, k);
+    PK.oxsets++;
+}
+
 static void pick_cmd(int argc, char **argv)
 {
     int v;
     if (argc == 2 && on_off(argv[1], &v)) { if (v) pick_on(); else pick_off("PICK OFF"); return; }
+    if (argc == 3 && _stricmp(argv[1], "OXEN") == 0) { ox_set(argv[2]); return; }          /* lane 74 */
+    if (argc == 3 && _stricmp(argv[1], "TIMBER") == 0) {                                   /* lane 74 */
+        char *e; unsigned long long c = _strtoui64(argv[2], &e, 16);
+        g_dirty = 1;
+        if (e == argv[2] || *e != 0 || (c & 7) != 0) { PK.bad++; log_line("PICK TIMBER refused: '%.40s' is not a class address in hex", argv[2]); return; }
+        PK.timber = (uint64_t)c;
+        if (!c) {                                       /* round 8: unset (a new world, the module not ruling): the oxen's kept records go too */
+            LONG i, n = PK.nox;
+            for (i = 0; i < n; i++) { PK.ox[i].stand_t = 0; PK.ox[i].pick_t = 0; }
+        }
+        log_line("PICK TIMBER %llX (%s)", c, c ? "set" : "unset");
+        return;
+    }
+    if (argc == 3 && _stricmp(argv[1], "HANDCART") == 0) {                                 /* lane 74, round 7 */
+        char *e; unsigned long long c = _strtoui64(argv[2], &e, 16);
+        g_dirty = 1;
+        if (e == argv[2] || *e != 0 || (c & 7) != 0) { PK.bad++; log_line("PICK HANDCART refused: '%.40s' is not a class address in hex", argv[2]); return; }
+        if (PK.handcart != (uint64_t)c) log_line("PICK HANDCART %llX (%s)", c, c ? "set" : "unset");
+        PK.handcart = (uint64_t)c; PK.hcsets++;
+        if (!c) { memset(PK.hcu, 0, sizeof(PK.hcu)); PK.hclastu = NULL; }   /* round 8: unset: the units' kept records go too */
+        return;
+    }
     if (argc == 3 && _stricmp(argv[1], "SET") == 0) {
         if (!PK.avail) { PK.bad++; g_dirty = 1; log_line("PICK SET refused: unavailable (%s)", PK.why); return; }
         pick_set(argv[2]); return;
@@ -4038,7 +4379,7 @@ static void pick_cmd(int argc, char **argv)
         pick_gone(argv[2]); return;
     }
     PK.bad++; g_dirty = 1;
-    log_line("PICK refused: needs ON, OFF, SET <unit>:<type>:<target unit>,... (or SET -) or GONE <hex>,...");
+    log_line("PICK refused: needs ON, OFF, SET <unit>:<type>:<target unit>,... (or SET -), GONE <hex>,..., OXEN <hex>,... (or OXEN -), TIMBER <class hex> or HANDCART <class hex>");
 }
 
 /* ------------------------------------------------------------------ REGSET (lane 35, round six): a region's two building sets
@@ -4188,6 +4529,8 @@ static void regset_cmd(int argc, char **argv)
 #include "coop_guide.h"
 /* ------------------------------------------------------------------ FELL (lane 54): its own file */
 #include "coop_fell.h"
+/* ------------------------------------------------------------------ MERCCUT (lane 88): its own file */
+#include "coop_mercs.h"
 /* ------------------------------------------------------------------ MAINT (lane 67): its own file */
 #include "coop_maint.h"
 
@@ -4205,6 +4548,7 @@ static void regset_cmd(int argc, char **argv)
 
 /* ------------------------------------------------------------------ HIST (lane 72): the first-run probes, its own file */
 #include "coop_hist.h"
+#include "coop_trk.h"                      /* lane 83: TRK (TRKHOLD), after coop_hist.h (HADD, g_trk_native) */
 
 /* ------------------------------------------------------------------ DIST (lane 42): a house's market goods on the host's word
  * (research/2026-11-10-game-probe/lanes/lane_s21_42/report.txt)
@@ -4486,7 +4830,8 @@ static void command(char *line)
     if (!(_strnicmp(line, "FIELD POLL", 10) == 0 || _strnicmp(line, "FIELD SET ", 10) == 0 || _strnicmp(line, "FIELD CHECK ", 12) == 0 ||
           _strnicmp(line, "MEN POLL", 8) == 0 || _strnicmp(line, "MEN SET ", 8) == 0 || _strnicmp(line, "MEN WAYS ", 9) == 0 ||   /* lane 43: several times a second */
           _strnicmp(line, "MAINT READ ", 11) == 0 || _strnicmp(line, "MAINT SET ", 10) == 0 ||                                    /* lane 67: every second */
-          _strnicmp(line, "SITEHP POLL", 11) == 0 || _strnicmp(line, "SITEHP HOLD ", 12) == 0)                                   /* lane 71 */
+          _strnicmp(line, "SITEHP POLL", 11) == 0 || _strnicmp(line, "SITEHP HOLD ", 12) == 0 ||                                 /* lane 71 */
+          _strnicmp(line, "SITEHP HOLDX ", 13) == 0)                                                                             /* lane 87 */
         && !snap_quiet_cmd(line) && !co_quiet_cmd(line))                                          /* lane 45: TOTALS SET, DIST SET, REGSET LIST */
         log_line("command: %.160s%s", line, strlen(line) > 160 ? " ..." : "");     /* a TOTALS SET line is long */
     argc = split(line, argv, 8);
@@ -4533,6 +4878,8 @@ static void command(char *line)
     if (_stricmp(argv[0], "JOBGATE") == 0 && argc == 2 && on_off(argv[1], &v)) { set_site(S_JG, v); return; }
     /* lane 66: NOTHEFT ON|OFF (site NT): a friend's copy never rolls the bandits' daily theft; the host tells it */
     if (_stricmp(argv[0], "NOTHEFT") == 0 && argc == 2 && on_off(argv[1], &v)) { set_site(S_NT, v); return; }
+    /* lane 64, round 5: NOMOURN ON|OFF (site NM): a friend's copy never takes a day off a home's mourning itself */
+    if (_stricmp(argv[0], "NOMOURN") == 0 && argc == 2 && on_off(argv[1], &v)) { set_site(S_NM, v); return; }
     /* lane 23: CHOOSE ON|OFF, CHOOSE SET <hex address>,<hex address>,... | CHOOSE SET - (the job chooser, per villager) */
     if (_stricmp(argv[0], "CHOOSE") == 0) { choose_cmd(argc, argv); return; }
     /* the lead: NOREGION ON|OFF (a work hit at a building without a region no longer reads through null) */
@@ -4552,6 +4899,8 @@ static void command(char *line)
     if (_stricmp(argv[0], "GUIDE") == 0) { guide_cmd(argc, argv); return; }
     /* lane 54: FELL <region> <x> <y> (the tree being felled at that place falls at this copy's next stroke) */
     if (_stricmp(argv[0], "FELL") == 0) { fell_cmd(argc, argv); return; }
+    /* lane 88: MERCCUT <engine> <array> <count now> <count wanted> (a friend's offer list as long as the host's) */
+    if (_stricmp(argv[0], "MERCCUT") == 0) { merc_cmd(argc, argv); return; }
     /* lane 67: MAINT READ <c>,... | SET <c> <status> <goods>=<left>,... | DROP <c>,... | FORGET (a building's maintenance) */
     if (_stricmp(argv[0], "MAINT") == 0) { maint_cmd(argc, argv); return; }
     /* lane 49, round four: ENDHOLD ON|OFF | SET <ceiling ms> <unit>:<type>:<building>,... | RANGE <lo> <hi> */
@@ -4570,6 +4919,10 @@ static void command(char *line)
     if (_stricmp(argv[0], "MROLL") == 0) { mroll_cmd(argc, argv); return; }
     /* lane 71: FAMROLL ON|OFF | SITES <ret1> <ret2> (births, new families and sickness on the host's word) */
     if (_stricmp(argv[0], "FAMROLL") == 0) { famroll_cmd(argc, argv); return; }
+    /* lane 87: NOROLL ON|OFF|PASS (a friend's own mercenary month roll held; one call through for the realm module) */
+    if (_stricmp(argv[0], "NOROLL") == 0) { noroll_cmd(argc, argv); return; }
+    /* lane 87 (the bar's cure 2): BARNAN ON|OFF (a friend's site with no parts yet reads its bar with no work done) */
+    if (_stricmp(argv[0], "BARNAN") == 0) { barnan_cmd(argc, argv); return; }
     if (_stricmp(argv[0], "ROUT") == 0) { do_call(0, argc, argv); return; }
     if (_stricmp(argv[0], "REFORM") == 0) { do_call(1, argc, argv); return; }
     if (_stricmp(argv[0], "FINISH") == 0) { do_call(2, argc, argv); return; }
@@ -4588,6 +4941,7 @@ static void command(char *line)
         if (_stricmp(argv[1], "STATS") == 0 && argc == 2) { goods_stats(); g_dirty = 1; return; }
         /* lane 46: GOODS GONE <addr>,... (a DEMOLISH, before the game removes it); GOODS DEMRULE OFF|ON (test switch) */
         if (_stricmp(argv[1], "GONE") == 0 && argc == 3) { goods_gone_cmd(argv[2]); return; }
+        if (_stricmp(argv[1], "PILERULE") == 0 && argc == 3) { G.pile_rule_off = _stricmp(argv[2], "OFF") == 0; log_line("GOODS PILERULE %s", G.pile_rule_off ? "OFF (test)" : "ON"); g_dirty = 1; return; }
         if (_stricmp(argv[1], "DEMRULE") == 0 && argc == 3) { GD.rule_off = _stricmp(argv[2], "OFF") == 0; log_line("GOODS DEMRULE %s", GD.rule_off ? "OFF (test)" : "ON"); g_dirty = 1; return; }
     }
     if (_stricmp(argv[0], "PILEGONE") == 0) { goods_pilegone(argc, argv); return; }
@@ -4628,6 +4982,8 @@ static void command(char *line)
     if (_stricmp(argv[0], "WALLSET") == 0) { wallset_cmd(argc, argv); return; }
     if (_stricmp(argv[0], "UNCAMP") == 0) { uncamp_cmd(argc, argv); return; }
     if (_stricmp(argv[0], "ALLOFF") == 0) { restore_all(); log_line("all patches off"); return; }
+    /* lane 83: TRKHOLD ON (also the keepalive, every second) | OFF: a friend's own production calls skipped */
+    if (_stricmp(argv[0], "TRKHOLD") == 0 && argc == 2 && on_off(argv[1], &v)) { if (v) trk_on(); else trk_off("TRKHOLD OFF"); return; }
 #ifdef COOP_PATCH_TEST
     if (_stricmp(argv[0], "TESTFAULT") == 0) { RaiseException(0xE0C0FFEEu, 0, 0, NULL); return; }
 #endif
@@ -4723,6 +5079,7 @@ static void tick_body(void)
     if (g_scan_busy) return;                   /* lane 47: the scan's thread is still reading .text */
     if (!g_scan_done) { g_scan_done = 1; scan_end(); g_dirty = 1; }
     goods_tick();           /* what the hooks left for the tick (before the commands: a write of the mod comes after) */
+    noroll_tick();          /* lane 87: a pass not used since the tick that set it is dropped (before the commands) */
     order_tick();           /* lane 28: the orders the hook noted */
     totals_tick();
     hold_tick();

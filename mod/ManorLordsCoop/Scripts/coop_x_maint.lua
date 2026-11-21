@@ -104,7 +104,14 @@ local function readStep(S, P)
   local hs, es = {}, {}
   while R.i < #R.list and #hs < MC.cfg.batch do
     R.i = R.i + 1; local e = R.list[R.i]
-    if valid(e.mc) then hs[#hs + 1] = e.h; es[e.h] = e end
+    -- (lane 64, task 64d) the component kept by the index (up to a pass and the next index, seconds) is of no native
+    -- table: the guard of kept handles in valid() could not know when it was freed. It is taken from its building in
+    -- this tick instead: the building through valid() (the guard knows a building that left the game's list and is
+    -- freed), its component read now and used only when it is the indexed one (same address)
+    if valid(e.b) then
+      local okc, mc = pcall(function() return e.b.MaintenanceComponent end)
+      if okc and mc and valid(mc) and hexOf(mc) == e.h then hs[#hs + 1] = e.h; es[e.h] = e end
+    end
   end
   if #hs > 0 then
     P.send("MAINT READ " .. table.concat(hs, ",")); P.tick()
@@ -141,9 +148,12 @@ local function hostSend(S, clock)
 end
 
 -- ---------------------------------------------------------------- friend
+-- (lane 64, task 64d) as in readStep: the component is taken from its building in this tick (e.mc is set to it)
 local function compOf(k)
   local X = MC.idx; local e = X and X.byKey[k]
-  if e and valid(e.mc) then return e end
+  if not (e and valid(e.b)) then return nil end
+  local okc, mc = pcall(function() return e.b.MaintenanceComponent end)
+  if okc and mc and valid(mc) and hexOf(mc) == e.h then e.mc = mc; return e end
 end
 local function applyOne(S, P, k, H, cmds, force)
   local e = compOf(k)

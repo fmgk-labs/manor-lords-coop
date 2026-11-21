@@ -214,6 +214,7 @@ typedef struct {
     size_t nf1_patch, nf2_patch;                                             /* the two NOFINISH jumps */
     size_t jg_patch;                                                         /* lane 19: the JOBGATE je */
     size_t nt_patch;                                                         /* lane 66: the NOTHEFT call */
+    size_t nm_patch;                                                         /* lane 64, round 5: the NOMOURN jle */
     size_t p1_patch, p1_patch2, p2_patch, p3a_patch, p3b_patch;
     size_t helper, recount, refresh, addinv, konst;                          /* GOODS */
     size_t addlist, notify;                                                  /* TOTALS */
@@ -238,9 +239,12 @@ typedef struct {
     size_t nd_bury, nd_bury_patch;                                                               /* ... and the burial chooser's test */
     size_t nd_hunger_patch, nd_acc_patch, nd_fire_patch, nd_crush_patch, nd_animal_patch;       /* ... and each caller's patched bytes */
     size_t hadd;                                                            /* lane 72: a "tracker add routine" with HADD's first bytes */
+    size_t tadd1, tadd2;                                                    /* lane 83: the two time adds (TADD1, TADD2) */
     size_t cl_ent, cl_kill, cl_call;                                        /* lane 71: a "collapseBuilding" that runs, its death roll site, a caller of it */
     size_t mr_day, mr_acc;                                                  /* lane 71: a "daily maintenance roll" and a "work accident" that run */
     size_t fr_mk, fr_a, fr_b, fr_c, fr_sick;                                /* lane 71: a "person maker" that runs, three callers, the sickness roll */
+    size_t nr_roll;                                                         /* lane 87: a "mercenary month roll" that runs */
+    size_t bn_prog;                                                         /* lane 87: a "site's progress function" that runs */
 } img_t;
 
 typedef struct {
@@ -274,6 +278,8 @@ typedef struct {
     int sprog;              /* lane 71: 0 = no SPROG pattern, 1 = one, 2 = two */
     int mroll;              /* lane 71: 0 = no MROLL routines, 1 = both, 2 = the daily roll twice */
     int famroll;            /* lane 71: 0 = no FAMROLL routines, 1 = both, 2 = the maker twice, 3 = no sickness roll */
+    int noroll;             /* lane 87: 0 = no month roll, 1 = one, 2 = two */
+    int barnan;             /* lane 87: 0 = no progress function, 1 = one, 2 = two */
 } opts_t;
 
 static void emit_hex(img_t *m, const char *s)
@@ -370,6 +376,16 @@ static void emit_nofinish(img_t *m)
     emit_hex(m, "48 8B 8F A0 00 00 00 48 8D 44 24 70 45 33 C0 48 89 44 24 40 48 8D 54 24 40 48 89 7C 24 48 48 8B 89 D0 02 00 00");
     m->nt_patch = m->pos;
     emit_hex(m, "E8 03 AE FF FF 4C 8D 5C 24 50 CC CC");
+}
+
+/* lane 64, round 5: the NOMOURN site (the daily routine's count of a home's mourning days), the loop at %8 == 0 and
+ * its jle at %8 == 3 as in the game (4d78350, 4d7835b). Emitted last: nothing else in the synthetic code moves. */
+static void emit_nomourn(img_t *m)
+{
+    align_to(m, 8, 0);
+    emit_hex(m, "48 8B 11 8B 82 20 0F 00 00 85 C0");
+    m->nm_patch = m->pos;
+    emit_hex(m, "7E 08 FF C8 89 82 20 0F 00 00 48 83 C1 08 49 3B C8 75 E2 CC CC");
 }
 
 /* combat(unit rcx, args rdx): rsi = unit (health at +0x2E8), rbp = args (avoidKilling byte at +0x448), xmm15 = 0 */
@@ -806,6 +822,15 @@ static void emit_noregion(img_t *m, int twin, int outside)
 static uint8_t *g_pick_rec;
 typedef void (*settask_fn)(void *unit, void *rec);
 typedef void (*think_fn)(void *unit);
+/* lane 74, round 7 (HANDCART): setTask called from d frames deeper than the caller (each frame holds 256 bytes), as
+ * the game's code calls it again from inside a setTask */
+__declspec(noinline) static void hc_deep(settask_fn st, void *unit, void *rec, int d)
+{
+    volatile char pad[256];
+    pad[0] = (char)d;
+    if (d > 0) hc_deep(st, unit, rec, d - 1); else st(unit, rec);
+    pad[1] = pad[0];
+}
 static void emit_pick(img_t *m, int variant)
 {
     size_t f, c, t, hole, other;
@@ -1156,6 +1181,32 @@ static void emit_hadd(img_t *m)
     emit_hadd_tail(m);
 }
 
+/* lane 83: TRK's time adds. TADD1 and TADD2 with the game's bytes up to their first branch, which (count 0 / a unit
+ * byte not 5) jumps to a tail that hands the registers to a C recorder (tracker rcx, category dl, time xmm2) */
+static volatile LONG g_tadd_calls;
+static void *volatile g_tadd_t;
+static volatile int g_tadd_cat;
+static volatile float g_tadd_time;
+__declspec(noinline) static void fake_tadd_impl(void *t, int cat, float tm)
+{
+    InterlockedIncrement(&g_tadd_calls); g_tadd_t = t; g_tadd_cat = cat & 0xFF; g_tadd_time = tm;
+}
+static void emit_tadd_tail(img_t *m)
+{
+    emit_hex(m, "48 B8"); emit_imm64(m, (uint64_t)(uintptr_t)&fake_tadd_impl); emit_hex(m, "FF E0");
+}
+static void emit_tadd(img_t *m)
+{
+    align_to(m, 16, 0); m->tadd1 = m->pos;
+    emit_hex(m, "4C 8B 89 20 01 00 00 48 63 81 28 01 00 00 4D 8B D1 48 8D 04 40 48 C1 E0 04 49 03 C1 4C 3B C8 74 1B");
+    emit_hex(m, "41 38 52 18 74 00 49 83 C2 30 4C 3B D0 75 00 48 81 C1 A8 00 00 00 E9 00 00 00 00");
+    emit_tadd_tail(m);
+    align_to(m, 16, 0); m->tadd2 = m->pos;
+    emit_hex(m, "41 80 B9 B0 0A 00 00 05 44 0F B6 C2 48 8B 91 20 01 00 00 4C 8B D9 48 63 81 28 01 00 00 75 18");
+    emit_hex(m, "4C 8D 04 40 49 C1 E0 04 4C 03 C2 49 3B D0 0F 84 00 00 00 00 80 7A 18 07");
+    emit_tadd_tail(m);
+}
+
 /* lane 49, round four: ENDHOLD. An end-task with the game's first bytes (ENDTASK) that sets the unit's task count
  * (+8A0h) to 0, and two callers of it (unit rcx): one the test names as the task steps' range, one outside it. */
 static void emit_endtask(img_t *m)
@@ -1299,6 +1350,37 @@ static void emit_mroll(img_t *m, int variant)
     emit_hex(m, "48 85 ED 74 09 8A 45 10 88 87 0C 03 00 00 48 83 C4 60 5F 48 8B 5C 24 10 48 8B 6C 24 20 C3");   /* (with no building the pattern's je lands on the dead-byte write: the test reads only the note) */
 }
 
+/* lane 87: NOROLL. A mercenary month roll with the game's first 48 bytes (MERCROLL: the prologue, "lea rbx,[rcx+0BF0h]",
+ * the xmm6 save and the first test) that marks its engine (the offer count +BF8h = 7) and returns through an epilogue that
+ * undoes the prologue (xmm6, the frame, the pushes, rbx). Variant 2: the roll twice. */
+static void emit_noroll(img_t *m, int variant)
+{
+    int k;
+    for (k = 0; k < (variant == 2 ? 2 : 1); k++) {
+        align_to(m, 16, 0); if (k == 0) m->nr_roll = m->pos;
+        emit_hex(m, "48 8B C4 48 89 58 20 48 89 48 08 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 90 48 81 EC 70 01 00 00 48 8D 99 F0 0B 00 00 0F 29 70 B8 83 7B 0C 00");
+        emit_hex(m, "C7 43 08 07 00 00 00 0F 28 B4 24 60 01 00 00 48 81 C4 70 01 00 00 41 5F 41 5E 41 5D 41 5C 5F 5E 5D 48 8B 5C 24 20 C3");
+    }
+}
+
+/* lane 87 (the bar's cure 2): BARNAN. A site's progress function with the game's first 36 bytes (SITEPROG: the prologue
+ * up to "add rcx,448h") that works as the game's does in small: G is the float at building +450h (the game's goods
+ * half; the copy BARNAN makes holds it), work = the sum of the parts' hp (+314h) over the sum of their max (+318h) over
+ * the list at +2F8h (count +300h), the bar (work + G) * 0.5; an empty list gives 0/0. The epilogue undoes the prologue
+ * (rbx, rsi, xmm6, xmm7, the frame, rdi). Variant 2: the function twice. */
+static void emit_barnan(img_t *m, int variant)
+{
+    int k;
+    for (k = 0; k < (variant == 2 ? 2 : 1); k++) {
+        align_to(m, 16, 0); if (k == 0) m->bn_prog = m->pos;
+        emit_hex(m, "48 8B C4 48 89 58 08 48 89 70 10 57 48 83 EC 50 48 8B F1 0F 29 70 E8 33 FF 0F 29 78 D8 48 81 C1 48 04 00 00");
+        emit_hex(m, "F3 0F 10 96 50 04 00 00 48 8B 8E F8 02 00 00 48 63 86 00 03 00 00 0F 57 C0 0F 57 C9 4C 8D 04 C1 48 8B D1 49 3B D0 74 1C");
+        emit_hex(m, "48 8B 02 48 83 C2 08 F3 0F 58 80 14 03 00 00 F3 0F 58 88 18 03 00 00 49 3B D0 75 E4");
+        emit_hex(m, "F3 0F 5E C1 F3 0F 58 C2 B8 00 00 00 3F 66 0F 6E C8 F3 0F 59 C1");
+        emit_hex(m, "48 8B 5C 24 60 48 8B 74 24 68 0F 28 74 24 40 0F 28 7C 24 30 48 83 C4 50 5F C3");
+    }
+}
+
 /* lane 71: FAMROLL. A person maker with the game's first bytes (GROWMK) that marks its region (+100h = 1) and returns
  * it, three callers of it (sub rsp,28h; call; add rsp,28h; ret), and the sickness roll (SICKROLL) as dead code.
  * Variant 2: the maker twice; 3: no sickness roll. */
@@ -1387,10 +1469,14 @@ static img_t *build_image(const opts_t *o)
         if (o->nodeath) emit_nodeath(m, o->nodeath);   /* lane 64 */
         if (o->maint) emit_maint(m, o->maint);      /* lane 67 */
         if (o->hist) { emit_hadd(m); if (o->hist == 2) { size_t keep = m->hadd; emit_hadd(m); m->hadd = keep; } }   /* lane 72 */
+        if (o->hist) emit_tadd(m);                                                                                    /* lane 83 */
         if (o->collapse) emit_collapse(m, o->collapse);   /* lane 71 */
         if (o->sprog) emit_sprog(m, o->sprog);              /* lane 71 */
         if (o->mroll) emit_mroll(m, o->mroll);              /* lane 71 */
         if (o->famroll) emit_famroll(m, o->famroll);        /* lane 71 */
+        if (o->noroll) emit_noroll(m, o->noroll);           /* lane 87 */
+        if (o->barnan) emit_barnan(m, o->barnan);           /* lane 87 (the bar's cure 2) */
+        emit_nomourn(m);                                    /* lane 64, round 5 (last) */
         if (m->pos > TEXT_SIZE - 0x100) { printf("synthetic .text too small (%Iu bytes used)\n", m->pos); exit(3); }
     }
     memcpy(m->snapshot, m->text, TEXT_SIZE);
@@ -1435,6 +1521,8 @@ static int status_has(const char *sub) { const char *s = read_file(g_status); re
 /* (lane 52) the number after <key> in the status file as it is (-1: not there) */
 static long status_val(const char *key) { const char *t = read_file(g_status), *p = strstr(t, key); return p ? strtol(p + strlen(key), NULL, 10) : -1; }
 /* (lane 67) the number after <key> on the MAINT line (-1: not there) */
+/* (lane 87) the number after <key> on the SITEHP line (-1: not there) */
+static long sh_val(const char *key) { const char *t = read_file(g_status), *m = strstr(t, "SITEHP available"), *p = m ? strstr(m, key) : NULL; return p ? strtol(p + strlen(key), NULL, 10) : -1; }
 static long mt_val(const char *key) { const char *t = read_file(g_status), *m = strstr(t, "MAINT available"), *p = m ? strstr(m, key) : NULL; return p ? strtol(p + strlen(key), NULL, 10) : -1; }
 
 static void append_raw(const char *text)
@@ -2125,6 +2213,15 @@ int main(void)
         cmd("NOTHEFT ON"); cmd("ALLOFF");
         check(bytes_are(m->text + m->nt_patch, "E8 03") && status_line("NT off", 1), "ALLOFF restores NT");
 
+        /* lane 64, round 5: NOMOURN ON|OFF (the daily count of a home's mourning days: jle -> jmp) */
+        check(status_line("NM off", 1), "NM found exactly once, off");
+        cmd("NOMOURN ON");
+        check(bytes_are(m->text + m->nm_patch, "EB 08 FF C8 89 82") && status_line("NM on", 1), "NOMOURN ON wrote EB 08, status NM on");
+        cmd("NOMOURN OFF");
+        check(bytes_are(m->text + m->nm_patch, "7E 08 FF C8 89 82") && status_line("NM off", 1), "NOMOURN OFF restored 7E 08");
+        cmd("NOMOURN ON"); cmd("ALLOFF");
+        check(bytes_are(m->text + m->nm_patch, "7E 08") && status_line("NM off", 1), "ALLOFF restores NM");
+
         cmd("NOKILL ON"); cmd("NOROUT ON");
         cmd("TESTFAULT");
         check(status_line("ready", 0), "1 internal failure: still ready");
@@ -2286,6 +2383,24 @@ int main(void)
         check(stock(b3, 17) == 4 && status_num("autoreg=") == 1, "GOODS ON <lord>: a building of that lord is remembered the first time it is seen (its first change stays)");
         game_write(m, b3, 17, 4, NULL);
         check(stock(b3, 17) == 4, "... its next change is put back");
+        {   /* lane 76 (task 76f): a lord's new pile (type 58h) is not taken in by the game's own calls */
+            uint8_t *pl = mk_building(m, 0x58, lord), *pl2 = mk_building(m, 0x58, lord);
+            unsigned long long ar = status_num("autoreg="), fz = status_num("frozen="), pf = status_num("pilefree=");
+            game_write(m, pl, 17, 4, NULL); game_write(m, pl, 16, 2, NULL);
+            check(stock(pl, 17) == 4 && stock(pl, 16) == 2 && status_num("pilefree=") >= pf + 2 && status_num("autoreg=") == ar && status_num("frozen=") == fz,
+                  "a lord's new pile keeps every change of the game's own (4 planks, then 2 logs): not remembered, counted (pilefree)");
+            mod_write(m, pl, 17, -1);
+            check(stock(pl, 17) == 3 && stock(pl, 16) == 2 && status_num("frozen=") == fz + 1, "the mod's first write takes the pile in as it is (3 planks, 2 logs)");
+            game_write(m, pl, 17, 5, NULL);
+            check(stock(pl, 17) == 3, "... and the game's next change of it is put back");
+            cmd("GOODS PILERULE OFF");
+            check(status_has("pilerule=off"), "GOODS PILERULE OFF (test switch): status pilerule=off");
+            game_write(m, pl2, 16, 2, NULL); game_write(m, pl2, 17, 4, NULL);
+            check(stock(pl2, 16) == 2 && stock(pl2, 17) == 0 && status_num("autoreg=") == ar + 1,
+                  "with the rule off the old way: the pile is remembered at its first call and the next fill is put back (the friend's empty or short pile)");
+            cmd("GOODS PILERULE ON");
+            check(status_has("pilerule=on"), "GOODS PILERULE ON: status pilerule=on");
+        }
 
         a1->data[0].amt = 44;                                   /* a change that reaches neither hook */
         n0 = status_num("leaks=");
@@ -4289,6 +4404,181 @@ int main(void)
         check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ALLOFF: .text byte-identical");
     }
 
+    /* ======================================================== O2: PICK OXCART (lane 74, round 3: the ox's timber cart) */
+    {
+        static __declspec(align(16)) uint8_t uo[0x1000], ux[0x1000], cart[0x40], other[0x40], r23t[0xD8], r23o[0xD8], r17[0xD8], r22[0xD8], r23bad[0xD8];
+        uint64_t timber = 0x7FF0000C000ull, cls2 = 0x7FF0000D000ull, cp = (uint64_t)(uintptr_t)cart, op = (uint64_t)(uintptr_t)other, bad = 0x10;
+        opts_t o; img_t *m; settask_fn st, thunk;
+        memset(&o, 0, sizeof(o)); o.p1_count = 1; o.known = 1; o.pick = 1; o.setthunk = 1;
+        m = build_image(&o);
+        st = (settask_fn)(void *)(m->text + m->pk_settask); thunk = (settask_fn)(void *)(m->text + m->st_thunk);
+        memset(uo, 0, sizeof(uo)); memset(ux, 0, sizeof(ux)); memset(r23t, 0, 0xD8); memset(r23o, 0, 0xD8); memset(r17, 0, 0xD8); memset(r22, 0, 0xD8); memset(r23bad, 0, 0xD8);
+        memcpy(cart + 0x10, &timber, 8); memcpy(other + 0x10, &cls2, 8);
+        r23t[0] = 23; memcpy(r23t + 0xC0, &cp, 8); r23o[0] = 23; memcpy(r23o + 0xC0, &op, 8); r17[0] = 17; r22[0] = 22;
+        r23bad[0] = 23; memcpy(r23bad + 0xC0, &bad, 8);
+        start("O2: PICK OXCART, a game-made pickup of a timber cart by a listed ox gets the board's stand record", m, NULL, NULL, NULL);
+        cmd("PICK ON"); cmd("STATUS");
+        check(status_has("OXCART unset timber=0 oxen=0 seen=0 replaced=0"), "status: OXCART unset at the start (no word 'on')");
+        st(uo, r23t); cmd("STATUS");
+        check(*(int32_t *)uo == 1 && uo[8] == 23 && status_has("seen=0 "), "TIMBER unset: a pickup goes through, nothing is read or counted");
+        cmd("PICK OXEN %llX", (unsigned long long)(uintptr_t)uo); cmd("PICK TIMBER %llX", (unsigned long long)timber); cmd("STATUS");
+        check(status_has("OXCART set timber=7FF0000C000 oxen=1 "), "PICK OXEN and PICK TIMBER: set");
+        st(uo, r23t); cmd("STATUS");
+        check(*(int32_t *)uo == 2 && uo[8] == 23 && status_has("seen=1 replaced=0 left=1 "), "no stand record kept yet: the game's own pickup goes through (left)");
+        thunk(uo, r17); cmd("STATUS");
+        check(*(int32_t *)uo == 3 && uo[8] == 17 && status_has("stands=1 "), "the board's stand record (reflected GoToLocation): done and kept");
+        st(uo, r23t); cmd("STATUS");
+        check(*(int32_t *)uo == 4 && uo[8] == 17 && status_has("seen=2 replaced=1 left=1 "), "the game's own pickup of a timber cart: the stand record is set instead");
+        st(uo, r23o); cmd("STATUS");
+        check(*(int32_t *)uo == 5 && uo[8] == 23 && status_has("seen=3 replaced=1 "), "a pickup of another class: goes through (counted)");
+        st(uo, r22); cmd("STATUS");
+        check(*(int32_t *)uo == 6 && uo[8] == 22 && status_has("seen=4 replaced=1 ") && status_has("OXSEEN") && status_has("/1/"), "another type: goes through; OXSEEN names type, caller, class and current task");
+        thunk(uo, r23t); cmd("STATUS");
+        check(*(int32_t *)uo == 7 && uo[8] == 23 && status_has("picks=1 "), "the board's own pickup (reflected): done and noted");
+        st(uo, r23t); cmd("STATUS");
+        check(*(int32_t *)uo == 8 && uo[8] == 23 && status_has("replaced=1 ") && status_has("board=1 "), "the game's pickup of the cart the board named: goes through (board)");
+        st(ux, r23t); cmd("STATUS");
+        check(*(int32_t *)ux == 1 && ux[8] == 23 && status_has("seen=5 "), "a unit not on the OXEN list: untouched and not counted");
+        cmd("PICK TIMBER 0"); st(uo, r23t); cmd("STATUS");
+        check(*(int32_t *)uo == 9 && uo[8] == 23 && status_has("OXCART unset ") && status_has("seen=5 "), "PICK TIMBER 0: everything as before");
+        cmd("PICK TIMBER %llX", (unsigned long long)timber); st(uo, r23t); cmd("STATUS");
+        check(*(int32_t *)uo == 10 && uo[8] == 23 && status_has("seen=6 replaced=1 left=2 "), "PICK TIMBER 0 dropped the oxen's kept records: set again, a game-made pickup goes through (left)");
+        cmd("PICK OXEN -"); st(uo, r23t); cmd("STATUS");
+        check(*(int32_t *)uo == 11 && uo[8] == 23 && status_has("oxen=0 seen=6 "), "PICK OXEN -: no ox listed, untouched");
+        cmd("PICK OXEN %llX", (unsigned long long)(uintptr_t)uo); cmd("PICK OXEN 12,%llX", (unsigned long long)(uintptr_t)uo); cmd("STATUS");
+        check(status_has("oxen=1 "), "a bad OXEN list is refused whole (the list before stays)");
+        st(uo, r23bad); cmd("STATUS");
+        check(*(int32_t *)uo == 12 && uo[8] == 23 && status_has("OXCART faulted ") && status_has("faults=1 ") && status_has("PICK on "), "a fault reading the resource: OXCART off, PICK stays on, the call goes through");
+        thunk(uo, r17); st(uo, r23t); cmd("STATUS");
+        check(*(int32_t *)uo == 14 && uo[8] == 23 && status_has("replaced=1 "), "after a fault OXCART does nothing more");
+        cmd("ALLOFF"); cmd("STATUS");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0 && status_has("oxen=0 "), "ALLOFF: .text byte-identical, the oxen list emptied");
+    }
+    {   /* O3: without SETTHUNK the board's gives cannot be told from the game's: OXCART stays out */
+        static __declspec(align(16)) uint8_t uo[0x1000], cart[0x40], r23t[0xD8];
+        uint64_t timber = 0x7FF0000C000ull, cp = (uint64_t)(uintptr_t)cart;
+        opts_t o; img_t *m; settask_fn st;
+        memset(&o, 0, sizeof(o)); o.p1_count = 1; o.known = 1; o.pick = 1; o.setthunk = 0;
+        m = build_image(&o);
+        st = (settask_fn)(void *)(m->text + m->pk_settask);
+        memset(uo, 0, sizeof(uo)); memset(r23t, 0, 0xD8); memcpy(cart + 0x10, &timber, 8); r23t[0] = 23; memcpy(r23t + 0xC0, &cp, 8);
+        start("O3: PICK OXCART without SETTHUNK: stays out", m, NULL, NULL, NULL);
+        cmd("PICK ON"); cmd("PICK OXEN %llX", (unsigned long long)(uintptr_t)uo); cmd("PICK TIMBER %llX", (unsigned long long)timber);
+        st(uo, r23t); cmd("STATUS");
+        check(*(int32_t *)uo == 1 && uo[8] == 23 && status_has("seen=0 replaced=0 left=0 "), "no SETTHUNK: nothing counted, nothing replaced");
+        cmd("ALLOFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ALLOFF: .text byte-identical");
+    }
+
+    /* ======================================================== O4: PICK HANDCART (lane 74, round 7: a villager's own hand cart) */
+    {
+        static __declspec(align(16)) uint8_t uv[0x1000], uy[0x1000], uz[0x1000], uk[0x1000], uk2[0x1000], ux[0x1000], uq[0x1000], uw[0x1000], ub2[0x1000], us[0x1000], un[0x1000], ut[0x1000], uc[0x1000];
+        static __declspec(align(16)) uint8_t cart[0x40], other[0x40], r23h[0xD8], r23o[0xD8], r22[0xD8], r4[0xD8], r23bad[0xD8], r17[0xD8];
+        uint64_t hcls = 0x7FF0000E000ull, cls2 = 0x7FF0000D000ull, cp = (uint64_t)(uintptr_t)cart, op = (uint64_t)(uintptr_t)other, bad = 0x10;
+        uint64_t m22 = 0x2222, m4 = 0x4444, mo = 0x5555, m17 = 0x1717;
+        uint8_t *units[13];
+        opts_t o; img_t *m; settask_fn st, thunk; think_fn th;
+        int i;
+        memset(&o, 0, sizeof(o)); o.p1_count = 1; o.known = 1; o.pick = 1; o.setthunk = 1;
+        m = build_image(&o);
+        st = (settask_fn)(void *)(m->text + m->pk_settask); thunk = (settask_fn)(void *)(m->text + m->st_thunk); th = (think_fn)(void *)(m->text + m->pk_think);
+        units[0] = uv; units[1] = uy; units[2] = uz; units[3] = uk; units[4] = uk2; units[5] = ux; units[6] = uq; units[7] = uw; units[8] = ub2; units[9] = us; units[10] = un; units[11] = ut; units[12] = uc;
+        for (i = 0; i < 13; i++) { memset(units[i], 0, 0x1000); *(uint8_t **)(units[i] + 0x898) = r22; *(int32_t *)(units[i] + 0x8A0) = 1; }
+        memset(r23h, 0, 0xD8); memset(r23o, 0, 0xD8); memset(r22, 0, 0xD8); memset(r4, 0, 0xD8); memset(r23bad, 0, 0xD8); memset(r17, 0, 0xD8);
+        memcpy(cart + 0x10, &hcls, 8); memcpy(other + 0x10, &cls2, 8);
+        r23h[0] = 23; memcpy(r23h + 0xC0, &cp, 8);
+        r23o[0] = 23; memcpy(r23o + 0xC0, &op, 8); memcpy(r23o + 0xA8, &mo, 8);
+        r22[0] = 22; memcpy(r22 + 0xA8, &m22, 8);
+        r4[0] = 4; memcpy(r4 + 0xA8, &m4, 8);
+        r17[0] = 17; memcpy(r17 + 0xA8, &m17, 8);
+        r23bad[0] = 23; memcpy(r23bad + 0xC0, &bad, 8);
+        start("O4: PICK HANDCART, a game-made pickup of a hand cart gets the board's kept record or the unit's own task", m, NULL, NULL, NULL);
+        cmd("PICK ON"); cmd("STATUS");
+        check(status_has("HANDCART unset cart=0 seen=0 byboard=0 bycur=0 bystand=0 left=0 loop=0 again=0 nested=0 inboard=0 chooser=0 faults=0 sets=0\r\nHCSEEN -\r\nHCLOG -\r\n"),
+              "status: HANDCART unset at the start (no word 'on'), HCSEEN and HCLOG empty");
+        st(uv, r23h); cmd("STATUS");
+        check(*(int32_t *)uv == 1 && uv[8] == 23 && status_has("HANDCART unset cart=0 seen=0 "), "unset: a pickup goes through, nothing is read or counted");
+        cmd("PICK HANDCART %llX", (unsigned long long)hcls); cmd("STATUS");
+        check(status_has("HANDCART set cart=7FF0000E000 seen=0 ") && status_has(" sets=1\r\n"), "PICK HANDCART: set");
+        st(uv, r23h); cmd("STATUS");
+        check(*(int32_t *)uv == 2 && uv[8] == 22 && *(uint64_t *)(uv + 0x10) == m22 && status_has("HANDCART set cart=7FF0000E000 seen=1 byboard=0 bycur=1 bystand=0 left=0 loop=0 again=0 nested=0 ") &&
+              status_has("/22/1/00/C\r\n") && status_has("/22/0x1"),
+              "the game's own pickup of a hand cart: the unit's own task (22) is set instead; HCSEEN and HCLOG name it");
+        st(uv, r23o); cmd("STATUS");
+        check(*(int32_t *)uv == 3 && uv[8] == 23 && *(uint64_t *)(uv + 0x10) == mo && status_has("HANDCART set cart=7FF0000E000 seen=1 "), "a Gathering of another class: goes through, not counted");
+        st(uv, r22);
+        check(*(int32_t *)uv == 4 && uv[8] == 22, "another type: untouched");
+        thunk(uv, r23h); cmd("STATUS");
+        check(*(int32_t *)uv == 5 && uv[8] == 23 && status_has("HANDCART set cart=7FF0000E000 seen=1 "), "a pickup through the reflected setTask (the board's give): untouched, not counted");
+        thunk(uy, r22); hc_deep(st, uy, r23h, 1); cmd("STATUS");
+        check(*(int32_t *)uy == 2 && uy[8] == 22 && status_has(" bycur=2 ") && status_has(" inboard=1 ") && status_has("/22/1/10/C\r\n"),
+              "a game-made pickup inside a reflected give of the same unit (a deeper frame): replaced, counted inboard");
+        *(int32_t *)(uz + 0x8A0) = 0; st(uz, r23h);
+        *(uint8_t **)(uz + 0x898) = r23h; *(int32_t *)(uz + 0x8A0) = 1; st(uz, r23h); cmd("STATUS");
+        check(*(int32_t *)uz == 2 && uz[8] == 23 && status_has(" bycur=2 bystand=0 left=2 ") && status_has("/-1/1/00/L") && status_has("/23/1/00/L\r\n"),
+              "no task, or a current task that is itself a hand cart pickup: the pickup goes through (left, never refused)");
+        *(uint8_t **)(uz + 0x898) = r23o; st(uz, r23h); cmd("STATUS");
+        check(*(int32_t *)uz == 3 && uz[8] == 23 && *(uint64_t *)(uz + 0x10) == mo && status_has(" bycur=3 bystand=0 left=2 "), "a current Gathering of another resource is a stand-in (the class is tested, not the type)");
+        thunk(us, r17); *(int32_t *)(us + 0x8A0) = 0; st(us, r23h); cmd("STATUS");
+        check(*(int32_t *)us == 2 && us[8] == 17 && *(uint64_t *)(us + 0x10) == m17 && status_has(" bycur=3 bystand=1 left=2 ") && status_has("/-1/1/00/S\r\n"),
+              "a unit with no task whose last reflected record is a stand here: that stand is set instead (bystand)");
+        thunk(ut, r17); *(uint8_t **)(ut + 0x898) = r23h; st(ut, r23h); cmd("STATUS");
+        check(*(int32_t *)ut == 2 && ut[8] == 17 && status_has(" bystand=2 left=2 "), "a current task that is itself a hand cart pickup: the stand record instead (bystand whenever bycur cannot)");
+        thunk(uc, r17); st(uc, r22); *(int32_t *)(uc + 0x8A0) = 0; st(uc, r23h); cmd("STATUS");
+        check(*(int32_t *)uc == 3 && uc[8] == 23 && status_has(" bystand=2 left=3 "), "another task the game set since the stand (its place may differ): the stand record is dropped (left)");
+        thunk(un, r22); *(int32_t *)(un + 0x8A0) = 0; st(un, r23h); cmd("STATUS");
+        check(*(int32_t *)un == 2 && un[8] == 23 && status_has(" bystand=2 left=4 "), "no task and a last reflected record that is not a stand here: the pickup goes through (left)");
+        cmd("PICK SET %llX:4:0,%llX:17:0,%llX:4:0", (unsigned long long)(uintptr_t)uk, (unsigned long long)(uintptr_t)uk2, (unsigned long long)(uintptr_t)ux);
+        thunk(uk, r4); thunk(uk2, r23h); thunk(ux, r4);
+        st(uk, r23h); cmd("STATUS");
+        check(*(int32_t *)uk == 2 && uk[8] == 4 && *(uint64_t *)(uk + 0x10) == m4 && status_has(" byboard=1 bycur=3 "), "a unit on the PICK list: its kept record (the host's task) is set instead");
+        st(uk2, r23h); cmd("STATUS");
+        check(*(int32_t *)uk2 == 2 && uk2[8] == 22 && *(uint64_t *)(uk2 + 0x10) == m22 && status_has(" byboard=1 bycur=4 "), "a kept record that is itself a hand cart pickup is not used: the unit's own task instead");
+        g_pick_rec = r23h; th(ux); cmd("STATUS");
+        check(*(int32_t *)ux == 2 && ux[8] == 4 && status_has(" byboard=2 ") && status_has(" chooser=1 ") && status_line("PICK on n=3 same=0 subst=0 left=0 kept=3 ", 0),
+              "a listed unit's chooser picks a hand cart: the kept record at once, PICK has nothing left to follow (subst 0, left 0)");
+        th(uq); cmd("STATUS");
+        check(*(int32_t *)uq == 1 && uq[8] == 22 && status_has(" bycur=5 ") && status_has(" chooser=2 ") && status_has("/22/1/01/C\r\n"), "an unlisted unit's chooser picks a hand cart: its own task instead");
+        st(uw, r23h); hc_deep(st, uw, r23h, 1); hc_deep(st, uw, r23h, 2); cmd("STATUS");
+        check(*(int32_t *)uw == 3 && uw[8] == 22 && status_has(" bycur=8 ") && status_has(" again=0 nested=2 "), "the pickup set again from inside the stand-in's setTask: replaced, nested 2 deep");
+        hc_deep(st, uw, r23h, 3); cmd("STATUS");
+        check(*(int32_t *)uw == 4 && uw[8] == 23 && status_has(" loop=1 again=0 nested=3 ") && status_has("/22/4/00/N\r\n"), "the 4th nested pickup in a row goes through (loop): never more than 3 nested replacements");
+        st(uw, r23h); cmd("STATUS");
+        check(*(int32_t *)uw == 5 && uw[8] == 22 && status_has(" bycur=9 ") && status_has(" loop=1 again=1 nested=3 "), "the next pickup at the first depth within 1 s: replaced again (counted as again)");
+        cmd("PICK OFF"); st(ub2, r23h); cmd("STATUS");
+        check(*(int32_t *)ub2 == 1 && ub2[8] == 23 && status_has("HANDCART set cart=7FF0000E000 seen=18 "), "PICK OFF with the class set: setTask untouched, nothing counted");
+        cmd("PICK ON"); cmd("PICK HANDCART 0"); st(ub2, r23h); cmd("STATUS");
+        check(*(int32_t *)ub2 == 2 && ub2[8] == 23 && status_has("HANDCART unset cart=0 seen=18 ") && status_has(" sets=2\r\n"), "PICK HANDCART 0: everything as before");
+        cmd("PICK HANDCART xyz"); cmd("PICK HANDCART 1001"); cmd("STATUS");
+        check(status_has("HANDCART unset cart=0 ") && status_has(" sets=2\r\n"), "a bad class is refused (not hex, unaligned): the class before stays");
+        cmd("PICK HANDCART %llX", (unsigned long long)hcls); st(us, r23h); cmd("STATUS");
+        check(*(int32_t *)us == 3 && us[8] == 23 && status_has(" bystand=2 left=5 "), "PICK HANDCART 0 dropped the units' kept records: set again, the idle unit's pickup goes through (left)");
+        st(ub2, r23bad); cmd("STATUS");
+        check(*(int32_t *)ub2 == 3 && ub2[8] == 23 && status_has("HANDCART faulted cart=7FF0000E000 ") && status_has(" faults=1 sets=3\r\n") && status_has("PICK on "),
+              "a fault reading the resource: HANDCART off, PICK stays on, the call goes through");
+        st(ub2, r23h); cmd("STATUS");
+        check(*(int32_t *)ub2 == 4 && ub2[8] == 23 && status_has(" seen=19 "), "after a fault HANDCART does nothing more");
+        cmd("ALLOFF"); cmd("STATUS");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0 && status_has("HANDCART faulted cart=0 "), "ALLOFF: .text byte-identical, the class unset");
+    }
+    {   /* O5: without SETTHUNK the board's gives cannot be told from the game's: HANDCART stays out */
+        static __declspec(align(16)) uint8_t uv[0x1000], cart[0x40], r23h[0xD8], r22[0xD8];
+        uint64_t hcls = 0x7FF0000E000ull, cp = (uint64_t)(uintptr_t)cart;
+        opts_t o; img_t *m; settask_fn st;
+        memset(&o, 0, sizeof(o)); o.p1_count = 1; o.known = 1; o.pick = 1; o.setthunk = 0;
+        m = build_image(&o);
+        st = (settask_fn)(void *)(m->text + m->pk_settask);
+        memset(uv, 0, sizeof(uv)); memset(r23h, 0, 0xD8); memset(r22, 0, 0xD8); memcpy(cart + 0x10, &hcls, 8);
+        r23h[0] = 23; memcpy(r23h + 0xC0, &cp, 8); r22[0] = 22;
+        *(uint8_t **)(uv + 0x898) = r22; *(int32_t *)(uv + 0x8A0) = 1;
+        start("O5: PICK HANDCART without SETTHUNK: stays out", m, NULL, NULL, NULL);
+        cmd("PICK ON"); cmd("PICK HANDCART %llX", (unsigned long long)hcls);
+        st(uv, r23h); cmd("STATUS");
+        check(*(int32_t *)uv == 1 && uv[8] == 23 && status_has("HANDCART set cart=7FF0000E000 seen=0 byboard=0 bycur=0 bystand=0 left=0 "), "no SETTHUNK: nothing counted, nothing replaced");
+        cmd("ALLOFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ALLOFF: .text byte-identical");
+    }
+
     /* ======================================================== P: GOODS and a demolished building (lane 46) */
     {
         typedef void (*dem_call)(void *b, void *pile, void *region);
@@ -4502,6 +4792,51 @@ int main(void)
         start("F5: the lookup without the stroke", m, NULL, NULL, NULL);
         check(status_line("FELL unavailable FELLHIT signature has 0 hits", 0), "FELL unavailable: one of its two patterns is missing");
     }
+    /* ======================================================== MC: MERCCUT, a friend's offer list as long as the host's (lane 88) */
+    {
+        static __declspec(align(16)) uint8_t eng[0x1000], novt[0x1000];
+        static __declspec(align(16)) uint8_t recs[4 * 0x100];
+        opts_t o = { 1 };
+        img_t *m;
+        uint64_t vt;
+        int32_t n = 3, cap = 4, got;
+        unsigned long long E, L;
+        o.known = 1;
+        m = build_image(&o);
+        vt = (uint64_t)(uintptr_t)(m->text + 0x40);
+        memset(eng, 0, sizeof(eng)); memset(novt, 0, sizeof(novt)); memset(recs, 0xAB, sizeof(recs));
+        memcpy(eng, &vt, 8);
+        *(uint8_t **)(eng + 0xBF0) = recs; memcpy(eng + 0xBF8, &n, 4); memcpy(eng + 0xBFC, &cap, 4);
+        *(uint8_t **)(novt + 0xBF0) = recs; memcpy(novt + 0xBF8, &n, 4); memcpy(novt + 0xBFC, &cap, 4);
+        E = (unsigned long long)(uintptr_t)eng; L = E + 0xBF0;
+        start("MC1: MERCCUT (known build)", m, NULL, NULL, NULL);
+        check(status_line("MERCCUT available cuts=0 refused=0 faults=0", 1), "MERCCUT available on the known build");
+        cmd("MERCCUT %llX %llX 3 2", E, L); cmd("STATUS");
+        memcpy(&got, eng + 0xBF8, 4);
+        check(got == 2 && status_has("MERCCUT available cuts=1 refused=0") && recs[2 * 0x100] == 0xAB, "3 offers -> 2: the count written, the record past the end left whole");
+        cmd("MERCCUT %llX %llX 3 1", E, L);                       /* the count is 2 now, not 3 */
+        cmd("MERCCUT %llX %llX 2 2", E, L);                       /* not a cut */
+        cmd("MERCCUT %llX %llX 2 -1", E, L);                      /* below 0 */
+        cmd("MERCCUT %llX %llX 2 1", E, L + 8);                   /* another field than the engine's offer list */
+        cmd("MERCCUT %llX %llX 3 2", (unsigned long long)(uintptr_t)novt, (unsigned long long)(uintptr_t)novt + 0xBF0);   /* no vtable in the module */
+        cmd("MERCCUT 0 BF0 3 2"); cmd("MERCCUT %llX %llX 2", E, L); cmd("MERCCUT %llX zz 2 1", E); cmd("STATUS");
+        memcpy(&got, eng + 0xBF8, 4);
+        { int32_t nv; memcpy(&nv, novt + 0xBF8, 4); check(got == 2 && nv == 3 && status_has("cuts=1 refused=8 faults=0"), "8 bad forms refused (count not as said, no cut, below 0, another field, no vtable, null, a missing number, not a number); nothing written"); }
+        cap = 1; memcpy(eng + 0xBFC, &cap, 4);
+        cmd("MERCCUT %llX %llX 2 1", E, L); cmd("STATUS");
+        memcpy(&got, eng + 0xBF8, 4);
+        check(got == 2 && status_has("refused=9 "), "a list whose capacity is below its count is refused");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "MERCCUT never writes to .text");
+        cmd("ALLOFF");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        m = build_image(&o);
+        start("MC2: MERCCUT on another game build", m, NULL, NULL, NULL);
+        check(status_line("MERCCUT unavailable another game build", 0), "MERCCUT unavailable: another build");
+        cmd("MERCCUT 1000 1BF0 3 2"); cmd("STATUS"); check(status_line("MERCCUT unavailable", 0), "a command is refused");
+    }
     /* ======================================================== E: ENDHOLD, a task ends on the host's word (lane 49, round four) */
     {
         static __declspec(align(16)) uint8_t unit[0x1000], rec[0xD8 * 2];
@@ -4654,7 +4989,12 @@ int main(void)
         m = build_image(&o);
         start("ND3: the hunger step's jump lies across an aligned 8-byte block", m, NULL, NULL, NULL);
         check(status_line("NODEATH off hunger=na accident=off", 0), "the hunger site is not taken (a write there could not be one atomic store)");
-        check(strstr(read_file(g_log), "crosses an 8-byte block") != NULL, "the log says why");
+        {   /* (lane 74, the int31 merge) the log may have turned over just after the line: its .old is read too, as in
+             * lane 65's check above (the merge's added lines moved the turn-over onto this scenario) */
+            wchar_t old[MAX_PATH]; int inLog = strstr(read_file(g_log), "crosses an 8-byte block") != NULL;
+            _snwprintf(old, MAX_PATH, L"%s.old", g_log);
+            if (!inLog) inLog = strstr(read_file(old), "crosses an 8-byte block") != NULL;
+            check(inLog, "the log says why"); }
         cmd("NODEATH ON"); cmd("STATUS");
         check(status_line("NODEATH part hunger=na accident=on fire=on crush=on animal=on", 0) && bytes_are(m->text + m->nd_hunger_patch, "0F 85"), "ON: the other four; the jump keeps its bytes");
         cmd("NODEATH OFF");
@@ -4945,6 +5285,35 @@ int main(void)
             _snwprintf(fp, MAX_PATH, L"%shist_gflush_f1.txt", g_io);
             memcpy(&qn, eng + 0x1020, 4);
             check(strstr(read_file(fp), "queued 1 pending 29") != NULL && qn == 2 && q[1] == 40 * 64 + 34, "GRIDFLUSH once the game drew from the queue: the next pending cell queued");
+            /* (lane 83) cell by cell: the friend's cell hashes of row 40 (x0 32), one cell of the host's then changed */
+            {
+                char ch[600], *e; float tq = 0.75f;
+                cmd("HIST GRIDCH %llX c1 40:32,40:33,99:0", (unsigned long long)(uintptr_t)eng);
+                _snwprintf(fp, MAX_PATH, L"%shist_gch_c1.txt", g_io); hf = read_file(fp);
+                check(strncmp(hf, "40 32 ", 6) == 0 && strstr(hf, " R ") != NULL && strstr(hf, "40:33 BAD") != NULL && strstr(hf, "99:0 BAD") != NULL, "GRIDCH: 32 cell hashes and the row hash; x0 not on a block edge or a row outside: BAD");
+                strncpy(ch, hf, sizeof(ch) - 1); ch[sizeof(ch) - 1] = 0; e = strstr(ch, "\r\n"); if (e) { e[0] = '\r'; e[1] = '\n'; e[2] = 0; }
+                _snwprintf(fp, MAX_PATH, L"%shist_gdin_d1.txt", g_io); gf = _wfopen(fp, L"wb"); fputs(ch, gf); fclose(gf);
+                cmd("HIST GRIDDIFF %llX d1", (unsigned long long)(uintptr_t)eng);
+                _snwprintf(fp, MAX_PATH, L"%shist_gdiff_d1.txt", g_io); hf = read_file(fp);
+                check(strstr(hf, "END rows 0 cells 0 whole 0 bad 0") == hf, "GRIDDIFF on equal cells: nothing to send");
+                memcpy(&qb, &tq, 4); grid[(40 * 64 + 37) * 4 + 3] = tq;
+                cmd("HIST GRIDDIFF %llX d1", (unsigned long long)(uintptr_t)eng);
+                hf = read_file(fp);
+                check(strncmp(hf, "40 32 00000020 3E8000003E8000003E8000003F400000\r\n", 49) == 0 && strstr(hf, "END rows 1 cells 1 whole 0 bad 0") != NULL, "GRIDDIFF: only the changed cell (bit 5), its four floats");
+                /* the friend writes it in the masked form; the other cells stay */
+                _snwprintf(fp, MAX_PATH, L"%shist_gin_m1.txt", g_io); gf = _wfopen(fp, L"wb"); fprintf(gf, "40 32 00000021 3F0000003F0000003F0000003F000000 3F8000003F8000003F8000003F800000\r\n"); fclose(gf);
+                grid[(40 * 64 + 32) * 4] = 0.1f;
+                cmd("HIST GRIDSET %llX m1", (unsigned long long)(uintptr_t)eng);
+                _snwprintf(fp, MAX_PATH, L"%shist_gset_m1.txt", g_io); hf = read_file(fp);
+                check(strstr(hf, "bad 1") != NULL && grid[(40 * 64 + 37) * 4] == 0.25f, "GRIDSET masked: a cell that is no hex is refused (counted bad; the cells before it are written)");
+                grid[(40 * 64 + 32) * 4] = 0.1f;
+                gf = _wfopen(fp, L"wb"); fclose(gf);
+                _snwprintf(fp, MAX_PATH, L"%shist_gin_m1.txt", g_io); gf = _wfopen(fp, L"wb"); fprintf(gf, "40 32 00000021 3F0000003F0000003F0000003F0000003F8000003F8000003F8000003F800000\r\n"); fclose(gf);
+                cmd("HIST GRIDSET %llX m1", (unsigned long long)(uintptr_t)eng);
+                _snwprintf(fp, MAX_PATH, L"%shist_gset_m1.txt", g_io); hf = read_file(fp);
+                check(strstr(hf, "cells 2 changed 2") != NULL && grid[(40 * 64 + 32) * 4] == 0.5f && grid[(40 * 64 + 37) * 4] == 1.0f && grid[(40 * 64 + 33) * 4 + 1] == 0.25f && grid[(40 * 64 + 37) * 4 + 3] == 1.0f,
+                      "GRIDSET masked: the two cells of bits 0 and 5 written, the cells between kept");
+            }
             memset(eng + 0x1018, 0, 16);
         }
         /* DUMP and DUMPLIST */
@@ -4972,7 +5341,10 @@ int main(void)
             memcpy(trk + 0xD8, &mb, 4); memcpy(trk + 0xF0, &nb, 4);
             cmd("HIST TRKDUMP k1 %llX,%llX", (unsigned long long)(uintptr_t)trk, (unsigned long long)(uintptr_t)novt);
             _snwprintf(fp, MAX_PATH, L"%shist_trk_k1.txt", g_io); hf = read_file(fp);
-            check(strstr(hf, " 1 | 18:2:290/5,291/7\r\n") != NULL && strstr(hf, "77") == NULL && strstr(hf, " BAD ") != NULL, "TRKDUMP: the allocated good's entries (the free slot not read); an object with no vtable: BAD");
+            /* (lane 88) the free slot's key 77 as an entry ("77:"), not any "77": an object's address in the file can
+             * hold those two digits (it did once lane 88's test block moved the statics: ...C7710) */
+            check(strstr(hf, " 1 | 18:2:290/5,291/7\r\n") != NULL && strstr(hf, "| 77:") == NULL && strstr(hf, ",77:") == NULL && strstr(hf, ";77:") == NULL
+                  && strstr(hf, " BAD ") != NULL, "TRKDUMP: the allocated good's entries (the free slot not read); an object with no vtable: BAD");
             /* TRKSET: in place from entry 1; a third entry past the capacity is refused ("short"); a good the map has
              * not ("nokey"); cut to none; a hole refused */
             cmd("HIST TRKSET %llX 18 1 291/9", (unsigned long long)(uintptr_t)trk); cmd("STATUS");
@@ -5063,6 +5435,81 @@ int main(void)
         m = build_image(&o);
         start("H4: HADD twice", m, NULL, L"friend", NULL);
         check(status_line("HIST available reads=0 files=0 tryadd=unavailable", 0), "two HADD hits: the probes stay, TRYADD unavailable");
+    }
+    {
+        /* lane 83: TRK (TRKHOLD) - a friend's own production calls skipped, this DLL's own calls passed, the bytes back */
+        static __declspec(align(16)) uint8_t trk[0x200], mel[0x20], ent[2 * 0x10], kown[0x400], keng[0x1100], kwm[0x200];
+        typedef void (*hadd_t)(void *, int, int, void *);
+        opts_t o = { 1 };
+        img_t *m;
+        hadd_t fh;
+        uint64_t vt;
+        int32_t two = 2, one = 1, k18 = 18; uint32_t mb = 1;
+        o.known = 1; o.hist = 1;
+        m = build_image(&o);
+        vt = (uint64_t)(uintptr_t)(m->text + 0x40);
+        memset(trk, 0, sizeof(trk)); memcpy(trk, &vt, 8);
+        memset(kown, 0, sizeof(kown)); memset(keng, 0, sizeof(keng)); memset(kwm, 0, sizeof(kwm)); memcpy(kown, &vt, 8); memcpy(keng, &vt, 8); memcpy(kwm, &vt, 8);
+        *(uint8_t **)(kown + 0x2E8) = keng; *(uint8_t **)(trk + 0x90) = kown; *(uint8_t **)(trk + 0x118) = kwm;
+        start("K1: TRK (lane 83): a friend's own production calls skipped", m, NULL, L"friend", NULL);
+        fh = (hadd_t)(void *)(m->text + m->hadd);
+        check(status_line("TRK off skipped=0 passed=0 native=0 other=0 stale=0 tskipped=0", 1), "TRK off before any TRKHOLD");
+        g_hadd_calls = 0; fh(trk, 5, 1, NULL);
+        check(g_hadd_calls == 1, "off: the game's routine runs");
+        cmd("TRKHOLD ON"); cmd("STATUS");
+        check(m->text[m->hadd] == 0xE9 && memcmp(m->text + m->hadd + 5, m->snapshot + m->hadd + 5, 16) == 0 && status_line("TRK on skipped=0", 0),
+              "TRKHOLD ON: a jump in the routine's first five bytes and nothing else; status on");
+        g_hadd_calls = 0; fh(trk, 5, 1, NULL); fh(trk, 6, 2, NULL); cmd("TRKHOLD ON"); cmd("STATUS");
+        check(g_hadd_calls == 0 && status_has("skipped=2 "), "ON: the game's own calls return at once (the routine not run), counted; a second ON is the keepalive");
+        /* this DLL's own call (TRKSET: a good the map has not -> the game's add) goes through */
+        memset(mel, 0, sizeof(mel)); memset(ent, 0, sizeof(ent));
+        memcpy(mel, &k18, 4); *(uint8_t **)(mel + 8) = ent; memcpy(mel + 0x10, &two, 4); memcpy(mel + 0x14, &two, 4);
+        *(uint8_t **)(trk + 0xC8) = mel; memcpy(trk + 0xD0, &one, 4); memcpy(trk + 0xD4, &one, 4); memcpy(trk + 0xD8, &mb, 4); memcpy(trk + 0xF0, &one, 4);
+        g_hadd_calls = 0;
+        cmd("HIST TRKSET %llX 99 0 1/1", (unsigned long long)(uintptr_t)trk); cmd("STATUS");
+        check(g_hadd_calls == 1 && g_hadd_good == 99 && status_has("native=1 "), "ON: this DLL's own call (TRKSET's add) runs the routine, counted as native");
+        memset(trk + 0xC8, 0, 0x50);
+        g_hadd_calls = 0; fh(trk, 7, 1, NULL); cmd("STATUS");
+        check(g_hadd_calls == 0 && status_has("skipped=3 "), "after the native call the game's own calls are skipped again (the flag was put back)");
+        cmd("TRKHOLD OFF"); cmd("STATUS");
+        check(memcmp(m->text + m->hadd, m->snapshot + m->hadd, 5) == 0 && status_line("TRK off", 0), "TRKHOLD OFF: the original five bytes back; status off");
+        g_hadd_calls = 0; fh(trk, 5, 1, NULL);
+        check(g_hadd_calls == 1, "off again: the game's routine runs");
+        cmd("TRKHOLD ON"); cmd("ALLOFF"); cmd("STATUS");
+        check(memcmp(m->text + m->hadd, m->snapshot + m->hadd, 5) == 0 && status_line("TRK off", 0), "ALLOFF takes TRK out too");
+        /* the dead-man: no keepalive for over 5 s -> the game's own calls pass, counted, said once */
+        cmd("TRKHOLD ON"); Sleep(5300);
+        g_hadd_calls = 0; fh(trk, 5, 1, NULL); fh(trk, 5, 1, NULL); cmd("STATUS");
+        check(g_hadd_calls == 2 && status_has("stale=2"), "no keepalive for 5 s: the game's own calls pass through (the mod stopped answering), counted"); if (g_hadd_calls != 2 || !status_has("stale=2")) printf("   calls %ld status: %s\n", (long)g_hadd_calls, read_file(g_status));
+        {
+            typedef void (*tadd_t)(void *, int, float);
+            typedef void (*tadd2_t)(void *, int, float, void *);
+            tadd_t ft1 = (tadd_t)(void *)(m->text + m->tadd1); tadd2_t ft2 = (tadd2_t)(void *)(m->text + m->tadd2);
+            static __declspec(align(16)) uint8_t unit[0xC00];
+            memset(unit, 0, sizeof(unit));
+            g_tadd_calls = 0; ft1(trk, 4, 2.5f);
+            check(g_tadd_calls == 1 && g_tadd_cat == 4 && g_tadd_time == 2.5f, "no keepalive for 5 s: TADD1 passes through, its category (dl) and time (xmm2) kept through the stub");
+            ft2(trk, 6, 1.25f, unit); cmd("STATUS");
+            check(g_tadd_calls == 2 && g_tadd_time == 1.25f && status_has("tskipped=0 "), "... TADD2 too, its time (xmm2) kept (its category the game itself moves to r8d: not seen by the recorder)");
+            cmd("TRKHOLD ON"); g_tadd_calls = 0; ft1(trk, 4, 2.5f); ft2(trk, 6, 1.25f, unit); cmd("STATUS");
+            check(g_tadd_calls == 0 && status_has("tskipped=2 ") && status_has("time=hooked"), "ON: both time adds of the game return at once, counted apart (tskipped)");
+            cmd("TRKHOLD OFF"); g_tadd_calls = 0; ft1(trk, 3, 0.5f); cmd("STATUS");
+            check(g_tadd_calls == 1 && g_tadd_cat == 3 && g_tadd_time == 0.5f && memcmp(m->text + m->tadd1, m->snapshot + m->tadd1, 8) == 0 && memcmp(m->text + m->tadd2, m->snapshot + m->tadd2, 8) == 0,
+                  "OFF: the time routines' bytes back, the call runs with its arguments");
+        }
+        cmd("TRKHOLD ON"); g_hadd_calls = 0; fh(trk, 5, 1, NULL); cmd("STATUS");
+        check(g_hadd_calls == 0, "a new keepalive: skipped again");
+        cmd("TRKHOLD OFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, ".text as it was after OFF");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.hist = 2;
+        m = build_image(&o);
+        start("K2: TRK with two HADD hits", m, NULL, L"friend", NULL);
+        cmd("TRKHOLD ON"); cmd("STATUS");
+        check(status_line("TRK unavailable HADD signature has 2 hits", 0) && memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "two HADD hits: TRK refused, nothing written");
     }
 
     /* ======================================================== C: COLLAPSE, a building collapses on the host's word (lane 71) */
@@ -5201,6 +5648,116 @@ int main(void)
         cmd("SITEHP HOLD %llu %08X", (unsigned long long)(uintptr_t)site, hb); g_tick(NULL); cmd("STATUS");
         check(status_has("held=0 ") && status_has("gone=2 "), "a part list that is not sane: dropped, nothing read past it");
         *(int32_t *)(site + 0x300) = 3;
+        /* (lane 87) a big building: 200 parts (the limit was 64: a church has 85, a manor 69, the most seen 120) */
+        {
+            static __declspec(align(16)) uint8_t big[0x1000], bpart[200][0x320];
+            static uint8_t *bp[1025];
+            float q25 = 0.25f, got = 0.0f; uint32_t qb; int i, full = 0;
+            memset(big, 0, sizeof(big)); memset(bpart, 0, sizeof(bpart));
+            *(uint8_t **)big = m->base + 0x100; *(uint32_t *)(big + 0x0C) = 72; *(uint64_t *)(big + 0x18) = 0x7272;
+            *(uint8_t **)(big + 0x2C8) = reg;
+            for (i = 0; i < 1025; i++) bp[i] = bpart[i % 200];
+            for (i = 0; i < 200; i++) { *(uint8_t **)bpart[i] = m->base + 0x100; *(float *)(bpart[i] + 0x318) = 10.0f; *(float *)(bpart[i] + 0x314) = i < 50 ? 10.0f : 0.0f; }
+            *(uint8_t ***)(big + 0x2F8) = bp; *(int32_t *)(big + 0x300) = 200; *(int32_t *)(big + 0x304) = 1025;
+            memcpy(&qb, &q25, 4);
+            DeleteFileW(outp);
+            cmd("SITEHP WATCH %llu", (unsigned long long)(uintptr_t)big); cmd("SITEHP POLL");
+            out = read_file(outp); _snprintf(want, sizeof(want), "%IX %08X\r\n", (uintptr_t)big, qb); hit = strstr(out, want) != NULL; DeleteFileW(outp);
+            check(hit, "POLL: a site of 200 parts is read (500 of 2000)");
+            cmd("SITEHP DROP %llu", (unsigned long long)(uintptr_t)big);
+            cmd("SITEHP HOLD %llu %08X", (unsigned long long)(uintptr_t)big, hb); g_tick(NULL); cmd("STATUS");
+            for (i = 0; i < 200; i++) { float v = *(float *)(bpart[i] + 0x314); got += v; if (v == 10.0f) full++; if (v < 0.0f || v > 10.0f) full = -1000; }
+            check(got > 999.9f && got < 1000.1f && full >= 0 && status_has("held=1 ") && status_has("gone=2 "), "HOLD 0.5 on 200 parts: their hp sum to half of the max, none above its max, the site is not dropped");
+            *(int32_t *)(big + 0x300) = 1025;
+            g_tick(NULL); cmd("STATUS");
+            check(status_has("held=0 ") && status_has("gone=3 "), "a part list of 1025: over the limit of 1024, dropped, nothing written");
+            *(int32_t *)(big + 0x300) = 200;
+            /* (lane 87) HOLDX: the exact hold. The fraction is made as the game makes it: float sums in list order, one division */
+            {
+                float S = 0.0f, M = 0.0f, fq, v, one = 1.0f, fr = 0.3f; uint32_t wb, ob, nb, rnd = 12345u;
+                int j, exact = 0, near1 = 0, farn = 0, order_ok = 1, cases = 0, missed = 0;
+                unsigned w0;
+                for (i = 0; i < 200; i++) { *(float *)(bpart[i] + 0x318) = 7.3f + (float)(i % 5) * 0.37f; *(float *)(bpart[i] + 0x314) = 0.0f; }
+                memcpy(&wb, &fr, 4);
+                cmd("SITEHP HOLDX %llu %08X", (unsigned long long)(uintptr_t)big, wb); g_tick(NULL); cmd("STATUS");
+                for (i = 0; i < 200; i++) { S += *(float *)(bpart[i] + 0x314); M += *(float *)(bpart[i] + 0x318); }
+                fq = S / M; memcpy(&nb, &fq, 4);
+                check(nb == wb && status_has("hx=1 ") && status_has("held=1 "), "HOLDX 0.3 on 200 parts of uneven max: the game's sum over the game's max sum is 0.3 bit for bit");
+                { int st = 0;                                    /* full parts, then one partial part, then nothing */
+                  for (i = 0; i < 200; i++) { float hpv = *(float *)(bpart[i] + 0x314), mx = *(float *)(bpart[i] + 0x318);
+                    if (hpv < 0.0f || hpv > mx) order_ok = 0;
+                    if (st == 0) { if (hpv == mx) continue; st = hpv > 0.0f ? 1 : 2; if (st == 1) continue; }
+                    else if (st == 1) st = 2;
+                    if (st == 2 && hpv != 0.0f) order_ok = 0; }
+                  check(order_ok, "HOLDX fills in list order: full parts, one partial part, the rest 0; none above its max"); }
+                w0 = (unsigned)sh_val("writes="); g_tick(NULL); g_tick(NULL); cmd("STATUS");
+                check(sh_val("writes=") > 0 && (unsigned)sh_val("writes=") == w0, "the fraction is the wanted one: nothing is written at the next ticks");
+                /* this copy's builder hammers the first part that is not full: taken back, to the same bits */
+                for (i = 0; i < 200; i++) if (*(float *)(bpart[i] + 0x314) < *(float *)(bpart[i] + 0x318)) { *(float *)(bpart[i] + 0x314) += 1.5f; break; }
+                g_tick(NULL); S = 0.0f; M = 0.0f;
+                for (i = 0; i < 200; i++) { S += *(float *)(bpart[i] + 0x314); M += *(float *)(bpart[i] + 0x318); }
+                fq = S / M; memcpy(&nb, &fq, 4);
+                check(nb == wb, "a builder's stroke on this copy is taken back at the next tick: the same bits again");
+                /* many fractions as a host with ANOTHER part count makes them (119 parts of 10.5: its own sums) */
+                for (j = 0; j < 400; j++) {
+                    float hs = 0.0f, hm = 0.0f, hq; int nfull;
+                    rnd = rnd * 1664525u + 1013904223u; nfull = (int)((rnd >> 8) % 119u);
+                    for (i = 0; i < 119; i++) { hm += 10.5f; if (i < nfull) hs += 10.5f; }
+                    rnd = rnd * 1664525u + 1013904223u; hs += (float)((rnd >> 8) % 10500u) / 1000.0f;
+                    hq = hs / hm; if (hq > one) hq = one; memcpy(&wb, &hq, 4);
+                    cmd("SITEHP HOLDX %llu %08X", (unsigned long long)(uintptr_t)big, wb); g_tick(NULL);
+                    S = 0.0f; M = 0.0f;
+                    for (i = 0; i < 200; i++) { v = *(float *)(bpart[i] + 0x314); S += v; M += *(float *)(bpart[i] + 0x318); if (v < 0.0f || v > *(float *)(bpart[i] + 0x318)) order_ok = 0; }
+                    fq = S / M; memcpy(&nb, &fq, 4); cases++;
+                    if (nb == wb) exact++; else if (nb + 1 == wb || nb == wb + 1) near1++; else farn++;
+                    if (nb != wb) {                              /* is there a sum of THIS copy's grid that gives the wanted bits? then it was missed */
+                        float c = (float)((double)hq * (double)M); uint32_t cb, qb2; int s2;
+                        memcpy(&cb, &c, 4);
+                        for (s2 = -64; s2 <= 64; s2++) { uint32_t tb2 = cb + (uint32_t)s2; float cc, qq; memcpy(&cc, &tb2, 4); qq = cc / M; memcpy(&qb2, &qq, 4); if (cc <= M && qb2 == wb) missed++; }
+                    }
+                }
+                cmd("STATUS");
+                printf("        (HOLDX, %d fractions of a host with 119 parts held on 200 parts: %d bit for bit, %d one float step off, %d further; of those not bit for bit, %d had a sum that gives the bits; status near=%ld)\n", cases, exact, near1, farn, missed, status_val("near="));
+                check(farn == 0 && missed == 0 && order_ok && exact >= cases / 2, "HOLDX: 400 fractions of a host with another part count: bit for bit, or one float step where NO sum of this copy's float grid gives the bits (checked: 64 steps each way); never further");
+                /* a part without a max is left alone */
+                *(float *)(bpart[3] + 0x318) = 0.0f; *(float *)(bpart[3] + 0x314) = 5.0f; memcpy(&wb, &fr, 4);
+                cmd("SITEHP HOLDX %llu %08X", (unsigned long long)(uintptr_t)big, wb); g_tick(NULL);
+                check(*(float *)(bpart[3] + 0x314) == 5.0f, "HOLDX leaves a part with max 0 alone (the game's adder skips it too)");
+                *(float *)(bpart[3] + 0x318) = 7.3f + 3.0f * 0.37f;
+                /* refusals, and HOLD after HOLDX is the old hold again */
+                { long b0 = sh_val("bad=");
+                  cmd("SITEHP HOLDX %llu %08X", (unsigned long long)(uintptr_t)big, tb); cmd("SITEHP HOLDX %llu zz", (unsigned long long)(uintptr_t)big); cmd("SITEHP HOLDX 0 %08X", wb); cmd("STATUS");
+                  check(b0 >= 0 && sh_val("bad=") == b0 + 3 && status_has("hx=1 "), "HOLDX refused: a fraction above 1, bits that are no number, address 0"); }
+                cmd("SITEHP HOLD %llu %08X", (unsigned long long)(uintptr_t)big, hb); g_tick(NULL); cmd("STATUS");
+                check(status_has("hx=0 ") && status_has("held=1 "), "HOLD on a site held exactly: the old hold again (one entry per site)");
+                /* FILL: every part to its max in the command itself, the hold ended (ahead of a FINISH of the same tick) */
+                { int allfull = 1; long b1;
+                  memcpy(&wb, &fr, 4);
+                  cmd("SITEHP HOLDX %llu %08X", (unsigned long long)(uintptr_t)big, wb); g_tick(NULL);
+                  cmd("SITEHP FILL %llu", (unsigned long long)(uintptr_t)big);      /* one tick: the command, then sitehp_tick (which must find nothing held) */
+                  for (i = 0; i < 200; i++) if (*(float *)(bpart[i] + 0x314) != *(float *)(bpart[i] + 0x318)) allfull = 0;
+                  cmd("STATUS");
+                  check(allfull && status_has("held=0 ") && sh_val("fills=") == 1, "FILL: every part at its max after the tick of the command, and no hold is applied after it (the site is no longer held)");
+                  b1 = sh_val("bad=");
+                  *(int32_t *)(big + 0x300) = 1025; cmd("SITEHP FILL %llu", (unsigned long long)(uintptr_t)big); cmd("SITEHP FILL 0"); cmd("STATUS");
+                  check(sh_val("bad=") == b1 + 2 && sh_val("fills=") == 1, "FILL refused: a part list that is not sane, address 0");
+                  *(int32_t *)(big + 0x300) = 200; }
+                cmd("SITEHP DROP %llu", (unsigned long long)(uintptr_t)big);
+                /* POLL reports a change of one float step (was: only a move of 0.0005) */
+                DeleteFileW(outp);
+                cmd("SITEHP WATCH %llu", (unsigned long long)(uintptr_t)big); cmd("SITEHP POLL"); DeleteFileW(outp);
+                for (i = 0; i < 200; i++) if (*(float *)(bpart[i] + 0x314) > 0.0f && *(float *)(bpart[i] + 0x314) < *(float *)(bpart[i] + 0x318)) break;
+                if (i == 200) i = 0;
+                S = 0.0f; M = 0.0f; for (j = 0; j < 200; j++) { S += *(float *)(bpart[j] + 0x314); M += *(float *)(bpart[j] + 0x318); }
+                fq = S / M; memcpy(&ob, &fq, 4);
+                *(float *)(bpart[i] + 0x314) += 0.004f;
+                S = 0.0f; M = 0.0f; for (j = 0; j < 200; j++) { S += *(float *)(bpart[j] + 0x314); M += *(float *)(bpart[j] + 0x318); }
+                fq = S / M; memcpy(&nb, &fq, 4);
+                cmd("SITEHP POLL"); out = read_file(outp); _snprintf(want, sizeof(want), "%IX %08X\r\n", (uintptr_t)big, nb); hit = strstr(out, want) != NULL; DeleteFileW(outp);
+                check(hit && nb != ob, "POLL reports a fraction whose bits changed (0.004 hp of about 1,600: far under the old 0.0005 threshold)");
+                cmd("SITEHP DROP %llu", (unsigned long long)(uintptr_t)big);
+            }
+        }
         check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "SITEHP never writes to .text");
     }
     {
@@ -5347,6 +5904,127 @@ int main(void)
         m = build_image(&o);
         start("FR4: no sickness roll", m, NULL, NULL, NULL);
         check(status_line("FAMROLL unavailable SICKROLL signature has 0 hits", 0), "FAMROLL unavailable without the sickness roll");
+    }
+
+    /* ======================================================== NR: NOROLL, a friend's own mercenary month roll (lane 87) */
+    {
+        static __declspec(align(16)) uint8_t eng[0x1000];
+        opts_t o = { 1 };
+        img_t *m;
+        typedef void (*rollfn)(void *e);
+        rollfn roll;
+        o.known = 1; o.noroll = 1;
+        m = build_image(&o);
+        roll = (rollfn)(void *)(m->text + m->nr_roll);
+        memset(eng, 0, sizeof(eng));
+        start("NR1: NOROLL (known build)", m, NULL, NULL, NULL);
+        check(status_line("NOROLL off blocked=0 passed=0 expired=0 bad=0", 0), "NOROLL found: the month roll's entry once");
+        roll(eng); check(*(int32_t *)(eng + 0xBF8) == 7, "the game's roll runs (its offer count marked)");
+        *(int32_t *)(eng + 0xBF8) = 0;
+        cmd("NOROLL ON"); cmd("STATUS");
+        check(status_line("NOROLL on ", 0) && m->text[m->nr_roll] == 0xE9 && m->text[m->nr_roll + 5] == 0xCC && m->text[m->nr_roll + 6] == 0xCC
+              && memcmp(m->text + m->nr_roll + 7, m->snapshot + m->nr_roll + 7, 40) == 0,
+              "ON: the entry's 7 bytes are a jump and two int3; the rest of the routine untouched");
+        roll(eng); cmd("STATUS");
+        check(*(int32_t *)(eng + 0xBF8) == 0 && status_has("blocked=1 "), "ON: the roll returns at once (no offers of this copy's own)");
+        cmd("NOROLL PASS"); roll(eng); cmd("STATUS");
+        check(*(int32_t *)(eng + 0xBF8) == 7 && status_has("passed=1 ") && status_has("blocked=1 "),
+              "PASS: the next call goes through: the game's own roll runs (the realm module's call)");
+        *(int32_t *)(eng + 0xBF8) = 0; roll(eng); cmd("STATUS");
+        check(*(int32_t *)(eng + 0xBF8) == 0 && status_has("blocked=2 "), "PASS is for one call: the call after it is blocked again");
+        cmd("NOROLL PASS"); g_tick(NULL); roll(eng); cmd("STATUS");
+        check(*(int32_t *)(eng + 0xBF8) == 0 && status_has("expired=1 ") && status_has("blocked=3 "),
+              "a pass not used before the next tick is dropped (a later month roll stays blocked)");
+        cmd("NOROLL ON"); cmd("STATUS"); check(status_line("NOROLL on ", 0) && m->text[m->nr_roll] == 0xE9, "ON twice: one hook");
+        cmd("NOROLL MAYBE"); cmd("STATUS"); check(status_has("bad=1"), "a bad form refused");
+        cmd("NOROLL OFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "OFF: .text byte-identical");
+        roll(eng); check(*(int32_t *)(eng + 0xBF8) == 7, "OFF: the game's roll runs again");
+        cmd("NOROLL ON"); cmd("ALLOFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ALLOFF: .text byte-identical");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.noroll = 1;
+        m = build_image(&o);
+        start("NR2: NOROLL on another game build", m, NULL, NULL, NULL);
+        check(status_line("NOROLL unavailable another game build", 0), "NOROLL unavailable: another build");
+        cmd("NOROLL ON"); cmd("STATUS"); check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ON refused, nothing written");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.noroll = 2;
+        m = build_image(&o);
+        start("NR3: the month roll twice", m, NULL, NULL, NULL);
+        check(status_line("NOROLL unavailable MERCROLL signature has 2 hits", 0), "NOROLL unavailable: two hits");
+    }
+
+    /* ======================================================== BN: BARNAN, a friend's site with no parts yet (lane 87) */
+    {
+        static __declspec(align(16)) uint8_t bnb[0x600], before[0x600], p1[0x400], p2[0x400];
+        static uint8_t *parts[2];
+        opts_t o = { 1 };
+        img_t *m;
+        typedef float (*progfn)(void *b);
+        progfn prog;
+        float three = 3.0f, five = 5.0f, ten = 10.0f, g = 0.5f, g2 = 0.8f, r, want, w;
+        o.known = 1; o.barnan = 1;
+        m = build_image(&o);
+        prog = (progfn)(void *)(m->text + m->bn_prog);
+        memset(bnb, 0, sizeof(bnb)); memset(p1, 0, sizeof(p1)); memset(p2, 0, sizeof(p2));
+        memcpy(p1 + 0x314, &three, 4); memcpy(p1 + 0x318, &ten, 4); memcpy(p2 + 0x314, &five, 4); memcpy(p2 + 0x318, &ten, 4);
+        parts[0] = p1; parts[1] = p2;
+        *(uint8_t ***)(bnb + 0x2F8) = parts; *(int32_t *)(bnb + 0x300) = 2; *(int32_t *)(bnb + 0x304) = 2; memcpy(bnb + 0x450, &g, 4);
+        w = (0.0f + 3.0f + 5.0f) / (0.0f + 10.0f + 10.0f); want = (w + 0.5f) * 0.5f;
+        start("BN1: BARNAN (known build)", m, NULL, NULL, NULL);
+        check(status_line("BARNAN off zeroed=0 faults=0 bad=0", 0), "BARNAN found: the progress function's entry once");
+        r = prog(bnb); check(memcmp(&r, &want, 4) == 0, "off: two parts, the game's bar (0.45)");
+        *(int32_t *)(bnb + 0x300) = 0;
+        r = prog(bnb); check(r != r, "off: an empty part list reads not a number (0/0), as in the game");
+        cmd("BARNAN ON"); cmd("STATUS");
+        check(status_line("BARNAN on ", 0) && m->text[m->bn_prog] == 0xE9 && m->text[m->bn_prog + 5] == 0xCC && m->text[m->bn_prog + 6] == 0xCC
+              && memcmp(m->text + m->bn_prog + 7, m->snapshot + m->bn_prog + 7, 40) == 0,
+              "ON: the entry's 7 bytes are a jump and two int3; the rest of the function untouched");
+        *(int32_t *)(bnb + 0x300) = 2;
+        memcpy(before, bnb, sizeof(bnb));
+        r = prog(bnb); cmd("STATUS");
+        check(memcmp(&r, &want, 4) == 0 && status_has("zeroed=0 ") && memcmp(before, bnb, sizeof(bnb)) == 0,
+              "ON: a site with parts: the original runs, bit for bit, nothing written");
+        *(int32_t *)(bnb + 0x300) = 0;
+        memcpy(before, bnb, sizeof(bnb));
+        r = prog(bnb); cmd("STATUS");
+        want = (0.0f / 1.0f + 0.5f) * 0.5f;
+        check(memcmp(&r, &want, 4) == 0 && status_has("zeroed=1 "), "ON: an empty part list reads the game's bar with no work done (G 0.5: 0.25), not 0/0");
+        check(memcmp(before, bnb, sizeof(bnb)) == 0, "ON: the building's bytes are unchanged by that call (the game's function ran on a copy)");
+        memcpy(bnb + 0x450, &g2, 4);
+        r = prog(bnb); want = (0.0f / 1.0f + 0.8f) * 0.5f;
+        check(memcmp(&r, &want, 4) == 0, "ON: the goods half is the game's own, from the building (G 0.8: 0.4)");
+        cmd("BARNAN ON"); cmd("STATUS"); check(status_line("BARNAN on ", 0) && m->text[m->bn_prog] == 0xE9, "ON twice: one hook");
+        cmd("BARNAN MAYBE"); cmd("STATUS"); check(status_has("bad=1"), "a bad form refused");
+        cmd("BARNAN OFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "OFF: .text byte-identical");
+        r = prog(bnb); check(r != r, "OFF: an empty list reads not a number again (the game's own)");
+        cmd("BARNAN ON"); cmd("ALLOFF");
+        check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ALLOFF: .text byte-identical");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.barnan = 1;
+        m = build_image(&o);
+        start("BN2: BARNAN on another game build", m, NULL, NULL, NULL);
+        check(status_line("BARNAN unavailable another game build", 0), "BARNAN unavailable: another build");
+        cmd("BARNAN ON"); cmd("STATUS"); check(memcmp(m->text, m->snapshot, TEXT_SIZE) == 0, "ON refused, nothing written");
+    }
+    {
+        opts_t o = { 1 };
+        img_t *m;
+        o.known = 1; o.barnan = 2;
+        m = build_image(&o);
+        start("BN3: the progress function twice", m, NULL, NULL, NULL);
+        check(status_line("BARNAN unavailable SITEPROG signature has 2 hits", 0), "BARNAN unavailable: two hits");
     }
 
     test_report();                              /* lane 61 */

@@ -65,7 +65,7 @@ The third word of a line. Most kinds go one way: from the host to friends (H→F
 | `T` | `coop_town.lua`, `coop_x_town.lua`, `coop_x_build.lua`, `coop_x_lord.lua` | town actions: build, roads, panels, plans, letters (F→H; the host replays, then sends it on to every friend; a refusal is `T host <n> NAK`) |
 | `W` | `coop_world.lua` | region stock and totals, the daily comparison (H→F) |
 | `F` | `coop_facts.lua` | every building's stock, house values, livestock (H→F) |
-| `R` | `coop_realm.lua` | perks, taxes, policies |
+| `R` | `coop_realm.lua` | perks, taxes, policies, the mercenary offers' records (a friend's list is cut to the host's length: native `MERCCUT`) |
 | `L` | `coop_x_lord.lua` | war and peace |
 | `A`, `K` | `coop_x_army.lua` | army panel, retinue |
 | `M` | `coop_ui.lua` | the mercenary offers list |
@@ -74,10 +74,11 @@ The third word of a line. Most kinds go one way: from the host to friends (H→F
 | `B` | `coop_sites.lua` | building sites finish with the host's (H→F) |
 | `U` | `coop_x_jobs.lua` | the job board: which villager does which task (H→F) |
 | `MM`, `MF`, `MV` and others | `coop_x_men.lua` | where each man of a squad stands (H→F) |
-| `FM` | `coop_x_merch.lua` | free merchants' places (H→F) |
+| `FM`, `FI`, `FV` | `coop_x_merch.lua` | free merchants' places; the host's whole merchant list, by which a friend makes a missing merchant and takes out an extra one; the host's livestock merchants and the animal each one leads, for which a friend shows a stand-in and keeps its own animal beside him (H→F) |
 | `MC` | `coop_x_maint.lua` | every building's maintenance: status and each tracker (H→F) |
 | `Q` | `coop_x_scene.lua` | small scene pieces: yard gates, stalls, carts (H→F) |
 | `Y` | `coop_x_fields.lua` | fields and gardens (H→F) |
+| `FT` | `coop_x_trees.lua` | the felled trees on the ground: a friend removes one the host no longer has (H→F) |
 | `ST` | `coop_x_stats.lua` | a building's time pie and expertise, prices and foreign supply, squads' morale and stamina, militia gear, retainers' and villagers' experience, the production log (native TRKDUMP/TRKSET), expertise (native EXP), the fertility grid (block hashes, rows on a friend's ask: `ST GH/GA/GC`), the region graphs' day records (`ST H`, native HSET) (H→F; a friend asks with `ST ASK`) |
 | `J` | `coop_join.lua` | join and resync |
 | `BYE`, `HL` | `coop_session.lua` | the host leaves, or loads |
@@ -105,6 +106,7 @@ Each module registers itself with the core and gets `onWorld` (a world attached)
 | `coop_x_people.lua` | Families and rival buildings made on friends; population |
 | `coop_x_jobs.lua` | The job board: tasks, holds, which villager does what |
 | `coop_x_fields.lua` | Fields and gardens |
+| `coop_x_trees.lua` | Felled trees on the ground (loaded by `coop_x_fields.lua`) |
 | `coop_x_scene.lua` | Yard gates, stalls, carts |
 | `coop_x_stats.lua` | Time pie, expertise, prices, squads' men, experience (loaded by `main.lua` after the list) |
 | `coop_sites.lua` | Building sites finish with the host's |

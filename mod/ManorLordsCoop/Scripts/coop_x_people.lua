@@ -62,6 +62,7 @@ local DEFAULT_ON = {
   rival = true,         -- the host's list of the rival lords' buildings is pushed and compared
   rivalMake = true,     -- a building this copy lacks is placed here (town module BUILD / HOUSE)
   rivalUpgrade = true,  -- an upgrade this copy lacks is started here
+  rivalDrop = true,     -- (lane 87) an upgrade id this copy has and the host's list has not is dropped from this copy's list
   rivalRemove = true,   -- a building the host no longer has is removed here (town module DEMOLISH)
   grow = true,          -- lane 36: the host names each change of its families' sizes and homes at once (V G)
   growRivals = true,    -- lane 39: ... and of every rival lord's town too
@@ -86,6 +87,25 @@ local SETTLE = 8.0          -- a family's people are not read before it has been
 
 -- what a building is for (EBuildingFunction): which of the rival's buildings are followed, and how
 local SKIP_FN = { [3] = "market stall", [7] = "being removed", [13] = "landscape", [19] = "cosmetic", [20] = "scenario" }
+-- (lane 76, task 76e) a market stall is listed after all, for ONE rule: a rival's stall the host listed and then lost
+-- goes here too (session l76u: a rival stall demolished on the host stayed on the friend to the end, 36 s). It is
+-- never made here (each copy's families set their stalls up), and one this copy's families set up where the host has
+-- had none for 60 s is left alone. The other kinds above stay unlisted: "being removed" goes by itself, landscape,
+-- cosmetic and scenario pieces belong to the map; drawn plots (PLOT_FN) are listed but neither made nor removed.
+local STALL_FN = 3
+local STALL_KEEP = 60.0     -- s: a stall the host lost less than this long ago is removed here
+-- (lane 76, task 76e round 2) THE STALLS FOLLOW THE HOST. The lead's run r27m83: from day 322 the rival town's two
+-- new stalls stood the other way round on the friend for the whole session (host 91@9249,7403 and 93@9260,7421,
+-- friend 93@9249,7403 and 91@9260,7421: about 2,800 differing records in eight sections). Each copy's own families
+-- had put them up (the friend's log: "91@9260,7421 is a site here but the host has no such building"), and stalls
+-- were neither listed nor followed. Now, in a rival town whose host lists stalls:
+--   * a stall of ANOTHER type where the host has a stall is removed here (and then the host's is made);
+--   * a host's stall with nothing at its place here for STALL_WAIT s is made here (a site; the sites module finishes
+--     it on the host's word), unless this copy's families put up the same one meanwhile;
+--   * a stall here where the host has none for STALL_WAIT s is removed (as one the host lost within STALL_KEEP).
+-- Each is a job of the usual kind: three tries, 20 s apart, then given up (no loop with this copy's own families).
+local STALL_WAIT = 10.0
+local function listed(fn) return fn == STALL_FN or not SKIP_FN[fn] end
 local PLOT_FN = { [10] = "pasture", [12] = "field", [15] = "marketplace" }
 local HOUSE_FN = 1
 -- upgrades (EUpgradeType): animal orders are each copy's own; 100 and up are backyards and workshops of a house
@@ -577,7 +597,7 @@ local function scanSnap(S, done, recs)
         code = c.code; seen[oa] = code
       end
     end
-    if code:match("^A%d+$") and not SKIP_FN[r.fn] then
+    if code:match("^A%d+$") and listed(r.fn) then
       local okL, x, y, z, yaw = pcall(N_loc, r)
       local b = okL and x and N_obj(r)
       if b then
@@ -616,7 +636,7 @@ local function scan(S, done)
         local code = st.own[oa]; if code == nil then code = ownerCode(S, op); st.own[oa] = code end
         if not code:match("^A%d+$") then return end       -- rival lords only (the mod's helper lord reads A-1)
         local fn = tonumber(b.buildingFunction) or -1
-        if SKIP_FN[fn] then return end
+        if not listed(fn) then return end
         local l = b:K2_GetActorLocation()
         local e = { b = b, t = A.btype(b), x = l.X, y = l.Y, z = l.Z, yaw = b:K2_GetActorRotation().Yaw, fn = fn, c = b.Data.constructed and 1 or 0, u = upgIds(b) }
         e.us = table.concat(e.u, "."); e.pos = posKey(l.X, l.Y); e.key = e.t .. "@" .. e.pos
@@ -733,7 +753,7 @@ local function want(clock, seen, kind, code, key, job)
   local id = kind .. ":" .. code .. ":" .. key
   seen[id] = true
   P.since[id] = P.since[id] or clock
-  if clock - P.since[id] < ((kind == "remove") and RIVAL_AFTER or 0) or P.queued[id] then return end   -- lane 42: making and upgrading at the first look (the host's list is complete or not taken)
+  if clock - P.since[id] < ((kind == "remove" or kind == "drop") and RIVAL_AFTER or 0) or P.queued[id] then return end   -- lane 42: making and upgrading at the first look (the host's list is complete or not taken)
   local tr = P.tries[id]
   if tr and (tr.n >= TRIES or clock - tr.t < TRY_AGAIN) then
     if tr.n >= TRIES then sayOnce("gaveup:" .. id, "rival %s: %s of %s was tried %d times and is given up (the copies differ there)", code, kind, key, TRIES) end
@@ -759,12 +779,32 @@ local function friendRival(S, clock, per)
       local mine = per[code] or {}
       local have, at, hostAt = {}, {}, {}
       for _, m in ipairs(mine) do have[m.key] = m; at[m.pos] = m end
+      P.stallHad = P.stallHad or {}; P.stallMiss = P.stallMiss or {}; P.stallOnly = P.stallOnly or {}
+      local hostStalls = false
       for _, h in ipairs(H.list) do
         hostAt[h.pos] = h
         local m = have[h.key] or at[h.pos]
-        if m then
+        if h.fn == STALL_FN then                                  -- (task 76e) see THE STALLS FOLLOW THE HOST
+          P.stallHad[code .. "|" .. h.pos] = clock; hostStalls = true
+          local mid = code .. "|" .. h.key
+          if m and m.key ~= h.key and m.fn == STALL_FN then
+            if P.on.rivalRemove and hostGives(m, code) then want(clock, seen, "remove", code, m.key, { m = m }) end
+          elseif not m then
+            local first = P.stallMiss[mid] or clock; P.stallMiss[mid] = first; seen["stallmiss:" .. mid] = true
+            if clock - first >= STALL_WAIT and P.on.rivalMake then want(clock, seen, "make", code, h.key, { h = h }) end
+          end
+        elseif m then
           -- the same building, or another type at the same place: the upgrades the host's has and this one lacks
           local miss = missing(h.u, m.u)
+          -- (lane 87) LANE 76'S DIAGNOSIS (lane 83's run A, the house 8@9639,7581: upgradesDone 1 on the host, 2 here
+          -- for 16 days): a rival AI's own level upgrade on the host leaves its house's earlier extension (101, the
+          -- chicken coop) out of the house's list, while this copy's BeginUpgrade appends to the old list. This module
+          -- only added what the host's list has more; an id this copy has beyond the host's list stayed. The host's
+          -- list is the referee: such an id is dropped from this copy's list after the rival rule's usual wait
+          -- (RIVAL_AFTER; the world module's settle-field check looks again about 3 s after a difference). Only when
+          -- this copy lacks nothing of the host's list (the upgrade first), and only for the same building type.
+          local extra = (#miss == 0 and P.on.rivalDrop ~= false) and missing(m.u, h.u) or {}
+          if #extra > 0 and m.key == h.key then want(clock, seen, "drop", code, h.key, { h = h, m = m, extra = extra }) end
           if #miss > 0 then
             if P.on.rivalUpgrade then want(clock, seen, "upgrade", code, h.key, { h = h, m = m, miss = miss }) end
           elseif m.key ~= h.key then sayOnce("type:" .. code .. h.key, "rival %s: %s on the host is %s here and no upgrade explains it: left as it is", code, h.key, m.key) end
@@ -777,7 +817,17 @@ local function friendRival(S, clock, per)
         -- when a list comes short. So nothing is removed unless the host still gives that building's region to this
         -- lord (the events module's owner line), and never more than MAX_REMOVE buildings of a lord at one look.
         local gone = {}
-        for _, m in ipairs(mine) do if not hostAt[m.pos] and not PLOT_FN[m.fn] then gone[#gone + 1] = m end end
+        for _, m in ipairs(mine) do
+          if not hostAt[m.pos] and not PLOT_FN[m.fn] then
+            if m.fn ~= STALL_FN then gone[#gone + 1] = m
+            else                                              -- (task 76e) a stall the host lost a moment ago, or has had no stall at
+              local had = P.stallHad[code .. "|" .. m.pos]       --   that place for STALL_WAIT s (while it lists stalls)
+              local oid = code .. "|" .. m.key
+              local first = P.stallOnly[oid] or clock; P.stallOnly[oid] = first; seen["stallonly:" .. oid] = true
+              if (had and clock - had < STALL_KEEP) or (hostStalls and clock - first >= STALL_WAIT) then gone[#gone + 1] = m end
+            end
+          end
+        end
         if #gone > MAX_REMOVE then
           sayOnce("many:" .. code .. #gone, "rival %s: %d of his buildings here are not in the host's list at once: none is removed (a region changed hands, or a short list)", code, #gone)
         else
@@ -790,9 +840,21 @@ local function friendRival(S, clock, per)
     end
   end
   for id in pairs(P.since) do if not seen[id] then P.since[id] = nil; P.tries[id] = nil end end
+  for id in pairs(P.stallMiss or {}) do if not seen["stallmiss:" .. id] then P.stallMiss[id] = nil end end
+  for id in pairs(P.stallOnly or {}) do if not seen["stallonly:" .. id] then P.stallOnly[id] = nil end end
 end
 
 local function tried(job, clock) local tr = P.tries[job.id]; if not tr then tr = { n = 0 }; P.tries[job.id] = tr end; tr.n = tr.n + 1; tr.t = clock end
+-- (lane 64, task 64d3) the family ids a building has at work (assignedFamilyIDs), rising; read in the tick of use
+local function familiesOf(b)
+  local t = {}
+  pcall(function()
+    local a = b.assignedFamilyIDs
+    for j = 1, #a do local v = a[j]; if type(v) ~= "number" then v = un(v) end; v = math.tointeger(tonumber(v)); if v then t[#t + 1] = v end end
+  end)
+  table.sort(t)
+  return t
+end
 local function regionOwnerAt(S, h)
   local ok, code = pcall(function() local r = S.eng:getRegionByPos({ X = h.x + 0.0, Y = h.y + 0.0, Z = h.z + 0.0 }, false); return valid(r) and ownerCode(S, r.ownerPawn) or "-" end)
   return ok and code or "?"
@@ -805,16 +867,76 @@ local function doUpgrade(S, job)
   if not valid(b) then return false, "the building is gone" end
   local busy = false; pcall(function() busy = b.isBeingUpgraded or not b.Data.constructed end)
   if busy then return nil end                            -- a site or an upgrade under way here: wait until it is finished
-  local id = job.miss[1]; local how = "BeginUpgrade"
+  local id = job.miss[1]; local how, note = "BeginUpgrade", ""
   local T = C.town
   local ok, e = pcall(T.quiet, function()
     if id >= 100 then
       if #b.Extensions < 1 then error("this house has no backyard here") end
-      if ARTISAN[id] then how = "changeArtisanType"; b:changeArtisanType(id - 100) else how = "ChangeExtension"; b:ChangeExtension(0, id - 100) end
+      if ARTISAN[id] then
+        how = "changeArtisanType"
+        -- (lane 64, task 64d3) the rival's own change keeps the house's family at work on the host (its AI); the same
+        -- call here cleared it (sessions l64pin17, l64pin18: assignedFamilyIDs 0 here for 28 to 33 s, 1 on the host).
+        -- The families are read before the call and given back right after it, in the same tick (the facts module's
+        -- worker line of the host then keeps them as the host has them)
+        local before = familiesOf(b)
+        b:changeArtisanType(id - 100)
+        if #before > 0 and T.fixFamilies then
+          local after = familiesOf(b)
+          if table.concat(after, ",") ~= table.concat(before, ",") then
+            local okF, r = pcall(T.fixFamilies, b, before)
+            note = "; its family " .. table.concat(before, ",") .. " given back: " .. tostring(okF and r or ("error " .. tostring(r)))
+            bump(okF and r == "ok" and "b_artisanKept" or "b_artisanKeptFailed")
+          end
+        end
+      else how = "ChangeExtension"; b:ChangeExtension(0, id - 100) end
     else b:BeginUpgrade(id) end
   end)
   if not ok then return false, how .. "(" .. id .. ") failed: " .. tostring(e) end
-  return true, how .. "(" .. id .. ")"
+  return true, how .. "(" .. id .. ")" .. note
+end
+
+-- (lane 87) the ids of job.extra taken out of this copy's building's upgradesDone, the rest kept in their order. The
+-- building is the look's (checked valid here, in the tick of use); the list is read count first (never past its end).
+-- upgradesDone is a list of one-byte numbers (coop_snap.lua reads it at stride 1); the mod's other rewrites (Empty,
+-- then each entry appended: coop_x_jobs.lua, coop_cart_stands.lua) are of struct and object lists. So the write is
+-- first tried on the first entry, written back to its own value and read back: if the mod loader refuses that, the
+-- list is left untouched (an emptied list would make the next look begin upgrades the house already has). Then the
+-- list is emptied, the kept ids appended in their order, and the whole list read back and compared.
+local function sameIds(x, y)
+  if #x ~= #y then return false end
+  for i = 1, #x do if x[i] ~= y[i] then return false end end
+  return true
+end
+local function doDrop(S, job)
+  local b = job.m.b
+  if not valid(b) then return false, "the building is gone" end
+  local okR, have = pcall(upgIds, b)
+  if not okR then return false, "the list could not be read: " .. tostring(have) end
+  local left = {}; for _, id in ipairs(job.extra) do left[id] = (left[id] or 0) + 1 end
+  local keep, dropped = {}, {}
+  for _, id in ipairs(have) do
+    if (left[id] or 0) > 0 then left[id] = left[id] - 1; dropped[#dropped + 1] = id else keep[#keep + 1] = id end
+  end
+  if #dropped == 0 then return true, "nothing to drop now", false end   -- (the look's list was older than the house's)
+  local a = b.upgradesDone
+  local okT, eT = pcall(function() a[1] = have[1] end)              -- #have >= 1 here (an id was found to drop)
+  local okB, back = pcall(upgIds, b)
+  if not (okT and okB and sameIds(back, have)) then
+    return false, string.format("a write of the first entry to itself was refused (%s); the list is left as it is: %s", tostring(eT), okB and table.concat(back, ".") or tostring(back))
+  end
+  local ok, e = pcall(function()
+    a:Empty()
+    for i, id in ipairs(keep) do a[i] = id end
+  end)
+  local okN, now = pcall(upgIds, b)
+  if not (ok and okN and sameIds(now, keep)) then
+    -- the old list put back (the same calls; best effort), so that no upgrade the house has is begun again
+    local okP = pcall(function() a:Empty(); for i, id in ipairs(have) do a[i] = id end end)
+    local okA, after = pcall(upgIds, b)
+    return false, string.format("the list could not be written (%s): it read %s; the old list put back: %s, it reads %s", tostring(e),
+      okN and table.concat(now, ".") or tostring(now), okP and "yes" or "no", okA and table.concat(after, ".") or tostring(after))
+  end
+  return true, string.format("dropped %s, now %s", table.concat(dropped, "."), #keep > 0 and table.concat(keep, ".") or "-"), true
 end
 
 local function finishJob(S, clock, cur, status)
@@ -849,6 +971,18 @@ end
 
 local function runJobs(S, clock)
   local T = C.town; if not (T and T.inject and T.results) then return end
+  -- (lane 87) the drops first: they use no helper lord and no town line, so they wait neither for a job in flight (up
+  -- to 12 s below) nor behind a player's action (the owner's bar is 3 s)
+  local d = 1
+  while d <= #P.jobs do
+    local job = P.jobs[d]
+    if job.kind == "drop" then                                -- an id this copy has beyond the host's list
+      local ok, how, did = doDrop(S, job)
+      table.remove(P.jobs, d); P.queued[job.id] = nil; tried(job, clock)
+      log("rival %s: %s has upgrade(s) %s here and not on the host: %s (%s)", job.code, job.key, table.concat(job.extra, "."), ok and (did and "dropped here" or "none to drop") or "NOT dropped", tostring(how))
+      bump(ok and (did and "b_dropped" or "b_dropNone") or "b_dropFailed")
+    else d = d + 1 end
+  end
   local cur = P.cur
   if cur then
     local st = T.results[cur.id]
@@ -864,7 +998,31 @@ local function runJobs(S, clock)
     local job = P.jobs[i]
     if job.kind == "upgrade" then
       if C.traceF then C.trace("people:doUpgrade " .. tostring(job.key)) end   -- (lane 47, round three: test switch only)
+      -- (lane 76, task 76h) an upgrade can bring animals (goats 28, pigs 27: two each, measured). The facts module owns
+      -- a town's animal count and may have made the host's new animals here already: it takes those back now, in the
+      -- same tick as the call that brought the real ones (coop_facts.lua liveTakeBack; sessions l76q, l76s: 4 where
+      -- the host had 2). The town's count before and after the call is logged: the measure of when the game makes them.
+      local reg, before, after, back
+      -- (lane 64, task 64d) the job's building is kept from the rival scan (up to 120 s): valid() first (the guard of
+      -- kept handles), then its region; doUpgrade asks valid() again before its call
+      if valid(job.m.b) then pcall(function() reg = job.m.b.Region; if valid(reg) then before = reg:getTotalLivestockCount() end end) end
       local ok, how = doUpgrade(S, job)
+      if ok and before then
+        pcall(function()
+          after = reg:getTotalLivestockCount()
+          local Fm = rawget(C, "facts")
+          if Fm and Fm.liveUpgraded then back = Fm.liveUpgraded(S, reg) end
+        end)
+        if after ~= before or (back or 0) > 0 then how = string.format("%s; the town's animals %d before the call, %s after; %d made here before taken out", tostring(how), before, tostring(after), back or 0) end
+      end
+      -- (task 76e) the storage counters of the building: recounted now and for 2 s (coop_facts.lua F.recountSoon)
+      if ok then
+        local Fm = rawget(C, "facts")
+        if Fm and Fm.recountSoon then pcall(Fm.recountSoon, job.m.b, 2.0) end
+        -- (lane 87, cure 1) the host's work fraction of the upgrade held in this tick (coop_x_values.lua V.begun)
+        local Vv = rawget(C, "values")
+        if Vv and Vv.begun then pcall(Vv.begun, job.m.b) end
+      end
       if ok ~= nil then
         table.remove(P.jobs, i); P.queued[job.id] = nil; tried(job, clock)
         log("rival %s: %s has upgrade %d on the host and not here: %s (%s)", job.code, job.key, job.miss[1], ok and "started here" or "NOT started", tostring(how))

@@ -16,6 +16,7 @@ one is two hooked function entries, not a byte patch.
 | FINISH | `FINISH <building>` | calls finishConstruction(SMBuildingMaster) at RVA 4d0b370: the game's own "site complete" routine | lane_w report_W answer 1 |
 | NF1 + NF2 | `NOFINISH ON/OFF` | the game's two own calls of finishConstruction are jumped over (`74` becomes `EB`; both or neither) | session 20 |
 | NT | `NOTHEFT ON/OFF` | the bandits' daily theft routine (4d64460) calls the squad walk that robs the nearest region for every encamped bandit squad; that call (4d646d8) becomes `EB 03` (jumped over), so a friend's copy never rolls a theft; the host's theft is told by the events module | lane 66 |
+| NM | `NOMOURN ON/OFF` | the engine's daily routine takes one day off every home's mourningPeriod (+F20h) that is above 0 (the loop at 4d78350); its `jle next` (4d7835b, `7E 08`) becomes `EB 08`, so a friend's copy never counts the days itself and a home's mourning days there are the host's alone (the facts module writes each host value as it comes) | lane 64 round 5, `lanes/lane_s21_64/design_nomourn.txt` |
 | BURN, FIREOUT | `BURN <building>`, `FIREOUT <building>` | call progressFire(building, 1e6) and extinguishFire(building) | lane_f Q3 |
 | GOODS | `GOODS ON [lord]/OFF` | the first instruction (5 bytes) of recountStorage (4d18fc0) and of the region's refreshBuildingStorageCache (4c49700) becomes a jump to a stub of this DLL: the game's own changes of a building's stock are put back; the mod's own write stays | lane 14 report |
 | CURSOR | `CURSOR <pawn> <x> <y> <z>`, `CURSOR <pawn> GET` | writes (or logs) the lord pawn's cached cursor point, three doubles at +4E8; the game rewrites it only while the OS pointer is over its window (updateCursor 4b75b90). Needs the CURSOR signature once and the known build | lane 26 report part 3 |
@@ -56,7 +57,7 @@ Relative folders are taken from the DLL's folder, and `%VARS%` are expanded.
 | `patch_status.txt` | the DLL | rewritten atomically (temp file, then `MoveFileEx` replace) on every change and on `STATUS` |
 | `coop_patch.log` | the DLL | one line per event with a local timestamp; above 256 KB it becomes `coop_patch.log.old` |
 
-**Commands:** `NOKILL ON|OFF`, `NOROUT ON|OFF`, `NOREFORM ON|OFF`, `NOFINISH ON|OFF`, `NOTHEFT ON|OFF`, `ROUT <address> <handle>`,
+**Commands:** `NOKILL ON|OFF`, `NOROUT ON|OFF`, `NOREFORM ON|OFF`, `NOFINISH ON|OFF`, `NOTHEFT ON|OFF`, `NOMOURN ON|OFF`, `ROUT <address> <handle>`,
 `REFORM <address> <handle>`, `FINISH <address>`, `BURN <address>`, `FIREOUT <address>`,
 `GOODS ON [address of the player's lord]`, `GOODS OFF`, `GOODS AUDIT`, `GOODS STATS`, `PILEGONE <address>`,
 `TOTALS ON|OFF|FORGET|AUDIT|DUMP`, `TOTALS SET|SETR <region> <good>=<amount>,... [ALL]` (or `-` for none), `ALLOFF`,
@@ -923,6 +924,38 @@ routine, when the grow helper starts otherwise, without REFRESH, on another buil
   goes through. Never refused: the game's guide path (4e15ab0) plans the task it has just set (4e1b950) and writes into
   Tasks[0] unchecked (a refusing first version closed 3 of 4 friends' games, writing 0x8). Status adds `follow=`
   (replaced), `followok=` (the board's leader of that ox), `followleft=`. Offline tests O1: 465 passed, 0 failed.
+- Round eight (OXCART, lane 74; design `research/2026-11-10-game-probe/lanes/lane_s21_74/design_oxcart.txt`): a
+  friend's ox takes a timber cart (Resource_TimberCart_C) only on the board's word. `PICK OXEN <unit>,...|-` (the
+  board's oxen, whole list, at most 64) and `PICK TIMBER <class>` (the timber cart's class; 0 = unset). For a listed ox
+  the hook keeps the board's last reflected setTask of type 17 (GoToLocation, the cart module's "stand here") and of
+  type 23 (Gathering, with its resource +C0h). A setTask the GAME makes on a listed ox (return address not SETTHUNK's)
+  is counted by type, caller, class of its resource (UObject +10h) and current task type; a Gathering of a timber cart
+  goes through when the board's own 23 names that cart (60 s), else it gets the kept stand record (120 s; never
+  refused), else it goes through (`left`). Nothing is read while TIMBER is unset; without SETTHUNK it stays out; an
+  exception switches OXCART off, not PICK; ALLOFF empties the list and unsets the class. Status lines `OXCART
+  set|unset|faulted timber= oxen= seen= replaced= left= board= stands= picks= faults= sets=` and `OXSEEN
+  <type>/<caller rva>/<timber>/<current type>x<n> ...` (never the word "on"). Native piece 0.9.12. Offline tests O2, O3 (mechanism test 971
+  passed, 0 failed; 100 of 100 signatures; image test 25 of 25). The Lua side is in coop_cart_stands.lua (oxcartStep).
+- Round nine (HANDCART, lane 74 round 7; design `research/2026-11-10-game-probe/lanes/lane_s21_74/design_handcart_pickup.txt`):
+  a friend's villager takes a hand cart only on the host's word. `PICK HANDCART <class>` (the hand cart's class; 0 =
+  unset; only stored). While it is set and SETTHUNK is known, a Gathering (23) the GAME sets (return address not
+  SETTHUNK's) whose resource (+C0h) has that class (UObject +10h) is replaced, never refused, by the first of: the PICK
+  list's kept record of that unit when it is fresh (`byboard`); the unit's current task (Tasks[0], copied: `bycur`);
+  the unit's last reflected record when that is a stand here (17) of the last 30 s (`bystand`: kept for 256 units,
+  renewed when used, dropped when another task the game sets goes through for that unit); each only when it names
+  nothing gone and is not itself a Gathering of a hand cart (the class is tested, not the type); else it goes through
+  (`left`). setTask runs on into the game's code after the hook, so a replacement at a deeper stack frame than the
+  unit's last one within 1 s counts as `nested` and the 4th nested one in a row goes through (`loop`); one within 1 s
+  that is not nested counts as `again`; a game-made one nested in a reflected give of the same unit counts as
+  `inboard`; one inside a chooser as `chooser`. The reflected setTask is never touched; nothing is read while the class
+  is unset; without SETTHUNK it stays out; an exception switches HANDCART off, not PICK; ALLOFF unsets the class.
+  Status lines `HANDCART set|unset|faulted cart= seen= byboard= bycur= bystand= left= loop= again= nested= inboard=
+  chooser= faults= sets=`, `HCSEEN <caller rva>/<current type>/<inboard>x<n> ...` (the 6 most frequent) and `HCLOG
+  <unix ms>/<unit>/<caller rva>/<current type>/<nest depth>/<inboard><chooser>/<B|C|S|L|N> ...` (the last 32 events,
+  oldest first), never the word "on". Native piece 0.9.17 (renumbered by the lead); 0.9.19 (round 8; renumbered by the lead): PICK TIMBER 0 and PICK HANDCART 0 also drop the kept records (the cart module sends both at every new world, so no record of an old world is given). Offline tests O4, O5
+  (mechanism test 1042 passed, 0 failed; 101 of 101 signatures; image test 25 of 25). The Lua side is in
+  coop_cart_stands.lua (handcartStep sends the class while the host's word rules the hand carts; endOwnPickups ends
+  every pickup left through, which also gives the stand record) and coop_patch.lua (P.pickHandcart).
 
 ## REGSET: a region's two building sets (lane 35, round six)
 Evidence: `research/2026-11-10-game-probe/lanes/lane_s21_35/report.txt`, part 2. A friend's game closed in the job
@@ -1048,6 +1081,22 @@ be committed memory with at most 20000 records; the known build and both signatu
 displacement in both and the stroke's two +18h must be as known. Nothing is patched or called: one float is written.
 Status: `FELL available fells= already= misses= bad= faults=`. Offline F1-F5.
 
+## MERCCUT: a friend's mercenary offers as many as the host's (lane 88)
+
+A hire takes the company off the offer list (`RTSMultiEngineCPP.availableMercs`, `+BF0h`) of the copy whose game ran
+the hire. A rival lord's hire (and the host's own player's) runs on the host only; a friend makes the squads from the
+host's word and keeps the company on offer. The game has no call that takes an offer off without hiring it. The mod
+writes the host's records into the friend's first slots, field by field (`coop_realm.lua`), and then:
+
+    MERCCUT <engine> <array> <count now> <count wanted>   the list's count is set to <count wanted>
+
+The engine must look like an object of the game (8-aligned, committed, its vtable in the module); `<array>` (the
+address the script layer gives for the list) must be the engine + BF0h; the count must be `<count now>` (1 to 64), the
+capacity at least that, the data pointer non-null and 8-aligned, and `0 <= <count wanted> < <count now>`. Known build
+only. Nothing is freed, patched or called: one int32 is written. The records past the new end stay whole in the list's
+memory; a record the game adds later is built over that slot. Status: `MERCCUT available cuts= refused= faults=`.
+Offline MC1, MC2. Design: `research/2026-11-10-game-probe/lanes/lane_s21_88/design_mercs.txt`.
+
 ## ENDHOLD: a task ends on the host's word (lane 49, round four)
 
 The game's end of a unit's tasks is 4dfb960 (signature `ENDTASK`, its entry). ENDHOLD ON moves its first 5 bytes into
@@ -1156,8 +1205,15 @@ hp half is each copy's own builders. `SITEHP WATCH <b>` and `SITEHP POLL` (host)
 `<b hex> <fraction bits>` per site whose work fraction changed. `SITEHP HOLD <b> <fraction bits>` (friend) sets every
 tick the parts' hp so that their sum is the host's fraction of their max (each part in proportion, the rest in list
 order, never above its max). `DROP <b>`, `FORGET`. A site is checked alive at every use (object number and name, a
-region, a part list of 0 to 64 parts with vtables in the module). Signature SPROG (the two sums); known build only.
-**Status:** `SITEHP available held= watched= writes= polls= lines= gone= bad= faults=` or `SITEHP unavailable <why>`.
+region, a part list of 0 to 1024 parts with vtables in the module; the limit was 64 before 0.9.13, which refused every
+church, manor, tavern and large house: lane 87). Signature SPROG (the two sums); known build only.
+`SITEHP HOLDX <b> <fraction bits>` (lane 87) is the exact hold: the parts are filled in list order (as the game's own
+builders fill them, 4d27780) so that the game's own sum over its own max sum is the host's fraction bit for bit; where
+this copy's float grid has no such sum, the nearest (one float step; counted `near`). `POLL` reports a site when the
+bits of its fraction changed (was: moved by 0.0005). `SITEHP FILL <b>` (lane 87) sets every part of a site to its max at
+once and ends its hold: sent ahead of `FINISH`, so a friend's finished building has full parts like the host's.
+**Status:** `SITEHP available held= watched= writes= polls= lines= gone= bad= faults= hx= near= cap= fills=` (`hx`: of the held
+sites, those held exactly) or `SITEHP unavailable <why>`.
 **Offline:** tests C1-C4 and SH1-SH3 in `test/patch_test.c` (2026-11-17: 732 passed, 0 failed; 80 of 80 signatures
 hold on the test copy's game file).
 
@@ -1177,6 +1233,32 @@ worker died go to `accident_out.txt` at the tick. `MROLL OFF` and ALLOFF put bot
 build only. Lane 64's NODEATH (NDACC) jumps over the accident's call inside 4cfacc0 on a friend: the two do not touch the
 same bytes. **Status:** `MROLL off|on|watch blocked= seen= pending= dropped= faults= bad=`. **Offline:** M1-M3 (751
 passed, 0 failed; 82 of 82 signatures hold).
+
+**NOROLL (lane 87, 0.9.14).** A friend's own mercenary month roll (Engine::rerollMercenaries 4cd83e0, called by
+updateDay's month block 4d78bf0, BeginPlay 4c83bfa and the script thunk 4ae9d60): it empties the offer list (engine
++BF0h), adds at most three companies picked with rand() and gives the player the notice `mercenaries_available`. On a
+friend it drew three companies the host never had for one look (66 ms, lane 88's p88a). `NOROLL ON` (friend) moves the
+entry's first 7 bytes into a stub (a 5-byte jmp and two int3): every call returns at once (`blocked`). `NOROLL PASS` lets
+the next call through, once (`passed`): the realm module's own call when the friend holds fewer offers than the host
+(Engine::refillMercenaries 40a70e0 is the linker's empty stub in this build and is not touched); a pass not used before
+the next tick begins is dropped (`expired`). `NOROLL OFF` and ALLOFF put the bytes back. Signature MERCROLL; known
+build only. **Status:** `NOROLL off|on blocked= passed= expired= bad=`. **Offline:** NR1-NR3 (981 passed, 0 failed;
+101 of 101 signatures hold). Design and reading: `research/2026-11-10-game-probe/lanes/lane_s21_87/design_noroll.txt`.
+
+**BARNAN (lane 87, 0.9.16; the construction bar's cure 2).** A site with no parts yet: SMBuildingMaster::
+getConstructionProgress (4d3d940; callers: the script thunk 4af596e, the panel's widget, and PawnCPP::drawBuildingOverlays
+4b3b161, the bars over the sites) gives (work + G) * 0.5 with work = the parts' hp sum over their max sum and no check: an
+empty part list gives 0/0. A friend makes a rival's site through the player's placement path, whose parts come a few frames
+after the building, while the host's AI site can hold a part with no work in its first frame (run p87g, 3@8981,7789: the
+host 0, the friend "not a number" for 0.079 s). `BARNAN ON` (friend) moves the entry's first 7 bytes (`mov rax,rsp; mov
+[rax+8],rbx`) into a stub. For a building whose part list is empty the wrapper runs the game's own function on a copy of the
+building's first 0x500 bytes on its stack, whose part list is one made-up part with hp 0 and max 1: the game works out the
+goods half itself (its goods routine 4c663a0 only reads the real lists, through the copied headers, and writes only its own
+out-list) and the work half is 0 (`zeroed`). Nothing of the game's object is written; every other call runs the original
+through the trampoline. `BARNAN OFF` and ALLOFF put the bytes back. Signature SITEPROG; known build only. **Status:** `BARNAN
+off|on zeroed= faults= bad=`. **Offline:** BN1-BN3 (1016 passed, 0 failed; 102 of 102 signatures on the test copy's game
+file, SITEPROG once at 4D3D940). Used by coop_x_values.lua (on a friend while the host is heard; `Coop.values.cfg.barnan =
+false` switches it off).
 
 **FAMROLL (lane 71, round three).** Births and new families: Region::growPopulation (4c64ee0, from updateDay) makes a
 person (4c65336) and on some days a family (4c6590f) through the maker 4c51db0, at each copy's own day change and with a

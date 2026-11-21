@@ -8,10 +8,20 @@
 --   GATE      a gate opened or closed. ON. Run on two copies by lane 28 (a gate of an upgraded wall across a road).
 --   PLANWALL  a wall or palisade drawn in the castle planner. ON since lane 28: replayed with the game's own wall tool,
 --             run by the native piece (coop_patch DRAW). Without the native piece a wall is logged and not carried.
---   PLANSEL   a change to the selected part of the plan (remove, level, platform level, turn a wall round). OFF: never run;
---             while off such a change is silent (not sent, not logged).
---   So a castle plan can differ between copies without any sign (walls, removed or changed parts, dragged parts), and
---   the construct step is still carried: the copies then build different castles until the next resync.
+--   PLANSEL   a change to the selected part of the plan (remove, level, platform level, turn a wall round). ON since
+--             lane 26 (floater presses, two copies); lane 37 by real clicks (level, delete).
+--   PLANMOVE  a planned part dragged or turned (lane 37).   PLANWPTS  a placed wall's control points changed, or the
+--             wall removed by an alt-click (lane 53).   PLANJOIN  two walls joined by the wall option widget (lane 83).
+--   THE CLASS (lane 83): every control of the castle planner and where it is carried:
+--     planner window: a part card + a click on the ground PLAN; the Walls card + points + hammer PLANWALL; Commit
+--       (and its controller path naviCommit / navi_upgrade) CASTLE; Close / return, the roads card, hide controls,
+--       the trade overview: this copy's own view only (Close drops a half-drawn wall, never sent: lane 37).
+--     castle floater over a selected part: level up / down (Button_0 / Button_1) PLANSEL LVL; demolish (Button_demo)
+--       PLANSEL DEL; turn a wall round (Button_flip) PLANSEL REV; platform level up / down PLANSEL PLAT.
+--     wall option widget (spawnWallJoinWidget): join PLANJOIN.
+--     on the ground: a part dragged PLANMOVE; a wall point dragged, shift-click (a point added), alt-click (the wall
+--       removed) PLANWPTS; a new wall started on another wall's end: the game snaps it there, an ordinary PLANWALL.
+--     a gate's own button GATE. Selecting a part (selectCastleBlueprint) is this copy's own view.
 --   (a marketplace plot, MARKET, lives with the field and house plots in coop_town.lua: same hook, same replay)
 --   None of these was ever done by a real click on the ground: all need one (real_click_checklist.md in the lane folder).
 --
@@ -124,7 +134,7 @@ local function checkPlan(S, Pd, h, waited)
   if not valid(Pd.m) then return "planner building gone" end
   local a = bpAt(Pd.m, Pd.e.x, Pd.e.y, 60) or (#Pd.m.blueprints > Pd.n0)        -- there, or at least one more than before
   A.log("TOWN planner part type %d at %.0f,%.0f: %s (blueprints %d -> %d)", Pd.e.t, Pd.e.x, Pd.e.y, a and "placed" or "not placed", Pd.n0, #Pd.m.blueprints)
-  if a then X.touch(Pd.m); return "ok" end
+  if a then X.touch(Pd.m); if B.resnapChanged then B.resnapChanged(Pd.m, Pd.wsnap) end; return "ok" end
   return timedOut and "the helper never took the request (timed out, disarmed)" or "no blueprint appeared (spot refused?)"
 end
 
@@ -160,7 +170,7 @@ X.def { name = "PLAN", status = "console2", ref = "lane 2 runs s3b, s4, s5", hel
     h.placeBuilding = e.t
     h.bbox:K2_SetWorldLocationAndRotation({ X = e.x + 0.0, Y = e.y + 0.0, Z = e.z + 0.0 }, { Pitch = 0.0, Yaw = e.yaw + 0.0, Roll = 0.0 }, false, {}, true)
     h.requestBuild = true
-    T.pend = { kind = "plan", job = job, m = m, e = e, n0 = #m.blueprints, t0 = Pl.vnow(), check = checkPlan }
+    T.pend = { kind = "plan", job = job, m = m, e = e, n0 = #m.blueprints, t0 = Pl.vnow(), check = checkPlan, wsnap = B.snapWalls and B.snapWalls(m) }
     return "pending"
   end }
 
@@ -232,6 +242,7 @@ X.def { name = "PLANWALL", status = "native2", ref = "lane 28 report (two copies
     if not Pl.clearMoved(h) then return "helper still holds a moved building" end
     if not enter(h, m) then return "the helper could not enter planning mode" end
     local nb0 = #m.blueprints
+    local wsnap = B.snapWalls and B.snapWalls(m)
     local okD, res, r = pcall(function()
       h:switchWallMode(true)
       if n[1] then h.dummyRoad.wallType = int(n[1]) end
@@ -281,11 +292,13 @@ X.def { name = "PLANWALL", status = "native2", ref = "lane 28 report (two copies
       end
     end
     X.touch(m)
+    if B.resnapChanged then B.resnapChanged(m, wsnap) end
     return "ok"
   end }
 B.wallReplayProven = true              -- lane 28: the replay runs the game's own tool (see above)
 if T.enabled.PLANWALL == true and not B.wallReplayProven then T.enabled.PLANWALL = false end
 
+B.wpGone = B.wpGone or {}       -- (lane 81) walls a replay took away, by their points (see WP below)
 -- ================================================================ PLANSEL: a change to the selected part of the plan
 -- SEE: pre-hooks on the lord's own functions; the selected part is the lord's selectedBlueprint. A part is named by its
 -- place (parts are plain mesh actors without a name of their own), a wall by its number in the manor's wall list.
@@ -318,6 +331,7 @@ for op, d in pairs(SEL) do
       if e then ref = ref .. string.format(":%.0f,%.0f", e.X, e.Y) end
     end
     if not ref then return { k = "_note", msg = "planner change on a part that could not be named: not sent" } end
+    if B.mark then B.mark(m) end      -- (lane 83) a wall turned round: not sent again by the PLANWPTS scan
     local v = 0
     if d.arg then v = int(a1 and a1:get()) end
     return { k = "PLANSEL", obj = m, ref = ref, op = op, v = v }
@@ -345,6 +359,11 @@ X.def { name = "PLANSEL", status = "static", ref = "lane 2 report (not run)", he
     if not valid(part) then return (op == "DEL") and "ok" or "part of the plan not found" end
     local h = A.helper(); if not valid(h) then return "no helper" end
     if not enter(h, m) then return "the helper could not enter planning mode" end
+    -- (lane 81) a wall this replay takes away is noted by its points (the PLANWPTS scan below must not send it back)
+    if op == "DEL" and C.patch and C.patch.wallGet then pcall(function()
+      local g0 = C.patch.wallGet(part)
+      if g0 and g0.ctl then local t = {}; for i, q in ipairs(g0.ctl) do t[i] = string.format("%.2f,%.2f,%.2f", q.X, q.Y, q.Z) end; B.wpGone[table.concat(t, "|")] = os.clock() end
+    end) end
     local okS, err = pcall(function()
       h:selectCastleBlueprint(part, false)
       if d.arg then h[d.fn](h, int(v)) else h[d.fn](h) end
@@ -353,6 +372,8 @@ X.def { name = "PLANSEL", status = "static", ref = "lane 2 report (not run)", he
     leave(h)
     if not okS then return "error " .. tostring(err) end
     X.touch(m)
+    -- (lane 83) a wall turned round (REV) or upgraded here: this copy's PLANWPTS scan must not send it back
+    if B.resnap and op ~= "DEL" and valid(part) and clsOf(part) == "Road" then B.resnap(m, { part }) end
     return "ok"
   end }
 -- lane 26 (2026-11-12): switched on to be pressed on two copies (the floater's own buttons after the game's
@@ -373,6 +394,18 @@ do
     if S.role == "host" then
       local m = X.findBkey(job.f[1])
       if m then
+        -- (lane 83, runs 8 and 12) the game works the check out when a lord enters planning mode for the manor (the
+        -- window, or setPlannerMode alone) and keeps the answer until the next time: outside the planner it can be a
+        -- load's or an old plan's (after a friend's reload: true on the friend, false on the host, with equal plans).
+        -- The Commit button a player sees is the fresh answer inside the planner; the host asks the same way: its
+        -- helper enters planning mode for the manor, the answer is read there, the helper leaves.
+        local h = A.helper()
+        if valid(h) and Pl.clearMoved(h) and enter(h, m) then
+          local okF, fresh = pcall(function() return m:canConstructCastle({}) end)
+          leave(h)
+          if okF and fresh == false then return "the castle cannot be constructed on the host (the game's own check, worked out in planning mode)" end
+          if okF then return plain(S, job) end
+        end
         local okC, can = pcall(function() return m:canConstructCastle({}) end)
         if okC and can == false then return "the castle cannot be constructed on the host (the game's own check)" end
       end
@@ -448,7 +481,11 @@ X.def { name = "GATE", status = "press2", ref = "lane 28 report (two copies, bot
 -- and PLANSEL) are read twice a second; a part that moved (more than 5 units or 0.5 degrees) and was not just moved by
 -- a replay is sent:  PLANMOVE <manor> b:<old x>,<old y> <x>,<y>,<z>,<yaw>
 -- REPLAY: the part at the old place gets the new place and turn (its actor; the plan is made of these actors).
-local PM = { seen = {}, t = 0 }
+local PM = { seen = {}, t = 0, drag = {} }
+-- (lane 81) a replay is told from the player's drag by what it is, not by time alone: the replay writes the part's
+-- new place into PM.seen itself (no change is seen for it), and a part the LOCAL player drags is noted every frame
+-- (PawnCPP.draggingBlueprint, the planner's own drag; a replay never sets it on this copy's lord). Before, every part
+-- of a manor a replay had touched in the last 2 s was skipped, so a real drag in that time was never sent.
 local function pmScan(S, clock)
   local p = S.p1; if not valid(p) then return end
   local inPlan, m = false, nil
@@ -465,7 +502,10 @@ local function pmScan(S, clock)
         local l = a:K2_GetActorLocation(); local r = a:K2_GetActorRotation(); local ad = addrOf(a)
         now[ad] = { x = l.X, y = l.Y, z = l.Z, yaw = r.Yaw }
         local w = PM.seen[ad]
-        local replayed = (T.touched[ma] and clock - T.touched[ma] < 2.0) or (T.touched[ad] and clock - T.touched[ad] < 2.0)
+        -- a part moved within 2 s of a replay on this manor that the local player did not drag: a side effect of the
+        -- replay (the game placing parts again), not sent
+        local dragged = PM.drag[ad] and clock - PM.drag[ad] < 1.5
+        local replayed = T.touched[ma] and clock - T.touched[ma] < 2.0 and not dragged
         if w and not replayed and (math.abs(w.x - l.X) > 5 or math.abs(w.y - l.Y) > 5 or math.abs(w.yaw - r.Yaw) > 0.5) and T.isOn("PLANMOVE") then
           T.emitAction(S, "PLANMOVE", string.format("%s b:%.0f,%.0f %.1f,%.1f,%.1f,%.2f", X.bkeyOf(X.bident(m)), w.x, w.y, l.X, l.Y, l.Z, r.Yaw))
         end
@@ -475,9 +515,13 @@ local function pmScan(S, clock)
   PM.seen = now
 end
 C.register("planmove", {
-  onWorld = function(S) PM.seen = {} end,
+  onWorld = function(S) PM.seen = {}; PM.drag = {} end,
   tick = function(S, clock)
-    if C.hold or clock - PM.t < 0.5 then return end
+    if C.hold then return end
+    -- every frame while the planner is open: which part this copy's own player drags (one field; lane 81)
+    if PM.inPlan then pcall(function() local db = S.p1.draggingBlueprint; if valid(db) then PM.drag[addrOf(db)] = clock end end) end
+    if clock - PM.t < 0.5 then return end
+    pcall(function() PM.inPlan = S.p1.inPlanningMode == true end)
     PM.t = clock
     local ok, e = pcall(pmScan, S, clock); if not ok then A.log("TOWN PLANMOVE scan error: %s", tostring(e)) end
   end })
@@ -491,9 +535,11 @@ X.def { name = "PLANMOVE", status = "lane 37 (real drag on two copies)", ref = "
     local part = bpAt(m, tonumber(x), tonumber(y), 60)
     if not valid(part) then return "part of the plan not found" end
     X.touch(m); X.touch(part)
+    local wsnap = B.snapWalls and B.snapWalls(m)
     local ok, e = pcall(function() part:K2_SetActorLocationAndRotation({ X = tonumber(nx), Y = tonumber(ny), Z = tonumber(nz) }, { Pitch = 0.0, Yaw = tonumber(yaw), Roll = 0.0 }, false, {}, true) end)
     if not ok then return "error " .. tostring(e) end
     pcall(function() local l = part:K2_GetActorLocation(); local r = part:K2_GetActorRotation(); PM.seen[addrOf(part)] = { x = l.X, y = l.Y, z = l.Z, yaw = r.Yaw } end)
+    if B.resnapChanged then B.resnapChanged(m, wsnap) end
     return "ok"
   end }
 
@@ -511,7 +557,10 @@ X.def { name = "PLANMOVE", status = "lane 37 (real drag on two copies)", ref = "
 -- rebuild; more points than the list holds: the game's own insert lengthens it). No helper lord is needed. The gates'
 -- heights are taken from the sending copy as PLANWALL does (lane 32).
 -- A wall is told apart by its object name (an address can be used again by a new wall).
-local WP = { seen = {}, m = nil, t = 0 }
+local WP = { seen = {}, m = nil, t = 0, gone = B.wpGone, pressT = -1e9 }
+-- (lane 81) a wall a replay took away is noted by its points (WP.gone): not sent back. Any other wall that left the
+-- plan is the player's if this copy's own left button was down in the planner since the last look (an alt-click is
+-- a press; WP.pressT, read every frame). Before, every wall that left within 2 s of a replay on the manor was skipped.
 B.wallPts = WP
 local function ctlLine(q) local t = {}; for i, v in ipairs(q) do t[i] = string.format("%.2f,%.2f,%.2f", v.X, v.Y, v.Z) end; return table.concat(t, "|") end
 local function gateLine(g) local t = {}; for i, q in ipairs(g or {}) do t[i] = string.format("%.2f,%.2f,%.4f", q.X, q.Y, q.Z) end; return #t > 0 and table.concat(t, "|") or "-" end
@@ -550,13 +599,26 @@ local function wpScan(S, clock)
   WP.mkey = X.bkeyOf(X.bident(m))
   -- the button still down (a drag going on): the change is looked at when it is up
   if not last then pcall(function() busy = p.LMB_pressed_b == true or valid(p.draggingBlueprint) end) end
+  -- (lane 83) this copy's own player just joined two walls of this plan: the PLANJOIN line carries it, so the kept
+  -- wall's new points and the other wall's leaving are not sent again as PLANWPTS lines
+  local jh = B.joinHold and B.joinHold[ma]
+  -- (lane 83) a planner act of this copy (its own placement, part change or join) or a replay here since the last
+  -- look: the walls the game changed with it (a tower placed on a wall splits the wall, run 2) are taken as they are
+  -- now, not sent as this copy's own PLANWPTS (the act's own line carries it on every copy)
+  local since = WP.lastT or -1e9
+  -- (a replay changes walls only while it runs: a placement through the helper waits for the game's build step, so a
+  -- pending replay on this manor counts too; a finished replay takes the walls it changed as they are: B.resnapChanged)
+  local marked = ((B.actMark and B.actMark[ma] or -2e9) >= since) or (T.pend ~= nil and T.pend.m ~= nil and addrOf(T.pend.m) == ma)
+  if marked then B.actMark[ma] = nil end
+  if jh and os.clock() - jh.t > 3.0 then B.joinHold[ma] = nil; jh = nil end
   local now = {}
   for _, w in ipairs(wallsOf(m)) do
     local g = C.patch.wallGet(w)
     if g and #g.ctl >= 2 then
       local key = wallName(w); local line = ctlLine(g.ctl); local was = WP.seen[key]
       if was and was ~= line then
-        if busy then line = was
+        if (jh and jh.names[key]) or marked then -- (lane 83) the own join's kept wall: sent as PLANJOIN
+        elseif busy then line = was
         elseif T.isOn("PLANWPTS") and X.owned(m) then
           local okS, r = C.patch.wallSet(w, g.ctl)                  -- this copy's own wall: the rounded numbers that go out
           local g2 = okS and C.patch.wallGet(w) or g
@@ -573,20 +635,24 @@ local function wpScan(S, clock)
   -- construct step: PLANSEL, DEMOLISH, CASTLE), or a replay just changed this plan, or a wall with the same points is
   -- still there (a wall rebuilt as a new object).
   if not busy and T.isOn("PLANWPTS") and X.owned(m) then
-    local replayed = T.touched[ma] and clock - T.touched[ma] < 2.0
+    local pressed = clock - WP.pressT < 1.5
+    local replayed = T.touched[ma] and clock - T.touched[ma] < 2.0 and not pressed
     local ownAct = false
     for i = #(T.ownList or {}), math.max(1, #(T.ownList or {}) - 5), -1 do
       local o = T.own[T.ownList[i]]
-      if o and os.clock() - o.t < 2.0 and (o.act == "PLANSEL" or o.act == "DEMOLISH" or o.act == "CASTLE" or o.act == "PLANWALL") then ownAct = true end
+      if o and os.clock() - o.t < 2.0 and (o.act == "PLANSEL" or o.act == "DEMOLISH" or o.act == "CASTLE" or o.act == "PLANWALL" or o.act == "PLANJOIN") then ownAct = true end
     end
     if not (replayed or ownAct) then
       local lines = {}
       for _, l in pairs(now) do lines[l] = true end
       for key, was in pairs(WP.seen) do
-        if not now[key] then
+        if not now[key] and not (jh and jh.names[key]) and not marked then
           local q = C.patch.decPoints(was); local r = {}
           for i = #q, 1, -1 do r[#r + 1] = q[i] end
-          if not (lines[was] or lines[ctlLine(r)]) then
+          local gt = WP.gone[was] or WP.gone[ctlLine(r)]
+          if gt then WP.gone[was] = nil; WP.gone[ctlLine(r)] = nil end
+          if gt and clock - gt < 10.0 then -- taken away by a replay here: not this player's
+          elseif not (lines[was] or lines[ctlLine(r)]) then
             T.emitAction(S, "PLANWPTS", string.format("%s %s - -", X.bkeyOf(X.bident(m)), was))
           end
         end
@@ -596,18 +662,57 @@ local function wpScan(S, clock)
   -- while the button is down nothing is decided: a wall that left the plan at the press (the alt-click removes it on
   -- the press) is still looked for when the button is up
   if busy then for key, was in pairs(WP.seen) do if not now[key] then now[key] = was end end end
-  WP.seen = now
+  WP.seen = now; WP.lastT = os.clock()
   if last then WP.seen = {}; WP.m = nil; WP.mkey = nil end
 end
+-- (lane 83, run 13) The planner WINDOW (castlePlanner_C: the Commit button, the construction cost line, the bailey
+-- area and castle level) is redrawn by the game after this copy's own planner acts only. After a replay (another
+-- player's part, wall, join, change) a copy whose window is open kept the old cost, area and Commit state: a friend's
+-- Commit stayed white over a plan the host refused, and the friend's press made a resync. So: when a replay changed
+-- this manor (X.touch) while this copy's own lord is in planning mode, the window's own updateCostAndConstructionAbility
+-- (updateConstructionCost: the cost, area and level lines; updateCanConstruct: the Commit button and its reasons) runs
+-- 0.3 s later and again 1.3 s later (a placement's blueprint comes a frame late).
+local PW = { t = 0, due = nil }
+B.plannerWindow = PW
+local function plannerWindow()
+  local w = PW.w
+  if w and valid(w) then local ok, v = pcall(function() return w:IsVisible() end); if ok and v then return w end end
+  PW.w = nil
+  for _, x in ipairs(FindAllOf("castlePlanner_C") or {}) do
+    local okF, fn = pcall(function() return x:GetFullName() end)
+    if valid(x) and okF and fn:find("Transient", 1, true) then local ok, v = pcall(function() return x:IsVisible() end); if ok and v then PW.w = x; return x end end
+  end
+  return nil
+end
+local function windowTick(S, clock)
+  local p = S.p1; local m
+  pcall(function() if p.inPlanningMode == true then m = p.plannerModeBld end end)
+  if not valid(m) then PW.due = nil; return end
+  local tm = T.touched[addrOf(m)]
+  if tm and tm > (PW.seenT or -1e9) then PW.seenT = tm; PW.due = { os.clock() + 0.3, os.clock() + 1.3 } end
+  if not PW.due then return end
+  if os.clock() >= PW.due[1] then
+    table.remove(PW.due, 1)
+    local w = plannerWindow()
+    if w then
+      local ok, e = pcall(function() w:updateCostAndConstructionAbility() end)
+      PW.n = (PW.n or 0) + 1
+      if not ok and PW.err ~= tostring(e) then PW.err = tostring(e); A.log("TOWN planner window not redrawn: %s", tostring(e)) end
+    end
+    if #PW.due == 0 then PW.due = nil end
+  end
+end
 C.register("planwpts", {
-  onWorld = function(S) WP.seen = {}; WP.m = nil; WP.mkey = nil; WP.was = false end,
+  onWorld = function(S) WP.seen = {}; WP.m = nil; WP.mkey = nil; WP.was = false; PW.w = nil; PW.due = nil; PW.seenT = nil; for k in pairs(WP.gone) do WP.gone[k] = nil end end,
   tick = function(S, clock)
     if C.hold then return end
+    do local okW, eW = pcall(windowTick, S, clock); if not okW and PW.terr ~= tostring(eW) then PW.terr = tostring(eW); A.log("TOWN planner window tick error: %s", tostring(eW)) end end
     -- the planner entered or left: looked at at once (the walls as they stand before the first change; the last
     -- change before leaving); else twice a second, and only while the planner is open
     local inPlan = false; local p = S.p1
     if not valid(p) then return end
     pcall(function() inPlan = p.inPlanningMode == true end)
+    if inPlan then pcall(function() if p.LMB_pressed_b == true then WP.pressT = clock end end) end   -- (lane 81) the local press
     if inPlan == WP.was and (not inPlan or clock - WP.t < 0.5) then return end
     WP.was = inPlan
     WP.t = clock
@@ -623,6 +728,7 @@ X.def { name = "PLANWPTS", status = "native2", ref = "lane 53 report (two copies
       -- (selectCastleBlueprint, destroySelectedCastleBlueprint: PLANSEL's DEL); already gone here: nothing to do
       local old = C.patch.decPoints(job.f[2]); if #old < 2 then return "bad points" end
       local w = wallWith(m, old, 0.05, true); if not w then return "ok" end
+      do local g0 = C.patch.wallGet(w); if g0 and g0.ctl then WP.gone[ctlLine(g0.ctl)] = os.clock() end end   -- (lane 81) taken away by the replay
       local h = A.helper(); if not valid(h) then return "no helper" end
       if not enter(h, m) then return "the helper could not enter planning mode" end
       X.touch(m)
@@ -677,6 +783,156 @@ X.def { name = "PLANWPTS", status = "native2", ref = "lane 53 report (two copies
       end
     end
     if g and WP.m == addrOf(m) then WP.seen[wallName(w)] = ctlLine(g.ctl) end
+    return "ok"
+  end }
+
+-- (lane 83) a replay changed these walls of the plan: the PLANWPTS scan of this copy takes their points as they are
+-- now, so it does not send the replay's change back as this copy's own
+local function resnap(m, walls)
+  if WP.m ~= addrOf(m) then return end
+  for _, w in ipairs(walls) do
+    if valid(w) then local g = C.patch.wallGet(w); if g and #g.ctl >= 2 then WP.seen[wallName(w)] = ctlLine(g.ctl) end end
+  end
+end
+B.resnap = resnap
+-- (lane 83) the walls' points before a replay, and after it: only the walls the replay changed are taken as they are
+function B.snapWalls(m)
+  local t = {}; if not valid(m) then return t end
+  for _, w in ipairs(wallsOf(m)) do local g = C.patch.wallGet(w); if g and #g.ctl >= 2 then t[wallName(w)] = ctlLine(g.ctl) end end
+  return t
+end
+function B.resnapChanged(m, before)
+  if not (valid(m) and before) or WP.m ~= addrOf(m) then return end
+  for _, w in ipairs(wallsOf(m)) do
+    local g = C.patch.wallGet(w)
+    if g and #g.ctl >= 2 then local k, l = wallName(w), ctlLine(g.ctl); if before[k] ~= l then WP.seen[k] = l end end
+  end
+end
+
+-- ================================================================ PLANJOIN: two walls of the plan joined into one (lane 83)
+-- SEE: a pre-hook on PawnCPP:joinWalls(wallA, wallB) on this copy's own lord: the castle floater's wall option widget
+-- (castleFloater_wallOptionWidget_C, its join button: GetPlayerPawn -> joinWalls(wallA, wallB) -> despawnCastleFloater;
+-- the game shows it through spawnWallJoinWidget(wallA, wallB)). Lane 69's audit (evidence.txt 3c) found it carried by
+-- nothing.
+--   PLANJOIN <manor> <A's points> <B's points> <the joined wall's points> <its gates' places | ->
+-- HOW THE GAME DOES IT (lane 83 run 1, coop_test_open, measured on the host, one call a step):
+--   * joinWalls returns true and KEEPS wall A (the same object, the same name): A gets the joined points; B leaves the
+--     plan's blueprints (its object stays valid a while). A 2-point wall and a 2-point wall meeting at one point give
+--     one 3-point wall (A's points, then B's far point).
+--   * Two walls that do NOT meet are joined too: A turned round, then B, the meeting ends made one point (B's): a
+--     3-point and a 3-point wall gave one 5-point wall. So the result is the game's own rule; it is carried as points.
+--   * The helper lord does the same in planning mode (run 1: no crash, the same kind of result).
+-- Walls are named by their control points (never by a list number: the join changes the list). The scan of PLANWPTS
+-- would otherwise see the kept wall change and B leave: B.joinHold tells it that this copy's own join is on its way.
+-- REPLAY: the helper finds both walls by their points, enters planning mode for the manor, calls the game's own
+-- joinWalls(A, B) and leaves; the kept wall gets the sender's points exactly (coop_patch WALLSET, the game's own
+-- rebuild) when the game here made other numbers; the gates' heights as the sending copy has them (as PLANWALL).
+-- Already joined here (a repeated line, or the copy that joined): "ok".
+B.joinHold = B.joinHold or {}
+B.actMark = B.actMark or {}
+function B.mark(m) if valid(m) then B.actMark[addrOf(m)] = os.clock() end end
+X.hook(P .. "PawnCPP:joinWalls", { "PLANJOIN" }, function(self, a1, a2)
+  local p = self:get(); if not X.isLocal(p) then return nil end
+  local m = p.plannerModeBld
+  local a, b = a1 and a1:get(), a2 and a2:get()
+  if not (valid(m) and valid(a) and valid(b)) then return { k = "_note", msg = "wall join outside the planner or without two walls: not sent" } end
+  local Pt = C.patch; if not (Pt and Pt.wallGet) then return { k = "_note", msg = "wall join: the native piece (WALLGET) is not here: not sent, copies now differ" } end
+  local ga, gb = Pt.wallGet(a), Pt.wallGet(b)
+  if not (ga and gb and #ga.ctl >= 2 and #gb.ctl >= 2) then return { k = "_note", msg = "wall join: the walls' points could not be read: not sent, copies now differ" } end
+  local na, nb = wallName(a), wallName(b)
+  B.joinHold[addrOf(m)] = { t = os.clock(), names = { [na] = true, [nb] = true } }
+  B.mark(m)
+  A.log("TOWN planner join seen: %s (%d points) + %s (%d points)", na, #ga.ctl, nb, #gb.ctl)
+  return { k = "PLANJOIN", obj = m, wa = a, wb = b, pa = ctlLine(ga.ctl), pb = ctlLine(gb.ctl) }
+end)
+local function inPlan(m, w) local a = addrOf(w); for _, x in ipairs(wallsOf(m)) do if addrOf(x) == a then return true end end; return false end
+X.def { name = "PLANJOIN", status = "lane 83", ref = "lane_s21_83 (report)", helper = true, wait = 1,
+  ready = function(S, rec)
+    local m = rec.obj; if not valid(m) then return nil, "planner building gone" end
+    if not X.owned(m) then return nil, "not the lord's" end
+    if not wallSetOk() then return nil, "the native piece (coop_patch WALLSET) is not available here: the join stays on this copy" end
+    -- (lane 83, run 2b) the wall option widget spawned again over an old one holds wallB = wallA: the game then joins a
+    -- wall with itself, which takes it out of the plan. Carried as such: PLANJOIN <manor> <A> <A> - -
+    if valid(rec.wa) and valid(rec.wb) and addrOf(rec.wa) == addrOf(rec.wb) then
+      if inPlan(m, rec.wa) then if Pl.vnow() - rec.t < 1.0 then return "wait" end; return nil, "a wall joined with itself stayed in the plan" end
+      if WP.m == addrOf(m) then WP.seen[wallName(rec.wa)] = nil end
+      return X.bkeyOf(rec.snap) .. " " .. rec.pa .. " " .. rec.pa .. " - -"
+    end
+    -- the game joins inside the call: one wall of the two is kept (A in every measured case) with the joined points
+    local keep
+    if valid(rec.wa) and inPlan(m, rec.wa) and not (valid(rec.wb) and inPlan(m, rec.wb)) then keep = rec.wa
+    elseif valid(rec.wb) and inPlan(m, rec.wb) and not (valid(rec.wa) and inPlan(m, rec.wa)) then keep = rec.wb end
+    if not keep then
+      if Pl.vnow() - rec.t < 1.0 then return "wait" end
+      local function st(w) if not valid(w) then return "gone" end; local g = C.patch.wallGet(w); return wallName(w) .. (inPlan(m, w) and " in the plan " or " out of the plan ") .. (g and #g.ctl or -1) .. " points" end
+      return nil, "the game did not join the walls: A " .. st(rec.wa) .. ", B " .. st(rec.wb)
+    end
+    local g = C.patch.wallGet(keep); if not (g and #g.ctl >= 2) then return "wait" end
+    B.joinHold[addrOf(m)] = { t = os.clock(), names = { [wallName(keep)] = true, [wallName(keep == rec.wa and rec.wb or rec.wa)] = true } }
+    resnap(m, { keep })
+    if WP.m == addrOf(m) then WP.seen[wallName(keep == rec.wa and rec.wb or rec.wa)] = nil end
+    return X.bkeyOf(rec.snap) .. " " .. rec.pa .. " " .. rec.pb .. " " .. ctlLine(g.ctl) .. " " .. gateLine(g.gates)
+  end,
+  apply = function(S, job)
+    if not wallSetOk() then return "the native piece (coop_patch WALLSET) is not available on this copy: the walls stay apart here" end
+    local m = X.findBkey(job.f[1]); if not m then return "retry:planner building not found" end
+    if job.f[4] == "-" then
+      -- a wall joined with itself left the plan on the sending copy: the same call here (the game's own result), and
+      -- the delete button's way if the wall stayed
+      local pw = C.patch.decPoints(job.f[2]); if #pw < 2 then return "bad points" end
+      local w = wallWith(m, pw, 0.05, true); if not w then return "ok" end
+      local h = A.helper(); if not valid(h) then return "no helper" end
+      if not Pl.clearMoved(h) then return "helper still holds a moved building" end
+      if not enter(h, m) then return "the helper could not enter planning mode" end
+      X.touch(m)
+      local okJ, r = pcall(function() return h:joinWalls(w, w) end)
+      if okJ and inPlan(m, w) then pcall(function() h:selectCastleBlueprint(w, false); h:destroySelectedCastleBlueprint() end); pcall(function() h:deselectCastleBlueprint() end) end
+      leave(h)
+      if not okJ then return "error " .. tostring(r) end
+      if valid(w) and inPlan(m, w) then return "the wall is still in the plan" end
+      A.log("TOWN planner wall joined with itself: out of the plan (%d control points)", #pw)
+      return "ok"
+    end
+    local pa, pb, pn = C.patch.decPoints(job.f[2]), C.patch.decPoints(job.f[3]), C.patch.decPoints(job.f[4])
+    if #pa < 2 or #pb < 2 or #pn < 2 or #pn > 64 then return "bad points" end
+    local a, b = wallWith(m, pa, 0.05, true), wallWith(m, pb, 0.05, true)
+    if a and b and addrOf(a) == addrOf(b) then return "bad fields: both walls are one" end
+    if not (a and b) then
+      if wallWith(m, pn, 0.05, true) then return "ok" end                  -- already joined here
+      return "the two walls are not in the plan here"
+    end
+    local h = A.helper(); if not valid(h) then return "no helper" end
+    if not Pl.clearMoved(h) then return "helper still holds a moved building" end
+    if not enter(h, m) then return "the helper could not enter planning mode" end
+    X.touch(m)
+    local okJ, r = pcall(function() return h:joinWalls(a, b) end)
+    leave(h)
+    if not okJ then return "error " .. tostring(r) end
+    local keep
+    if inPlan(m, a) and not inPlan(m, b) then keep = a elseif inPlan(m, b) and not inPlan(m, a) then keep = b end
+    if not keep then return "the game here did not join the walls (joinWalls " .. tostring(r) .. ")" end
+    local g = C.patch.wallGet(keep)
+    local off = not g or #g.ctl ~= #pn
+    if not off then for i = 1, #pn do if not near1(g.ctl[i], pn[i], 0.006) then off = true; break end end end
+    if off then
+      -- the game here joined to other numbers (or the other way round): the sender's joined wall, exactly
+      local okS, rs = C.patch.wallSet(keep, pn)
+      A.log("TOWN planner join: the game here made %d points, the sender %d: the sender's written: %s", g and #g.ctl or -1, #pn, okS and "ok" or ("NOT written: " .. tostring(rs)))
+      if not okS then return "the joined wall could not be given the sender's points: " .. tostring(rs) end
+      g = C.patch.wallGet(keep)
+    end
+    local want = (job.f[5] and job.f[5] ~= "-") and C.patch.decPoints(job.f[5]) or {}
+    for _, q in ipairs(want) do
+      for i, have in ipairs(g and g.gates or {}) do
+        if near1(have, q, 1.0) then
+          if math.abs(have.Z - q.Z) > 0.00005 and C.patch.gateSet then C.patch.gateSet(keep, i - 1, q) end
+          break
+        end
+      end
+    end
+    resnap(m, { keep })
+    if WP.m == addrOf(m) then WP.seen[wallName(keep == a and b or a)] = nil end
+    A.log("TOWN planner walls joined: %d + %d -> %d control points", #pa, #pb, g and #g.ctl or -1)
     return "ok"
   end }
 

@@ -25,6 +25,19 @@ local CLICK = "/Game/UI/W_MaterialButton.W_MaterialButton_C:BndEvt__W_MaterialBu
 
 local function valid(o) return A.valid(o) end
 local function addr(o) local ok, a = pcall(function() return o:GetAddress() end); return ok and a or nil end
+-- (lane 64, task 64d: the guard's row A38) widgets kept from an earlier tick (the hire window's screens, the pause
+-- line) are in no native table, so the guard in valid() cannot know when the engine frees one, and valid() on a freed
+-- one reads freed memory. Their addresses are looked up in the engine's object array first (coop_snap.lua
+-- N.aliveNow, one native look for all of them); true = at least one of them is freed (then none is touched: the
+-- caller finds them again). Without a native answer: false (valid() decides, as before).
+local function keptFreed(list)
+  local Ns = rawget(C, "snap"); if not (Ns and Ns.aliveNow) then return false end
+  local as = {}; for _, w in ipairs(list) do local a = addr(w); if a then as[#as + 1] = a end end
+  if #as == 0 then return false end
+  local live = Ns.aliveNow(as)
+  for _, a in ipairs(as) do if live[a] == false then U.keptFreed = (U.keptFreed or 0) + 1; return true end end
+  return false
+end
 local function log(fmt, ...) A.log("ui: " .. fmt, ...) end
 
 -- ---------------------------------------------------------------- notices
@@ -588,6 +601,7 @@ local function mercTick(S, clock)
   U.mercT = clock
   local screens = U.mercScreens
   local stale = not screens or #screens == 0
+  if not stale and keptFreed(screens) then stale = true; screens = nil; U.mercScreens = nil end   -- (lane 64) a freed one: none touched
   if screens then for _, sc in ipairs(screens) do if not valid(sc) then stale = true end end end
   if stale then
     if clock - (U.mercFindT or -10) < 2.0 then return end
@@ -633,6 +647,7 @@ local function holdTick(S, clock)
   local want = words ~= nil
   if want == (U.holdShown or false) and (not want or (U.holdWords == words and clock - (U.holdT or 0) < 2.0)) then return end
   U.holdT = clock
+  if U.pauseLbl and keptFreed({ U.pauseLbl }) then U.pauseLbl = nil end   -- (lane 64) freed since it was found: not touched
   if want then
     if not valid(U.pauseLbl) then
       U.pauseLbl = nil

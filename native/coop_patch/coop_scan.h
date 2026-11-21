@@ -43,7 +43,7 @@ typedef struct {
 } sig_def;
 
 /* Indexes used by the DLL. Keep the order: entries first (the patches point at them). */
-enum { S_TSR = 0, S_REFORM, S_P1, S_P2, S_P3A, S_P3B, S_NF1, S_NF2, S_JG /* lane 19 */, S_NT /* lane 66 */, S_FINISH, S_BURN, S_FIREOUT, S_RECOUNT, S_REFRESH, S_ADDINV,
+enum { S_TSR = 0, S_REFORM, S_P1, S_P2, S_P3A, S_P3B, S_NF1, S_NF2, S_JG /* lane 19 */, S_NT /* lane 66 */, S_NM /* lane 64, round 5 */, S_FINISH, S_BURN, S_FIREOUT, S_RECOUNT, S_REFRESH, S_ADDINV,
        S_ADDLIST /* lane 22 */, S_NOTIFY, S_TS1, S_TS2, S_TS3, S_TS4, S_TS5, S_TS6,
        S_CURSOR /* lane 26 */, S_LMBDOWN, S_LMBUP, S_RMBDOWN, S_RMBUP /* lane 26 */,
        S_CHOOSE /* lane 23 */,
@@ -69,10 +69,12 @@ enum { S_TSR = 0, S_REFORM, S_P1, S_P2, S_P3A, S_P3B, S_NF1, S_NF2, S_JG /* lane
        S_HADD /* lane 72 (HIST TRYADD) */,
        S_COLLENT /* lane 71 (COLLAPSE) */, S_CKILL /* lane 71 */, S_SPROG /* lane 71 (SITEHP) */,
        S_MRDAY /* lane 71 (MROLL) */, S_MRACC /* lane 71 */,
-       S_GROWMK /* lane 71 (FAMROLL) */, S_SICKROLL /* lane 71 */, S_DLL_COUNT };
+       S_GROWMK /* lane 71 (FAMROLL) */, S_SICKROLL /* lane 71 */,
+       S_MERCROLL /* lane 87 (NOROLL) */, S_SITEPROG /* lane 87 (BARNAN) */,
+       S_TADD1 /* lane 83 (TRK: the tracker's two time adds) */, S_TADD2 /* lane 83 */, S_DLL_COUNT };
 #define HOLD_GATES 10                   /* lane 31: S_HAPPR .. S_HPREM and S_HPRMALL are hooked at their entry; S_HWMON is a store site; lane 36: S_HEMIG */
 #define TOTALS_SITES 6
-#define S_PATCH_LAST S_NT      /* the patch sites are S_P1..S_PATCH_LAST */
+#define S_PATCH_LAST S_NM      /* the patch sites are S_P1..S_PATCH_LAST */
 
 static const sig_def SIGS[] = {
     /* report 5 / sigs5 "FUNCTION ENTRY": TriggerSquadRetreat(USquadComponent*, int handle), void */
@@ -129,6 +131,18 @@ static const sig_def SIGS[] = {
     { "NT", "no own theft (the bandits' daily theft)",
       "48 8B 8F A0 00 00 00 48 8D 44 24 70 45 33 C0 48 89 44 24 40 48 8D 54 24 40 48 89 7C 24 48 48 8B 89 D0 02 00 00 E8 03 AE FF FF 4C 8D 5C 24 50",
       K_FIXED, 37, 2, {0xE8, 0x03}, {0xEB, 0x03}, -1, 0x4d646b3, 1 },
+    /* ---- lane 64, round 5 (NOMOURN): the engine's daily routine, after its calls of the daily consumption (4d8f670)
+     * and the animals' hunger (4d638b0), walks the homes of every region and takes one day off a home's mourningPeriod
+     * (+F20h) when it is above 0: "mov rdx,[rcx]; mov eax,[rdx+F20h]; test eax,eax; jle next; dec eax; mov [rdx+F20h],
+     * eax; next: add rcx,8; cmp rcx,r8; jne". The loop does nothing else, and it is the only place of the game's own
+     * code that counts the field down. On a friend's copy "jle next" becomes "jmp next": the friend's game never takes
+     * the day off, and a home's mourning days there are the host's alone (the facts module writes each host value as
+     * it comes). Before, the friend's own day step took a day off the value the host's line had already put right:
+     * one day less than the host for a frame after a reload. Design and reading:
+     * research6-11-10-game-probe\lanes\lane_s21_64\design_nomourn.txt. */
+    { "NM", "no own mourning count (the engine's daily routine)",
+      "48 8B 11 8B 82 20 0F 00 00 85 C0 7E 08 FF C8 89 82 20 0F 00 00 48 83 C1 08 49 3B C8 75 E2",
+      K_FIXED, 11, 2, {0x7E, 0x08}, {0xEB, 0x08}, -1, 0x4d78350, 1 },
     /* lanes\lane_w\report_W.txt answer 1: finishConstruction(SMBuildingMaster*), called by the builder's hammer
      * handler 4dc5270 and the async construction callback 4cbdb1e */
     { "FINISH", "finishConstruction entry",
@@ -631,6 +645,30 @@ static const sig_def SIGS[] = {
     { "SICKROLL", "the family's sickness roll (patched by FAMROLL ON)",
       "FF 15 ?? ?? ?? ?? 25 FF 7F 00 00 66 0F 6E C0 B8 1E 00 00 00 0F 5B C0 F3 41 0F 59 C4 F3 0F 2C C8 3B C8 0F 4C C1 85 C0 ?? ?? 49 83 BE 60 01 00 00 1E",
       K_ENTRY, -1, 0, {0}, {0}, -1, 0x4d8f8fd, 1 },
+    /* ---- lane 87 (NOROLL): the mercenary month roll (Engine::rerollMercenaries 4cd83e0, engine rcx; called by updateDay
+     * 4d78bf0, BeginPlay 4c83bfa and the script thunk 4ae9d60): its entry up to "lea rbx,[rcx+0BF0h]" (the offer list) and
+     * the first test of it. The first 7 bytes ("mov rax,rsp; mov [rax+20h],rbx") are moved into a stub by NOROLL ON. */
+    { "MERCROLL", "the mercenary month roll's entry (hooked by NOROLL ON)",
+      "48 8B C4 48 89 58 20 48 89 48 08 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 90 48 81 EC 70 01 00 00 48 8D 99 F0 0B 00 00 0F 29 70 B8 83 7B 0C",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4cd83e0, 1 },
+    /* ---- lane 87 (BARNAN, the bar's cure 2): SMBuildingMaster::getConstructionProgress's entry (4d3d940, building rcx;
+     * called by the script thunk 4af596e and PawnCPP::drawBuildingOverlays 4b3b161), up to "add rcx,448h" (the inventory
+     * passed to the goods routine). The first 7 bytes ("mov rax,rsp; mov [rax+8],rbx") are moved into a stub by BARNAN ON. */
+    { "SITEPROG", "a site's progress function's entry (hooked by BARNAN ON)",
+      "48 8B C4 48 89 58 08 48 89 70 10 57 48 83 EC 50 48 8B F1 0F 29 70 E8 33 FF 0F 29 78 D8 48 81 C1 48 04 00 00",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4d3d940, 1 },
+    /* ---- lane 83 (TRK): the production tracker's two routines that add work time to a category of the time list (+120h,
+     * 30h an entry: double time +0, int count +8, byte category +18h) and broadcast OnNewTimeTracked (+0A8h) as a tail
+     * call: 4bcf780 (tracker rcx, category dl, time xmm2 float; 2 callers) and 4bcf7f0 (the same and the unit r9; 1
+     * caller). Leaf routines; no caller uses a return value. Their first instruction (7 and 8 bytes, no rip operand) is
+     * moved into a stub by TRKHOLD ON: on a friend this copy's own work time is not added (the host's time list is
+     * carried by the stats module). */
+    { "TADD1", "the production tracker's time add (hooked by TRKHOLD ON)",
+      "4C 8B 89 20 01 00 00 48 63 81 28 01 00 00 4D 8B D1 48 8D 04 40 48 C1 E0 04 49 03 C1 4C 3B C8 74 ?? 41 38 52 18 74 ?? 49 83 C2 30 4C 3B D0 75 ?? 48 81 C1 A8 00 00 00 E9",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4bcf780, 1 },
+    { "TADD2", "the production tracker's time add for a unit (hooked by TRKHOLD ON)",
+      "41 80 B9 B0 0A 00 00 05 44 0F B6 C2 48 8B 91 20 01 00 00 4C 8B D9 48 63 81 28 01 00 00 75 ?? 4C 8D 04 40 49 C1 E0 04 4C 03 C2 49 3B D0 0F 84 ?? ?? ?? ?? 80 7A 18 07",
+      K_ENTRY, -1, 0, {0}, {0}, -1, 0x4bcf7f0, 1 },
 
     /* ---- below: only checked by the offline tool (sigs5.txt lists them; the DLL does not use them) ---- */
     { "ALT-A", "arrows pass avoidKilling=1 (updateProj)",

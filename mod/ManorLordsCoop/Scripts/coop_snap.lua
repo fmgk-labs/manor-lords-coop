@@ -94,6 +94,13 @@ local function buildingSpec(b)
     { "ups", string.format("a%X:10:%X", P.upgradesDone.off, N.upStride or 1), "a" },   -- element size 1, or 4 after a refusal on it
     { "inv", string.format("g%X:18", P.Inventory.off), "g" },
   }
+  -- (lane 76, task 76e) the three storage counters, read with the goods in the same snapshot: the timing proof dates
+  -- the stock the host sends from this table at the snapshot's own moment (coop_world.lua W.proofNote). Optional:
+  -- a build without them reads as before.
+  for _, c in ipairs({ { "nsg", "numStoredGeneric" }, { "nsl", "numStoredLarge" }, { "nsp", "numStoredPantry" } }) do
+    local p = P[c[2]]
+    if p and p.kind == "IntProperty" then f[#f + 1] = { c[1], string.format("i%X", p.off) } end
+  end
   return f
 end
 
@@ -156,8 +163,13 @@ readBody = function()
       if not skip then
         r = T.by[a]
         if not r or r.idx ~= idx then r = { a = a, idx = idx, inv = {} }; T.by[a] = r; T.dirty = true end
+        if N.gone[a] ~= nil then N.gone[a] = nil; N.goneIdx[a] = nil end   -- (lane 64, round 5) the address is an object of the list again
         if r.pos ~= lpos then r.pos = lpos; T.dirty = true end
         r.ver = ver
+        -- (lane 76, task 76e) the buildings whose record changed in this answer (not a whole answer): the facts
+        -- module's host sends their stock in the same tick instead of at the end of its next pass (N.takeChanged)
+        if id == 0 and full == 0 then N.changed = N.changed or {}; N.changed[a] = true end
+        if id == 1 and full == 0 then N.changedR = N.changedR or {}; N.changedR[a] = true end   -- (the regions: coop_world.lua hostFastTotals)
       end
       -- every field's 8 bytes first (a list field: its count), then the uint8 list, then the goods lists in field order
       for k = 1, nf do
@@ -207,7 +219,10 @@ readBody = function()
     end
     for _ = 1, ngone do
       local a; a, pos = unpack("<I8", body, pos)
-      if not skip and T.by[a] then T.by[a] = nil; T.dirty = true end
+      if not skip and T.by[a] then
+        if id == 0 or id == 2 then N.gone[a] = id; N.goneIdx[a] = T.by[a].idx; bump("goneMarked") end   -- (lane 64, round 5: see N.gone)
+        T.by[a] = nil; T.dirty = true
+      end
     end
     if T and not skip then T.n = cnt; T.ver = T.ver + 1 end
   end
@@ -216,10 +231,184 @@ readBody = function()
   if N.rstate == "check" and N.S then N.rverify(N.S) end
 end
 
+-- ---------------------------------------------------------------- (lane 64, round 5) kept handles of objects that left the game's lists
+-- THE CLASS OF FAULT: a module keeps a building's or a unit's handle past its tick and checks it with valid() before
+-- use. valid() (IsValid) reads the object's memory too; once the engine's clean-up has freed the object it has
+-- answered "true" about 1 time in 19 (lane 47, R4.2), and the call behind it then ends the copy inside the mod loader
+-- (lanes 35 and 47; the host of session l64pin4). About forty stores of the mod rest on valid() alone (the list is in
+-- lane 64's report, section 39). This closes the class at its one common point, valid() itself (coop.lua):
+--   N.gone[a] = 0 | 2   the building (table 0) or unit (table 2) at address a has left the engine's list: the native
+--                       piece's own "gone" word, at most 0.1 s old. It may still be alive (destroyed, not yet freed).
+--   N.gone[a] = false   and the native look has since found its memory freed. Final until the address is in a list again.
+--   (a record that comes for the address takes the entry out: the address belongs to an object of the list again)
+-- valid() asks N.goneAlive(a) for a handle whose address has an entry, BEFORE it touches the object: true = the engine's
+-- object array still holds this very object (IsValid may be asked, and answers as before), false = freed (the handle
+-- is not touched; valid() says false). The look is the native piece's SNAP PROBE (the object array's entry at the
+-- object's own number must point back at the address), one command for every open address, at most once a tick, and
+-- only in a tick in which such a handle is checked. Nothing changes for an object that is alive, in a list or not.
+-- Without the native tables (another game build, a table refused, the native piece off) valid() is as it was.
+-- Not covered: objects of no table (carts, resources, roads, widgets, components), and an object destroyed AND freed
+-- within the 0.1 s before the tables' next read.
+--   N.goneIdx[a]        the object's own number in the engine's object array, as the native record had it when the
+--                       object left the list. THE SLOT USED AGAIN: when the engine has put ANOTHER object at the same
+--                       address, the native look finds a living object there, but its number differs: that is "freed"
+--                       for the kept handle (its object is gone), and valid() says false. Before this guard IsValid
+--                       said true there and the code went on with a stranger's object. Only when the new object has
+--                       the same address AND the same number can the two not be told apart (the engine's serial
+--                       number is set only for objects someone holds weakly): then the answer is today's "true", and
+--                       the calls behind it run on a living object, not on freed memory. A new building or unit in
+--                       the game's list takes the entry out before that (its record comes with its own number).
+-- THE SWITCH for a player's game: "keptguard = off" in coop.cfg (read once): valid() is then exactly as before.
+-- From the console: Coop.snap.test.goneOff = true.
+N.gone = N.gone or {}
+N.goneIdx = N.goneIdx or {}
+C.goneAddr = N.gone
+local function goneWanted()
+  if N.goneOn == nil then
+    N.goneOn = true
+    local P = rawget(C, "patch")
+    local ok, v = pcall(function() return P and P.cfgGet and P.cfgGet("keptguard") end)
+    if ok and type(v) == "string" and v:lower() == "off" then N.goneOn = false; log("kept handles: the guard is switched off in coop.cfg (keptguard = off): valid() answers as before 0.2.7") end
+  end
+  return N.goneOn
+end
+local function goneProbe(a)
+  local P = patch(); if not (P and P.send and P.tick and P.dir) then return nil end
+  local list, n = { string.format("0x%X", a) }, 1
+  for x, v in pairs(N.gone) do if v and x ~= a and n < 150 then n = n + 1; list[n] = string.format("0x%X", x) end end
+  P.send("SNAP PROBE " .. table.concat(list, ",")); P.tick()
+  local f = io.open(P.dir .. "snap_probe.txt", "rb"); if not f then return nil end
+  local text = f:read("*a") or ""; f:close()
+  if text == "" or text:find("refused", 1, true) or text:find("exception", 1, true) then return nil end
+  local now, cur, seen = {}, nil, false
+  for line in text:gmatch("[^\r\n]+") do
+    local h, ix = line:match("^(%x+) flags=%x+ idx=(%-?%d+)")
+    if h then
+      cur = tonumber(h, 16); now[cur] = false; seen = true
+      local was = N.goneIdx[cur]
+      if was ~= nil and tonumber(ix) ~= was then cur = nil; bump("goneOther") end   -- the number at the address is no longer the object's (freed memory written over, or another object there): the kept handle's object is gone
+    else
+      local u = line:match("^(%x+) unreadable")
+      if u then now[tonumber(u, 16)] = false; cur = nil; seen = true
+      elseif cur and line:find("stride 24:", 1, true) and line:find(" SAME ", 1, true) then now[cur] = true end   -- (24: the native piece's own entry size, UOI_SIZE)
+    end
+  end
+  if not seen or now[a] == nil then return nil end           -- not this command's answer: nothing is decided by it
+  bump("goneProbes")
+  return now
+end
+function N.goneAlive(a)
+  local g = N.gone[a]
+  if g == nil then return true end
+  if g == false then return false end
+  if N.test.off or N.test.goneOff or not goneWanted() or (g == 0 and N.state ~= "ok") or (g == 2 and N.ustate ~= "ok") then return true end   -- switched off, or no table to rest on: as before
+  local S = C.s; local tk = S and S.ticks or 0
+  if N.goneTick ~= tk or (N.goneNow and N.goneNow[a] == nil) then
+    N.goneTick = tk
+    local ok, now = pcall(goneProbe, a)
+    N.goneNow = ok and now or nil
+    if N.goneNow then
+      for x, alive in pairs(N.goneNow) do
+        if not alive and N.gone[x] then
+          N.gone[x] = false; bump("goneFreed")
+        end
+      end
+    end
+  end
+  local now = N.goneNow
+  if now == nil or now[a] == nil then                          -- no native answer: as before, said once in a world
+    bump("goneNoLook")
+    if not N.goneNoLook then N.goneNoLook = true; log("kept handles: the native piece gave no answer about an address that left the game's list (no native piece, an older one, or another game build): valid() answers as before 0.2.7 for such handles") end
+    return true
+  end
+  if not now[a] then
+    bump("goneRefused")
+    if (N.stats.goneRefused or 0) <= 20 then log("a kept handle was checked whose object is freed (address %X; it left the game's list before): valid() answers false without touching it", a) end
+  end
+  return now[a]
+end
+
+-- (lane 64, task 64d) THE SAME LOOK FOR HANDLES OF NO TABLE: resources and felled trees (the job board's index and a
+-- task record's resource), handcarts. The native tables do not hold them, so the guard above never learns that they
+-- left. A module that keeps such a handle past its tick asks N.aliveNow({ address, ... }) right before it touches any
+-- of them: one SNAP PROBE for every address not yet asked in this tick (at most 150 in one look); the answers of a
+-- tick are kept for that tick. Per address: true = the engine's object array holds an object at that address (the
+-- entry at the number read there points back at it): IsValid may be asked, as before; false = freed or unreadable:
+-- the handle must not be touched; nil = no native answer (no native piece, another game build, the look refused, the
+-- 151st address and on): valid() decides, as before. There is no kept number here: a new object at the same address
+-- with the same number counts as alive, and every call behind it then runs on a living object, not on freed memory.
+-- Off with the guard (keptguard = off in coop.cfg, Coop.snap.test.goneOff, Coop.snap.test.off): nil for every address.
+function N.aliveNow(list)
+  local out = {}
+  if N.test.off or N.test.goneOff or not goneWanted() then return out end
+  -- only once the native piece has checked the engine's object array in this world (SNAP UOA, N.uoaOk): before that a
+  -- wrong layout could read "another object" for a living one, and a living cart would be dropped as freed
+  if not N.uoaOk then bump("aliveNoLook"); return out end
+  local S = C.s; local tk = S and S.ticks or 0
+  if N.aliveTick ~= tk or not N.aliveMap then N.aliveTick = tk; N.aliveMap = {} end
+  local M = N.aliveMap
+  local ask, n, seen = {}, 0, {}
+  for _, a in ipairs(list) do
+    if type(a) == "number" and a ~= 0 and not seen[a] then
+      seen[a] = true
+      if M[a] ~= nil then out[a] = M[a]
+      elseif n < 150 then n = n + 1; ask[n] = a end
+    end
+  end
+  if n == 0 then return out end
+  local P = patch(); if not (P and P.send and P.tick and P.dir) then bump("aliveNoLook"); return out end
+  local hexes = {}; for i = 1, n do hexes[i] = string.format("0x%X", ask[i]) end
+  local okL, now = pcall(function()
+    P.send("SNAP PROBE " .. table.concat(hexes, ",")); P.tick()
+    local f = io.open(P.dir .. "snap_probe.txt", "rb"); if not f then return nil end
+    local text = f:read("*a") or ""; f:close()
+    if text == "" or text:find("refused", 1, true) or text:find("exception", 1, true) then return nil end
+    local t, cur = {}, nil
+    for line in text:gmatch("[^\r\n]+") do
+      local h = line:match("^(%x+) flags=%x+ idx=%-?%d+")
+      if h then cur = tonumber(h, 16); t[cur] = false
+      else
+        local u = line:match("^(%x+) unreadable")
+        if u then t[tonumber(u, 16)] = false; cur = nil
+        elseif cur and line:find("stride 24:", 1, true) and line:find(" SAME ", 1, true) then t[cur] = true end   -- (24: the native piece's entry size, as goneProbe)
+      end
+    end
+    return t
+  end)
+  if not okL or not now then bump("aliveNoLook"); return out end
+  bump("aliveLooks"); bump("aliveAsked", n)
+  for i = 1, n do
+    local a = ask[i]; local v = now[a]
+    if v ~= nil then M[a] = v; out[a] = v; if v == false then bump("aliveFreed") end end
+  end
+  return out
+end
+
 -- the frame's snapshot: the native piece's coop_snap_tick (the tables and the crash guard, nothing else), then its
 -- answer; called by the core at the start of each frame, before any module (coop.lua)
 function N.frame()
   local P = patch(); if not P then return end
+  -- (lane 64, round 5) once a minute, when it moved: what the guard of kept handles did (see N.gone)
+  local tg = os.clock()
+  if tg - (N.goneSaidT or 0) >= 60 then
+    N.goneSaidT = tg
+    local st = N.stats; local sig = (st.goneMarked or 0) .. "/" .. (st.goneProbes or 0) .. "/" .. (st.goneFreed or 0) .. "/" .. (st.goneRefused or 0)
+    local vc = rawget(C, "validCount"); local nv, na = 0, 0; if vc then nv, na = vc() end
+    if sig ~= N.goneSaid and sig ~= "0/0/0/0" then
+      N.goneSaid = sig
+      log("kept handles: %d buildings and units have left the game's lists so far, %d native looks at such addresses, %d found freed (%d of them told by the object's number at the address: it had changed), %d checks of a freed one answered false without touching it, %d without a native answer | valid() was asked %d times in the last minute (%.0f a second), %d of them for an address that left the lists",
+        st.goneMarked or 0, st.goneProbes or 0, st.goneFreed or 0, st.goneOther or 0, st.goneRefused or 0, st.goneNoLook or 0,
+        nv - (N.goneV or 0), (nv - (N.goneV or 0)) / 60, na - (N.goneA or 0))
+    end
+    N.goneV, N.goneA = nv, na
+    -- (lane 64, task 64d) and the looks for handles of no table (N.aliveNow), when they moved
+    local sig2 = (st.aliveLooks or 0) .. "/" .. (st.aliveFreed or 0) .. "/" .. (st.aliveNoLook or 0)
+    if sig2 ~= N.aliveSaid and sig2 ~= "0/0/0" then
+      N.aliveSaid = sig2
+      log("kept handles of no table (resources, felled trees, carts, a task's resource): %d native looks so far for %d addresses, %d found freed and never touched, %d without a native answer",
+        st.aliveLooks or 0, st.aliveAsked or 0, st.aliveFreed or 0, st.aliveNoLook or 0)
+    end
+  end
   if N.sfn == nil then
     local fn = package.loadlib(P.dll, "coop_snap_tick")
     N.sfn = fn or false
@@ -259,6 +448,19 @@ function N.buildings()
   return ordered(T)
 end
 function N.building(a) if N.test.off or N.state ~= "ok" then return nil end; local T = TABS[0]; if not T or T.needFull then return nil end; return T.by[a] end
+-- (lane 76, task 76e) the addresses of the buildings whose record changed since the last call (a set), or nil while the
+-- table is not checked; the set is emptied by the call
+-- (lane 76, task 76e round 3) the same for the region table: the regions whose totals record changed, or nil
+function N.takeChangedRegions()
+  local c = N.changedR; N.changedR = nil
+  if N.test.off or N.test.regionsOff or N.rstate ~= "ok" then return nil end
+  return c
+end
+function N.takeChanged()
+  local c = N.changed; N.changed = nil
+  if N.test.off or N.state ~= "ok" then return nil end
+  return c
+end
 -- the object of a record: the engine's list at its place, the address compared; nil when it is not there
 -- (round two) the object is taken from the engine's list anew at every call, never kept from an earlier frame: a handle
 -- kept across frames could name an object the engine freed since (sitting p2: a friend's game closed inside the mod
@@ -515,6 +717,9 @@ end
 
 local function reset(S)
   if N.fh then pcall(io.close, N.fh); N.fh = nil end
+  for a in pairs(N.gone) do N.gone[a] = nil end; N.goneNow = nil; N.goneTick = nil      -- (lane 64, round 5) a new world: every address is new
+  for a in pairs(N.goneIdx) do N.goneIdx[a] = nil end; N.goneNoLook = nil
+  N.aliveMap = nil; N.aliveTick = nil                                                  -- (lane 64, task 64d) the same for N.aliveNow
   for id in pairs(TABS) do TABS[id] = nil end
   N.S = S; N.world = S.worlds; N.state = "start"; N.seq = nil; N.askedFull = false; N.want = false
   N.vq = nil; N.guardFor = nil; N.uoaOk = false; N.t0 = os.clock(); N.tries = 0; N.ustate = nil; N.ui = 0; N.un = 0; N.rstate = nil; N.rq = nil; N.rok = nil

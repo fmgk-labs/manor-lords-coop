@@ -110,7 +110,7 @@ local DEFAULT_CFG = {
   budgetMs = 1.5,        -- work per tick (os.clock has 1 ms steps on Windows, so a tick may reach about 2 ms)
   maxSteps = 200,        -- second guard on the work per tick
   maxLine = 3800,        -- characters per line before the core's prefix (keep a line under 4 KB)
-  pollEvery = 0.5, stockEvery = 2.0, exactStockEvery = 1.0, keyEvery = 30.0, bldEvery = 2.0, bldKeyEvery = 120.0, holdEvery = 1.0, fireEvery = 2.0,
+  pollEvery = 0.5, stockEvery = 2.0, exactStockEvery = 0.25, keyEvery = 30.0, bldEvery = 2.0, bldKeyEvery = 120.0, holdEvery = 1.0, fireEvery = 2.0,
   confirm = 0.3,         -- (lane 51) a changed region total goes out once it held this long (the 4-a-second check sees it then)
   confirmEvery = 0.05,   -- (lane 51) ... looked at again this often (only the pending ones)
   confirmMax = 1.0,      -- (lane 51, round two) ... but one that keeps changing goes out at most this long after its first
@@ -130,7 +130,18 @@ local DEFAULT_CFG = {
   proofEvery = 0.25,     --   a round over every row starts this many seconds after the last one started
   proofMs = 12,          --   and takes at most this many milliseconds of a tick
   proofKeep = 20,        --   seconds of reads kept
-  proofSecs = "bl bs an cs rp rw li ap fa fc",   --   wide sections read (the fingerprint's parts are always read)
+  proofSecs = "bl bs an cs rp rw li ap fa fc lo wx mk",   --   wide sections read (the fingerprint's parts are always read)
+  proofNoted = "fd pt",  --   (lane 88) wide sections kept by their module's notes only (W.proofNote), not read by the rounds (lane 83: pt, noted by the stats module's log and time carry)
+                         --   (task 76e: "... pt mt fd" decides the production log, maintenance and fields as well, but in
+                         --   sessions l7b and l7c it cost the host 160 ms a second, 3,800 gaps a minute in the other
+                         --   sections and longer ticks; l7c had a stock change 3.16 s late beside 0.75 s of stalls. Off by
+                         --   default; a session may set it with Coop.world.cfg.proofSecs)
+  proofExtraSecs = "",   -- (lane 83) building sections read by a pass of their own (proofExtra), not by the rounds: off ("")
+  proofExtraEvery = 0.4, --   (lane 83) a cycle over every building starts at most this often (seconds): each row read once a cycle
+  proofExtraMs = 16,     --   (lane 83) the cycle's share of one tick (ms): a cycle is spread over as many ticks as it needs (l83r4a: 8 ms made cycles of 0.7-2.3 s)
+  proofStockEvery = 0.2, --   (lane 76, task 76g) the stock rows (a region's stock S, its supplies rw, every building's stock bs) are
+                         --   read all at once, in one tick, this often, outside the rounds and their limit: a round took up to
+                         --   0.99 s at speed 8 (session l76p), and a stock reading can be judged only with a read every 0.6 s
 }
 W.on = W.on or {}
 for k, v in pairs(DEFAULT_ON) do if W.on[k] == nil then W.on[k] = v end end
@@ -398,6 +409,7 @@ end
 -- Coop.start() makes a new S. Every cached game object is dropped here.
 local function fresh(S)
   if W.S == S and W.world == S.worlds then return end
+  W.lastOwnDay = nil   -- (lane 83) a new world: no own day sampled yet (settlePendingWhat)
   local session = W.S ~= S
   W.S = S; W.world = S.worlds
   W.uRole = nil                                              -- (lane 59) the units of a role, kept up to 2 s: not past a load
@@ -578,6 +590,7 @@ local function fpJob(st)
   -- a differing "B" can be read line by line from the two logs
   if rawget(C, "fpLog") then log("FPB day %s %s %s", tostring(st.day), st.P.B, table.concat(st.B, " ")) end
   st.P.C = W.on.bstock and string.format("%x/%d", H(table.concat(st.C, "|")), #st.C) or "-"
+  if rawget(C, "fpLog") and W.on.bstock then log("FPC day %s %s %s", tostring(st.day), st.P.C, table.concat(st.C, " ")) end   -- (lane 74) the same for the stock of unbuilt sites
   st.P.at.buildings = Check.clock(S)
   if st.done then st.done(st.day, st.P) end
   return true
@@ -856,7 +869,10 @@ local WIDE = {
   { "mt", { "status", "slider", "need", "trk" } },
   -- every region
   { "ro", { "regionName", "owner", "isSettled", "settlementLevel", "tier" } },
-  { "rp", { "workerFamilies", "residents", "population", "homeless", "corpses", "squadsPresent" } },
+  -- (lane 79) "enemies" and "attack" are the two answers the game takes from the region's squad list squadsPresent:
+  -- Region:areAnyEnemySquadsPresent (the map's claim buttons) and Region.isUnderAttack (villagers stay home). The
+  -- list's own length is NOT compared (WIDE_LEFT_OUT below says why).
+  { "rp", { "workerFamilies", "residents", "population", "homeless", "corpses", "enemies", "attack" } },
   { "ap", { "Approval", "publicOrder", "summedApprovalFactors", "factors", "summedPublicOrderFactors", "problems" } },
   { "rw", { "regionalWealth", "supplies_food", "supplies_wood", "expenses", "marketAtt", "nextLivestockOrderIn" } },
   { "li", { "livestock", "role9", "role10", "role11", "role12", "role13", "role14", "role15", "role16", "role17", "role18", "role19", "role21", "role22" }, sparse = true },
@@ -879,18 +895,43 @@ local WIDE = {
             "landscapeDeformationBuildings", "kingsFavour_daysLeft", "lastUniqueID" } },
   -- the player's lord: numbers and the lengths of his lists (S035 to S041)
   { "lo", { "silver", "influence", "kingsFavour", "numTimesInDebt", "claims", "quests", "proposedQuests", "questOpportunities", "InBox", "outbox",
-            "letterHistory", "diplomaticTags", "enemies", "recruitmentPool_Militia", "recruitmentPool_Mercs", "traits", "availablePolicies" } },
+            "letterHistory", "diplomaticTags", "enemies", "recruitmentPool_Militia", "recruitmentPool_Mercs", "traits", "availablePolicies",
+            "raidWarn" } },   -- (lane 83) the raid warning the player reads: each raid quest's days left / day issued
   -- (lane 71) what work areas hold: the world's Resource actors per class (berries, mushrooms, fish, stone, felled
   -- trees ...), the engine's deposits and deer lairs (keys: the class name, "deposits", "lairs")
   { "rr", { "count" } },
   -- lane 72 (coop_x_stats.lua fills these): a building's production tracker (goods in its log | entries | hash of every
   -- entry | the time pie's per cents) and its expertise; prices and supply per region and of the foreign market
   -- (count | hash); the player's squads by the host's squad number (men | sums of morale, stamina, experience | gear hash)
-  { "pt", { "nGoods", "entries", "hash", "timePct" }, sparse = true },
+  { "pt", { "nGoods", "entries", "hash", "timePct", "yield", "made", "showProd" }, sparse = true },   -- (lane 83: yield, made, showProd: what the panel shows in nGoods' place)
   { "ex", { "expertise" }, sparse = true },
   { "mk", { "count", "hash" } },
   { "uv", { "men", "morale", "stamina", "experience", "gear" } },
 }
+-- Fields left out of the comparison on purpose, with the reason (a named exclusion: the sample does not hold them).
+local WIDE_LEFT_OUT = {
+  -- (lane 79) #Region.squadsPresent, the region's list of squads standing in it. Each copy fills it by itself and it
+  -- differs by the game's design: a free merchant's entry moves only when the list is rebuilt (each copy at its own
+  -- load, and when its own villagers trip the game's 50 s "stuck at home" rule), so after a load the count differs in
+  -- most regions; in lane 79's run almost every differing entry (153 of 170) was a free merchant, the rest a rival's
+  -- own squads at home and squads being removed. The game asks the list ONE question only, "does a squad hostile to
+  -- this region's owner stand here?", which a merchant or a lord's own squad at home can never answer yes. That
+  -- answer and the "under attack" flag it sets are compared instead (section rp: enemies, attack).
+  rp = { squadsPresent = "per copy by design; its two answers are compared instead (lane 79)" },
+  -- (lane 74) cart objects at the map's origin (classes Resource_Handcart_C, Resource_BigCart_C, Resource_TimberCart_C).
+  -- When a villager or an ox takes a cart the game retires the cart's object: it loses its game master and its
+  -- building's list entry, goes to 0,0,0 and stays a valid object until the engine's next garbage collection, which
+  -- each copy runs at its own time. The host's own game does this, with or without this mod's cart rules. Lane 74's
+  -- census on both copies (sittings word_f1 to f3, 300 s each, three readings a second, tools/objects74.py): valid
+  -- hand cart objects 9 to 23 on the host and 10 to 21 on the friend, of them at the origin 0 to 10 and 0 to 10; the
+  -- friend's count of ALL objects was outside the host's last 3 s for 209 to 221 of the 300 s, its count of the
+  -- carts that stand in the world for 0 s. No building lists a retired cart and the game's registry has no call
+  -- that counts them. Whether a retired cart can be seen at the origin was not measured; if so, each copy's own
+  -- game shows it without the mod as well. The row counts the carts that stand in the world; a building's own cart
+  -- list is compared in section "an" (Carts).
+  rr = { ["cart objects at 0,0,0"] = "retired carts waiting for each copy's own garbage collection: no game master, in no list (lane 74)" },
+}
+W.wideLeftOut = WIDE_LEFT_OUT
 local WIDE_LOLEN = 5                                                          -- "lo": lists from the fifth field on
 local WIDE_BY = {}
 for _, s in ipairs(WIDE) do WIDE_BY[s[1]] = s; if s.sparse then s.zero = string.rep("0", #s[2], "|") end end
@@ -934,6 +975,14 @@ end
 local function wv(o, n) local ok, v = pcall(gField, o, n); if ok then return wFmt(v) end; return "?" end                                   -- a simple value
 local function wl(o, n) local ok, v = pcall(gLen, o, n); if ok and type(v) == "number" then return v end; return "?" end                   -- a list: its length
 local function wp(o, n) local ok, x = pcall(gField, o, n); if not ok then return "?" end; return (ptrOk(x) and valid(x)) and "1" or "0" end  -- an object: there or not
+-- (lane 79) a region's "enemy units present" as the region view asks it (Region:areAnyEnemySquadsPresent, with
+-- includeEncamped as coop_realm.lua's claim guard asks it): 1 / 0 (a region without an owner always answers 0)
+local WIDE_ENCAMPED = true
+local function wAsk(r)
+  local ok, v = pcall(function() return r:areAnyEnemySquadsPresent(WIDE_ENCAMPED) end)
+  if not ok then return "?" end
+  return wFmt(v == true)
+end
 local function wo(o, n, P)                                                                                                             -- a building: its key
   local ok, x = pcall(gField, o, n); if not ok then return "?" end
   if not (ptrOk(x) and valid(x)) then return "-" end
@@ -941,6 +990,7 @@ local function wo(o, n, P)                                                      
   local ok2, k = pcall(W.bkey, x); return ok2 and k or "?"
 end
 
+local function wDying(r) local ok, d = pcall(function() return r.bActorIsBeingDestroyed end); return ok and d == true end   -- (lane 88; the reflected field: run p88a)
 local function wideWorld(P, S, only)
   if not (valid(S.eng) and valid(S.p1)) then error("world or lord is gone") end
   local eng = S.eng; local T = eng.TemporalComponent
@@ -959,20 +1009,53 @@ local function wideWorld(P, S, only)
     P.en.ENGINE = table.concat(t, "|")
   end
   if not only or only == "lo" then
-    t = {}; for i, f in ipairs(WIDE_BY.lo[2]) do t[i] = (i >= WIDE_LOLEN) and wl(S.p1, f) or wv(S.p1, f) end
+    t = {}
+    for i, f in ipairs(WIDE_BY.lo[2]) do
+      if f == "raidWarn" then
+        -- (lane 83) the raid warning a player reads (the proposed or running quest "raiders_near" and any other raid
+        -- quest): its days left and the day it was issued (with adjustDaysLeftToIssuedDay the shown count runs from
+        -- that day), by list, sorted; "-" when there is none. Lists read only within their length.
+        local w = {}
+        for _, l in ipairs({ "proposedQuests", "quests" }) do
+          pcall(function()
+            local a = S.p1[l]; local n = #a
+            for j = 1, n do
+              local q = a[j]; local okN, nm = pcall(function() return q.Name:ToString() end)
+              if okN and type(nm) == "string" and nm:find("raid") then
+                local dl, iss = "?", "?"
+                pcall(function() dl = tostring(math.floor(q.DaysLeft)) end); pcall(function() iss = tostring(math.floor(q.issuedOnDay)) end)
+                w[#w + 1] = l:sub(1, 1) .. ":" .. nm .. ":" .. dl .. ":" .. iss
+              end
+            end
+          end)
+        end
+        table.sort(w); t[i] = #w > 0 and table.concat(w, ",") or "-"
+      else t[i] = (i >= WIDE_LOLEN) and wl(S.p1, f) or wv(S.p1, f) end
+    end
     P.lo.LORD = table.concat(t, "|")
   end
   if not only or only == "rr" then
     -- (lane 71) Resource actors per class, deposits, deer lairs: a difference here is a work area that holds other things
     pcall(function()
       local cls = {}
+      -- (lane 88) an actor the game has destroyed reads valid until the engine's next garbage collection (each copy
+      -- collects every ~60 s at its own moment: run l88a, the host's felled trees 78 -> 66 at once); it is gone for the
+      -- player, so it is not counted
       for _, r in ipairs(FindAllOf("Resource") or {}) do
-        if valid(r) then
+        if valid(r) and not wDying(r) then
           local okN, n = pcall(function() local c = r:GetClass(); if valid(c) then return c:GetFName():ToString() end end)
           n = (okN and type(n) == "string") and n:gsub("[%s;|]", "_") or "?"
-          cls[n] = (cls[n] or 0) + 1
+          -- (lane 74) a retired cart is not counted (WIDE_LEFT_OUT.rr says why)
+          local retired = false
+          if n:find("Cart", 1, true) or n:find("cart", 1, true) then
+            pcall(function() local l = r:K2_GetActorLocation(); retired = math.abs(l.X) + math.abs(l.Y) <= 100 end)
+          end
+          if not retired then cls[n] = (cls[n] or 0) + 1 end
         end
       end
+      -- (lane 74) the cart classes are always in the row: a copy with no cart of a class standing says 0 (the class
+      -- was missing in its row then, and that day was not compared)
+      for _, n in ipairs({ "Resource_Handcart_C", "Resource_BigCart_C", "Resource_TimberCart_C" }) do cls[n] = cls[n] or 0 end
       for n, c in pairs(cls) do P.rr[n] = tostring(c) end
     end)
     P.rr.deposits = wl(eng, "deposits")
@@ -992,7 +1075,7 @@ local function wideRegion(P, r, only)
   if not only or only == "rp" then
     local pop, homeless = "-", "-"
     if town then pcall(function() pop = wFmt(r:getNumTotalPopulation()); homeless = wFmt(r:getNumHomelessFamilies()) end) end
-    P.rp[k] = wl(r, "workerFamilies") .. "|" .. wl(r, "residents") .. "|" .. pop .. "|" .. homeless .. "|" .. wl(r, "corpses") .. "|" .. wl(r, "squadsPresent")
+    P.rp[k] = wl(r, "workerFamilies") .. "|" .. wl(r, "residents") .. "|" .. pop .. "|" .. homeless .. "|" .. wl(r, "corpses") .. "|" .. wAsk(r) .. "|" .. wv(r, "isUnderAttack")
   end
   if not only or only == "ap" then
     -- approval's inputs as the game sums them: <factor type>[p = past]:<effect>, one per row of summedApprovalFactors
@@ -1035,7 +1118,7 @@ local function wideFamily(P, k, F, i)
   Check.note(P, "family", key)
 end
 
-local function wideBuilding(P, b, only)
+local function wideBuilding(P, b, only, place)
   local k = W.bkey(b)
   if P.bl[k] then P.dup = P.dup + 1; k = k .. "#" .. P.dup end        -- two buildings of one type on one spot
   local ba = addr(b); if ba then P.keyOf[ba] = k end                  -- for the families' homes and workplaces
@@ -1110,12 +1193,18 @@ local function wideBuilding(P, b, only)
     end
   end
   local X = rawget(C, "stats"); if (not only or only == "pt" or only == "ex") and X and X.wideBuilding then pcall(X.wideBuilding, P, b, k) end -- lane 72: sections pt, ex
-  if P.tag then W.wd.objects[k] = b end
+  -- (lane 64, round 5) the building's PLACE in the game's list is kept, never its handle: a handle kept past this
+  -- tick may point at freed memory by the time a watched field asks for it (findBuilding; session l64pin4)
+  if P.tag and place then W.wd.objects[k] = place end
+  if P.tag and C.traceF and rawget(C, "traceStale") then W.wd.shadow = W.wd.shadow or {}; W.wd.shadow[k] = b end      -- (test switch dev_trace.txt only: see staleLook)
   Check.note(P, "building", k)
 end
 
 local function wideNew(tag, day, done)
   local P = { times = {}, dup = 0, unc = {}, keyOf = {}, own = {} }
+  -- (lane 83) the production trackers' fields once a world: the check (settle22.py) classes pt nGoods internal only when
+  -- the panel's own words (yield, made, showProd) are among them
+  if W.wd and not W.wd.ptSpec then W.wd.ptSpec = true; log("wide pt fields %s", table.concat(WIDE_BY.pt[2], ",")); log("wide lo fields %s", table.concat(WIDE_BY.lo[2], ",")) end
   if tag ~= "bench" then P.tag = tostring(tag) end
   for _, s in ipairs(WIDE) do P[s[1]] = {} end
   return { tag = tag, day = day, done = done, P = P, phase = 1, i = 0, ri = 0, fi = 0, ms = 0, ticks = 0, t0 = os.clock() }
@@ -1175,7 +1264,7 @@ local function wideStep(S, st)
     if st.i > #arr then st.phase = 3; st.ri = 1; st.fi = 0; return 0 end
     local raw = arr[st.i]; st.lastB = addr(raw)
     local b = un(raw)
-    if valid(b) then local ok, e = pcall(wideBuilding, P, b); if not ok then P.err = tostring(e); P.berr = (P.berr or 0) + 1 end end
+    if valid(b) then local ok, e = pcall(wideBuilding, P, b, nil, st.i); if not ok then P.err = tostring(e); P.berr = (P.berr or 0) + 1 end end
     return 1
   elseif st.phase == 5 then                              -- 25 units per step: how many of each kind
     local arr = eng.unitArr; local n = #arr
@@ -1524,21 +1613,117 @@ local function fpRead(S, s, k, f, memo)
   end
   return "?"
 end
+-- (lane 64, round 5) A building for a watched field, by its key. W.wd.objects holds each key's PLACE in the game's
+-- building list (a number), and the handle is taken from that list in this tick: only a handle got from the game's
+-- own list in the frame of use is safe. Before, the day sample's handle itself was kept there and used after
+-- valid(): valid() reads the freed memory too and has said "true" for a freed object (lane 47, R4.2), and the call
+-- behind it (K2_GetActorLocation) then ends the copy inside the mod loader. This fits the close of the host in the pinned session l64pin4 (three
+-- protected calls deep, within 2 s of a day sample); it was not seen there with a trace.
+-- TEST SWITCH link/dev_trace.txt WITH THE WORD stale=1 ONLY (never in a player's game; the plain step trace does not
+-- run it): how often would the read of before this change
+-- have used a handle of a building that is gone? A shadow table keeps the handles exactly as the old code kept them
+-- (the day sample's handle per key; the whole table replaced by this tick's handles when a key missed). Before a
+-- kept handle would have been used, its address (the handle's own number: the object is not touched) is looked up
+-- among this tick's addresses of the game's building list. Not there = the old code was about to call IsValid and
+-- then K2_GetActorLocation on a building the game no longer lists. Only IsValid is asked here (as the old code did
+-- first; it has not closed a copy in lane 47's 19 tries); the call behind it is NOT made. One log line per case.
+-- the native piece's look at an address in the engine's object array (SNAP PROBE: the handle is not touched):
+-- "alive" (the array's entry is this object), "freed" (it is not), "?" (no native piece, another game build)
+local function nativeSays(a)
+  local P = rawget(C, "patch"); if not (P and P.fn and P.send and P.tick and P.dir) then return "?" end
+  local ok, s = pcall(function()
+    P.send(string.format("SNAP PROBE 0x%X", a)); P.tick()
+    local f = io.open(P.dir .. "snap_probe.txt", "rb"); local t = f and f:read("*a") or ""; if f then f:close() end
+    return t
+  end)
+  if not ok or type(s) ~= "string" or s == "" or s:find("refused", 1, true) or not s:find(string.format("%X flags", a), 1, true) then return "?" end
+  if s:find("SAME", 1, true) then return "alive" end
+  return "freed"
+end
+local function staleLook(S, k, memo)
+  local D = W.wd; D.shadow = D.shadow or {}; D.staleSaid = D.staleSaid or {}
+  local function looked()                                  -- this tick's handles by key and the list's addresses, once per check
+    if not memo.shFresh then
+      local map, live, dup = {}, {}, 0; local arr = S.eng.buildingArr
+      for j = 1, #arr do
+        local x = un(arr[j]); local a = addr(x); if a then live[a] = true end
+        if valid(x) then local key = W.bkey(x); if map[key] then dup = dup + 1; key = key .. "#" .. dup end; map[key] = x end
+      end
+      memo.shFresh, memo.liveAddr = map, live
+    end
+    return memo.shFresh
+  end
+  local h = D.shadow[k]
+  if h ~= nil then
+    looked(); local a = addr(h)
+    if a and memo.liveAddr[a] then return end             -- still in the game's list: the old read used it, rightly
+    local nat = a and nativeSays(a) or "?"
+    if nat == "alive" then
+      -- out of the game's list, not yet freed: IsValid is true and the old read went on using this handle at every
+      -- look, until the engine's clean-up frees the object
+      D.staleLooks = (D.staleLooks or 0) + 1
+      if not D.staleSaid[k] then
+        D.staleSaid[k] = os.clock(); D.staleN = (D.staleN or 0) + 1
+        log("stale: the read of before 0.2.7 uses a kept handle of %s, a building no longer in the game's list (address %X, not yet freed): it goes on using it at every look (case %d)", k, a, D.staleN)
+      end
+      return
+    end
+    local v = valid(h)
+    local since = D.staleSaid[k]; D.staleSaid[k] = nil
+    if not since then D.staleN = (D.staleN or 0) + 1 end
+    if nat == "freed" then D.staleFreed = (D.staleFreed or 0) + 1; if v then D.staleFatal = (D.staleFatal or 0) + 1 end end
+    log("stale: the kept handle of %s (address %X) is %s%s; IsValid says %s: %s (case %d; freed %d, of them IsValid true %d)",
+      k, a or 0, nat == "freed" and "FREED memory by the native look" or "of unknown state (no native look)",
+      since and string.format(", %.1f s after it left the game's list", os.clock() - since) or "", tostring(v),
+      (v and nat == "freed") and "THE OLD READ'S NEXT CALL, K2_GetActorLocation, WOULD HAVE RUN ON FREED MEMORY" or (v and "the old read's next call would have run on it" or "the old read would have looked the key up afresh (no call)"),
+      D.staleN or 0, D.staleFreed or 0, D.staleFatal or 0)
+  end
+  -- a key that missed: the old read looked every building up afresh and kept this tick's handles
+  local sh = {}; for key, x in pairs(looked()) do sh[key] = x end; D.shadow = sh
+end
+-- (test switch, word stale=1) the FIXED read's own count: every handle findBuilding hands out is looked up, by its
+-- address, among the addresses of the game's building list read in this same tick. "not of this tick" must stay 0.
+-- One line a minute: the fixed read's count beside what the read of before would have done.
+local function fixedCount(S, b, memo)
+  local D = W.wd; D.fixedUses = (D.fixedUses or 0) + 1
+  if not memo.liveAddr then
+    memo.liveAddr = {}; local arr = S.eng.buildingArr
+    for j = 1, #arr do local a = addr(un(arr[j])); if a then memo.liveAddr[a] = true end end
+  end
+  local a = addr(b)
+  if not (a and memo.liveAddr[a]) then D.fixedStale = (D.fixedStale or 0) + 1; log("stale: THE FIXED READ handed out a handle that is not in this tick's building list (address %X): case %d", a or 0, D.fixedStale) end
+  local c = os.clock()
+  if c - (D.fixedSaidT or 0) >= 60 then
+    D.fixedSaidT = c
+    log("stale: summary: the fixed read handed out %d handles, %d of them not of this tick's list | the read of before: %d kept handles of buildings gone from the list, %d looks at such a handle while not yet freed, %d found freed, of them IsValid true %d",
+      D.fixedUses, D.fixedStale or 0, D.staleN or 0, D.staleLooks or 0, D.staleFreed or 0, D.staleFatal or 0)
+  end
+end
+local findBuilding0
 findBuilding = function(S, k, memo)
-  local objects = W.wd.objects
-  local b = objects[k]
-  if valid(b) and W.bkey(b) == k then return b end
-  if not memo.buildings then
-    memo.buildings = {}; local arr = S.eng.buildingArr; local duplicates = 0
-    for i = 1, #arr do
-      local x = un(arr[i])
+  local b = findBuilding0(S, k, memo)
+  if b ~= nil and C.traceF and rawget(C, "traceStale") then pcall(fixedCount, S, b, memo) end
+  return b
+end
+findBuilding0 = function(S, k, memo)
+  local arr = S.eng.buildingArr
+  if C.traceF and rawget(C, "traceStale") then local okS, eS = pcall(staleLook, S, k, memo); if not okS and W.wd.staleErr ~= tostring(eS) then W.wd.staleErr = tostring(eS); log("stale look failed: %s", tostring(eS)) end end
+  local i = W.wd.objects[k]
+  if type(i) == "number" and i >= 1 and i <= #arr then      -- (never past the end: that would grow the game's list)
+    local b = un(arr[i])
+    if valid(b) and W.bkey(b) == (k:match("^([^#]+)#") or k) then return b end
+  end
+  if not memo.buildings then                                -- the list moved: every place again, once per check
+    memo.buildings = {}; local places = {}; local duplicates = 0
+    for j = 1, #arr do
+      local x = un(arr[j])
       if valid(x) then
         local key = W.bkey(x)
         if memo.buildings[key] then duplicates = duplicates + 1; key = key .. "#" .. duplicates end
-        memo.buildings[key] = x
+        memo.buildings[key] = x; places[key] = j
       end
     end
-    W.wd.objects = memo.buildings
+    W.wd.objects = places
   end
   return memo.buildings[k]
 end
@@ -1569,6 +1754,11 @@ local function read(S, s, k, f, memo)
       if f == "Inventory" then return wl(obj, f) elseif f ~= "goods" then return wv(obj, f) end
     elseif s == "hv" then return wv(obj, f)
     elseif s == "rw" then return (f == "expenses" or f == "marketAtt") and wl(obj, f) or wv(obj, f)
+    elseif s == "lo" and f == "raidWarn" then
+      -- (lane 83) the raid warning: the same reader as the row's (wideWorld), its last field
+      local P = { lo = {} }
+      if pcall(wideWorld, P, S, "lo") and P.lo.LORD then local last; for x in (P.lo.LORD .. "|"):gmatch("([^|]*)|") do last = x end; return last end
+      return "?"
     elseif s == "en" or s == "lo" then
       local o = s == "en" and S.eng or S.p1
       for i, name in ipairs(WIDE_BY[s][2]) do
@@ -1731,7 +1921,9 @@ function Check.section(tag, s, items, sample)
     local w = watch(s, x.k, x.f, tostring(tag))
     record(w, "friend", at, x.m)
     Check.proofFill(w, at)
-    batch.items[#batch.items + 1] = { w = w, at = at, initial = x.m, hostInitial = x.h }
+    -- (task 76e) taken before the host had 3 s of dated reads (see THE CHECK'S START at Check.proofTick)
+    local early = W.cfg.proof and at ~= nil and not (W.wd.hostProofAt and at >= W.wd.hostProofAt + 3) or false
+    batch.items[#batch.items + 1] = { w = w, at = at, initial = x.m, hostInitial = x.h, early = early }
     -- Allow final host observations to travel. Classification uses their read stamps.
     local now = Check.clock(W.S)
     local remaining = now and at and math.max(0, math.min(3, at + 3 - now)) or 3
@@ -1766,18 +1958,39 @@ end
 -- Positive evidence is a dated host read in the closed interval. For a negative
 -- result require observations across that interval. A gap, an error, or a late
 -- reply cannot establish either equality or a foreign value.
+-- (lane 76, task 76h) STALLS. The mod's tick runs once a frame (coop.lua: LoopInGameThreadAfterFrames(1)), and a
+-- value can be read only in a tick. Session l76s: for one minute the ticks of both copies came up to 0.72 s apart,
+-- and 15 stock readings were "undecided" for one reason alone: two reads of one copy more than 0.6 s apart. Between
+-- two ticks that follow each other there is no frame: that copy showed and held the value of the tick before, and no
+-- read was possible or missing. So the time between two FOLLOWING ticks that are over 0.25 s apart is dated as a
+-- stall (Check.tick; with the engine's frame counter when the game gives one: a wait with more than one frame in it
+-- is NOT a stall), the host's stalls go to the friends (W STALL), and the 0.6 s rule counts only the time outside
+-- stalls. The 3 s of the bar itself stay wall time: a value must still match a host read of the 3 s before it.
+local function covered(list, a, b)
+  local c = 0
+  if list and b > a then
+    for i = #list, 1, -1 do
+      local st = list[i]
+      if st.b <= a then break end
+      if st.a < b then c = c + math.min(b, st.b) - math.max(a, st.a) end
+    end
+  end
+  return c
+end
+local function apart(list, a, b) return (b - a) - covered(list, a, b) end      -- seconds between two reads outside stalls
 local function evidence(history, t, v)
   if v == "?" or v == "ERR" then return "unknown" end
+  local HS = W.wd.hostStalls
   local left, prev, gap = t - 3, nil, false
   for _, h in ipairs(history) do
     if h.t > t then break end
     if h.t >= left then
       if h.v == v then return "match" end
-      if h.v == "?" or h.v == "ERR" or h.t - (prev or left) > 0.6 then gap = true end
+      if h.v == "?" or h.v == "ERR" or apart(HS, prev or left, h.t) > 0.6 then gap = true end
       prev = h.t
     end
   end
-  if not prev or gap or t - prev > 0.6 then return "unknown" end
+  if not prev or gap or apart(HS, prev, t) > 0.6 then return "unknown" end
   return "outside"
 end
 local function classify(x)
@@ -1785,15 +1998,16 @@ local function classify(x)
   if not start then return false, false, false, false, true, "no-clock", "-", "-" end
   local deadline = start + 3
   local last, firstMatch, foreign, stale, unknown = nil, nil, false, false, false
+  local FS, HS = W.wd.stalls, W.wd.hostStalls
   table.sort(w.friend, function(a, b) return a.t < b.t end)
   for _, f in ipairs(w.friend) do
-    if f.t >= deadline and f.t <= deadline + 0.6 and (not last or f.t < last.t) then last = f end
+    if f.t >= deadline and apart(FS, deadline, f.t) <= 0.6 and (not last or f.t < last.t) then last = f end
   end
   table.sort(w.host, function(a, b) return a.t < b.t end)
   local previous = start
   for _, f in ipairs(w.friend) do
     if f.t >= start and f.t <= (last and last.t or deadline) then
-      if f.t - previous > 0.6 then unknown = true end
+      if apart(FS, previous, f.t) > 0.6 then unknown = true end
       previous = f.t
       local result = evidence(w.host, f.t, f.v)
       if result == "match" then
@@ -1807,7 +2021,7 @@ local function classify(x)
   unknown = unknown or atEnd == "unknown" or (atEnd == "match" and not firstMatch)
   local latest
   if last then for _, h in ipairs(w.host) do if h.t > last.t then break end; latest = h end end
-  if not latest or last.t - latest.t > 0.6 or latest.v == "?" or latest.v == "ERR" then unknown = true end
+  if not latest or apart(HS, latest.t, last.t) > 0.6 or latest.v == "?" or latest.v == "ERR" then unknown = true end
   return firstMatch ~= nil and atEnd == "match" and not unknown, atEnd == "outside", foreign, stale, unknown,
     last and string.format("%s@+%.3f", last.v, last.t - start) or "missing",
     latest and string.format("%s@%+.3f", latest.v, latest.t - start) or "missing",
@@ -1815,12 +2029,12 @@ local function classify(x)
 end
 -- Both sides use the host time scale. Keep every distinct read, including
 -- unchanged values, so gaps and the preceding three seconds can be audited.
-local function timeline(history, start, lead)
+local function timeline(history, start, lead, more)
   if not start then return "-" end
   local words, previous = {}, nil
   for _, r in ipairs(history) do
     local ms = math.floor((r.t - start) * 1000 + 0.5)
-    if ms >= lead and ms <= 3600 then
+    if ms >= lead and ms <= 3600 + (more or 0) then
       local word = tostring(ms) .. ":" .. r.v
       if word ~= previous then words[#words + 1] = word; previous = word end
     end
@@ -1828,17 +2042,19 @@ local function timeline(history, start, lead)
   return #words > 0 and table.concat(words, ";") or "-"
 end
 local function finish(batch)
-  local delay, past, foreign, stale, unknown = 0, 0, 0, 0, 0
+  local delay, past, foreign, stale, unknown, early = 0, 0, 0, 0, 0, 0
   for _, x in ipairs(batch.items) do
     local ok, p, f, old, u, value, hostValue, firstMatch = classify(x)
     if ok then delay = delay + 1 end; if p then past = past + 1 end
     if f then foreign = foreign + 1 end; if old then stale = stale + 1 end; if u then unknown = unknown + 1 end
-    log("settle-field %s %s %s %s initial=%s/%s recheck=%s/%s firstMatch=%s past=%d foreign=%d stale=%d unverified=%d at=%.3f hostMs=%s friendMs=%s",
+    if x.early then early = early + 1 end
+    log("settle-field %s %s %s %s initial=%s/%s recheck=%s/%s firstMatch=%s past=%d foreign=%d stale=%d unverified=%d at=%.3f hostMs=%s friendMs=%s" .. (x.early and " early=1" or ""),
       tostring(batch.tag), batch.s, x.w.k, x.w.f, tostring(x.hostInitial), x.initial, hostValue, value, firstMatch,
       p and 1 or 0, f and 1 or 0, old and 1 or 0, u and 1 or 0, x.at or 0,
-      timeline(x.w.host, x.at, -3000), timeline(x.w.friend, x.at, 0))
+      timeline(x.w.host, x.at, -3000, x.at and math.floor(covered(W.wd.hostStalls, x.at + 3, x.at + 5.6) * 1000 + 0.5)),
+      timeline(x.w.friend, x.at, 0, x.at and math.floor(covered(W.wd.stalls, x.at + 3, x.at + 5.6) * 1000 + 0.5)))
   end
-  log("settle %s %s sample=%d settled=%d past3=%d foreign=%d stale=%d unverified=%d",
+  log("settle %s %s sample=%d settled=%d past3=%d foreign=%d stale=%d unverified=%d" .. (early > 0 and (" early=" .. early) or ""),
     tostring(batch.tag), batch.s, #batch.items, delay, past, foreign, stale, unknown)
 end
 local function prior(tag, s, k, f)
@@ -1901,11 +2117,25 @@ local function proofState()
 end
 local function proofSecs(Pr)
   local text = tostring(W.cfg.proofSecs or "")
+  text = text .. "/" .. tostring(W.cfg.proofStockEvery) .. "/" .. tostring(W.cfg.proofNoted)
   if Pr.secText ~= text then
-    Pr.secText = text; Pr.secs = { building = {}, region = {}, family = {} }; Pr.secOn = {}
-    for s in text:gmatch("%l+") do
+    Pr.secText = text; Pr.secs = { building = {}, region = {}, family = {}, world = {} }; Pr.secOn = {}; Pr.noted = {}   -- (lane 83: world)
+    for s in tostring(W.cfg.proofSecs or ""):gmatch("%l+") do
       local group = proofGroup[s]
-      if WIDE_BY[s] and Pr.secs[group] then Pr.secs[group][#Pr.secs[group] + 1] = s; Pr.secOn[s] = true end
+      if WIDE_BY[s] and Pr.secs[group] then
+        Pr.secOn[s] = true
+        -- (a building's stock is read by the stock pass alone when that is on: see proofStock)
+        if not (s == "bs" and (tonumber(W.cfg.proofStockEvery) or 0) > 0) then Pr.secs[group][#Pr.secs[group] + 1] = s end
+      elseif s == "mk" and WIDE_BY.mk then
+        -- (lane 83) the market: its supply and base price are world rows, a region's prices region rows: read in both
+        Pr.secOn.mk = true; Pr.secs.world[#Pr.secs.world + 1] = "mk"; Pr.secs.region[#Pr.secs.region + 1] = "mk"
+      end
+    end
+    -- (lane 88) sections kept by their module's notes only (W.proofNote), not read by the rounds: fd, which the
+    -- fields module notes for every field every 0.25 s and at every change (read by the rounds it cost the host's
+    -- rounds half their pace in run l88a: 2,442 rounds in 1,313 s against 3,143 in 1,219 s)
+    for s in tostring(W.cfg.proofNoted or ""):gmatch("%l+") do
+      if WIDE_BY[s] and proofGroup[s] == "building" and not Pr.secOn[s] then Pr.secOn[s] = true; Pr.noted[s] = true end
     end
   end
   return Pr.secs
@@ -1922,6 +2152,7 @@ local function proofPut(Pr, key, row, t)
   end
   h.n = h.n + 1; h.t[h.n] = t; h.v[h.n] = row or false; h.c = Pr.cyc
   Pr.stat.reads = Pr.stat.reads + 1
+  if not Pr.firstT then Pr.firstT = t end                   -- (task 76e) the first dated read of this run of the proof
 end
 -- a building's key as the day scan names it; nil for an actor the game has cleared (type 0 or place 0,0)
 local function proofKey(b)
@@ -1939,6 +2170,12 @@ local function proofStep(S, J, Pr, t)
     sec(P, "N", function() return string.format("%d,%d,%d", S.p1.silver, S.p1.influence, S.p1.kingsFavour) end)
     sec(P, "Q", function() return fpSoldiers(S) end)
     for _, s in ipairs({ "W", "M", "N", "Q" }) do proofPut(Pr, s, P[s] ~= "ERR" and P[s] or "?", t) end
+    -- (lane 83) the wide world sections named in cfg.proofSecs (lo: the lord's open and proposed quests, lane 88's
+    -- row the check could not decide without the host's reads); a read that fails leaves a hole ("cannot be timed")
+    for _, s in ipairs(secs.world) do
+      local Pw = { [s] = {} }
+      if pcall(wideWorld, Pw, S, s) then for k, row in pairs(Pw[s]) do proofPut(Pr, s .. "~" .. k, row, t) end end
+    end
     J.regs = {}; J.F = {}; J.R = {}; J.S = {}; J.ri = 0
     local arr = eng.regions
     for i = 1, #arr do local r = un(arr[i]); if valid(r) then J.regs[#J.regs + 1] = r end end
@@ -1994,6 +2231,7 @@ local function proofStep(S, J, Pr, t)
   local base = k
   if J.seen[k] then J.dup = J.dup + 1; k = k .. "#" .. J.dup end; J.seen[base] = true
   local ba = addr(b); if ba then J.keyOf[ba] = k end
+  Pr.keyOf = J.keyOf
   for _, s in ipairs(secs.building) do
     local P = { dup = 0, keyOf = J.keyOf, own = J.own, bl = {} }; P[s] = {}
     if pcall(wideBuilding, P, b, s) then proofPut(Pr, s .. "~" .. k, P[s][base], t) else proofPut(Pr, s .. "~" .. k, "?", t) end
@@ -2019,7 +2257,7 @@ end
 local function proofEnd(Pr, t)
   local keep = W.cfg.proofKeep; local rows = 0
   for key, h in pairs(Pr.hist) do
-    if h.c ~= Pr.cyc then h.n = h.n + 1; h.t[h.n] = t; h.v[h.n] = false end              -- not found in this round
+    if h.c ~= Pr.cyc and not h.stock and not h.extra and not h.noted then h.n = h.n + 1; h.t[h.n] = t; h.v[h.n] = false end   -- not found in this round (a stock row: by its own pass; lane 83: an extra-pass row by that pass; lane 88: a noted row by its notes)
     while h.i <= h.n and t - h.t[h.i] > keep do h.t[h.i] = nil; h.v[h.i] = nil; h.i = h.i + 1 end
     if h.i > 64 then                                                                      -- move the kept reads to the front
       local nt, nv, m = {}, {}, 0
@@ -2034,8 +2272,217 @@ local function proofEnd(Pr, t)
   while e[1] and t - e[1] > keep do table.remove(e, 1) end
   Pr.stat.rows = rows; Pr.stat.cycles = Pr.stat.cycles + 1
 end
+-- The stock pass (lane 76, task 76g): a region's stock (the fingerprint's part S), a region's supplies (the wide row
+-- rw) and every building's stock row (bs), all read in ONE tick every cfg.proofStockEvery s, whatever the round is
+-- doing. Session l76p: at speed 8 a round took up to 0.99 s, and 22 stock readings could not be judged for want of a
+-- read every 0.6 s. A building this pass no longer finds is dated "not there" by this pass (not by the round's end).
+local function proofStock(S, Pr, t)
+  local eng = S.eng
+  Pr.scyc = (Pr.scyc or 0) + 1
+  local words = {}
+  local regs = eng.regions
+  for i = 1, #regs do
+    local r = un(regs[i])
+    if valid(r) then
+      local okK, k = pcall(W.rkey, r)
+      if okK and k then
+        local okM, own = pcall(function() return mine(r.ownerPawn) end)
+        if okM and own then local okW, _, _, sw = pcall(fpRegionWords, S, r, k); if okW and sw then words[#words + 1] = sw else words.bad = true end end
+        if Pr.secOn.rw then
+          local P = { rw = {} }
+          if pcall(wideRegion, P, r, "rw") then proofPut(Pr, "rw~" .. k, P.rw[k], t) else proofPut(Pr, "rw~" .. k, "?", t) end
+        end
+      end
+    end
+  end
+  table.sort(words)
+  proofPut(Pr, "S", words.bad and "?" or (#words > 0 and table.concat(words, "|") or "-"), t)
+  -- (lane 90) the army row Q in this pass too, every 0.2 s on each copy: read once a round it came 0.65 to 0.73 s
+  -- apart around a friend's day change (r27int2 day 420: 0, 727, 1442, 2091 ms), over the check's 0.6 s, and a rival
+  -- army's disband stayed "undecided" (r27int13 day 416, r27int2 day 420). See also W.proofQ.
+  local okQ, q = pcall(fpSoldiers, S)
+  proofPut(Pr, "Q", (okQ and q ~= "ERR") and q or "?", t)
+  local hq = Pr.hist.Q; if hq then hq.stock = true; hq.sc = Pr.scyc end
+  if not Pr.secOn.bs then return end
+  local arr = eng.buildingArr; local seen, keyOf, dup = {}, {}, 0
+  local was, keys, fresh = Pr.stockKeys, {}, {}                 -- (task 76e) the buildings of the pass before
+  for i = 1, #arr do
+    local b = un(arr[i])
+    if valid(b) then
+      local base = proofKey(b)
+      if base then
+        local k = base
+        if seen[base] then dup = dup + 1; k = base .. "#" .. dup end; seen[base] = true
+        keys[k] = true; if was and not was[k] then fresh[#fresh + 1] = { b = b, k = k, base = base } end
+        local ba = addr(b); if ba then keyOf[ba] = k end
+        local P = { dup = 0, keyOf = keyOf, own = {}, bl = {}, bs = {} }
+        if pcall(wideBuilding, P, b, "bs") then proofPut(Pr, "bs~" .. k, P.bs[base], t) else proofPut(Pr, "bs~" .. k, "?", t) end
+        local h = Pr.hist["bs~" .. k]; h.stock = true; h.sc = Pr.scyc
+      end
+    end
+  end
+  Pr.keyOf = keyOf
+  for _, h in pairs(Pr.hist) do
+    -- (every pass, not only the first: a series of "not there" with holes cannot be judged; session l76q, day 382)
+    if h.stock and h.sc ~= Pr.scyc and h.n >= h.i then h.n = h.n + 1; h.t[h.n] = t; h.v[h.n] = false end
+  end
+  -- (task 76e) A BUILDING THAT CAME OR WENT, dated in this pass for every row that names it, not only its stock row:
+  -- its place in the building list (bl) and the fingerprint's rows (B, C) were dated by the rounds alone, up to 0.5 s
+  -- later (session l76b, day 342: a building the host demolished, its bs and bl rows "poll limit"). An open watch is
+  -- told at once (W.proofTell), as a pile told gone is.
+  Pr.stockKeys = keys
+  if was then
+    for k in pairs(was) do
+      if not keys[k] then
+        W.proofTell(S, "bs", k, false, t)
+        for _, s in ipairs({ "bl", "B", "C" }) do
+          local h = Pr.hist[s .. "~" .. k]
+          if h and h.n >= h.i and h.v[h.n] ~= false and h.t[h.n] <= t then
+            h.n = h.n + 1; h.t[h.n] = t; h.v[h.n] = false; W.proofTell(S, s, k, false, t)
+          end
+        end
+        Pr.stat.went = (Pr.stat.went or 0) + 1; Pr.went = (Pr.went or 0) + 1
+      end
+    end
+    if Pr.secOn.bl then
+      for _, x in ipairs(fresh) do
+        local P = { dup = 0, keyOf = keyOf, own = {}, bl = {} }
+        if pcall(wideBuilding, P, x.b, "bl") and P.bl[x.base] ~= nil then
+          proofPut(Pr, "bl~" .. x.k, P.bl[x.base], t); W.proofTell(S, "bl", x.k, P.bl[x.base], t)
+        end
+        W.proofTell(S, "bs", x.k, Pr.hist["bs~" .. x.k] and Pr.hist["bs~" .. x.k].v[Pr.hist["bs~" .. x.k].n] or false, t)
+        Pr.stat.came = (Pr.stat.came or 0) + 1; Pr.came = (Pr.came or 0) + 1
+      end
+    end
+  end
+end
+-- (task 76e) THE CHECK'S START. A reading can be judged only against host reads of the 3 s before it. Sessions l76a
+-- and l76b: the game ran from the load, the day changed before the session script had switched the proof on, and the
+-- first day's sample was taken 0.1 to 0.2 s before the host's first dated read: 18 readings "undecided". So the host
+-- tells its friends the time of its first dated read (W PROOF <time>, at once and every 10 s), and a friend marks
+-- every reading taken less than 3 s after that time "early" (Check.section): logged in full with "early=1", counted
+-- apart by the session tools, never a pass. A proof that did not run for 5 s starts again (a new first read).
+-- (lane 83, the lead's item 3 of 2026-11-20) Building sections the rounds do not read (house fuel hv, fields fd,
+-- maintenance mt, production trackers pt ...) left most of their differing readings "unverified": the host had no read
+-- within 0.6 s of the friend's. Put into the rounds (cfg.proofSecs) they starved the rounds (run 18: hv and fd alone
+-- took the rounds from 173 to about 100 a minute and the row gaps over 0.55 s from about 1,000 to 14,000-22,000 a
+-- minute). So they get a pass of their own: a CYCLE over every building's rows of the sections in cfg.proofExtraSecs,
+-- started at most every cfg.proofExtraEvery s and spread over as many ticks as it needs, at most cfg.proofExtraMs a
+-- tick, after the stock pass (session l83r3: done in one tick it took 50-160 ms and delayed the next tick's stock
+-- pass). It starts only once the stock pass has run and a round has ended (l83r3c: the first cycle, right after the
+-- switch, left the host's region stock unread for over 0.6 s). A row the cycle no longer finds is dated "not there"
+-- at the cycle's end; a row first seen after the first cycle (a new building) is "not there" at the cycle before
+-- (not at every kept round end: those reads never happened).
+-- Off unless the session check names the sections. Each copy runs it (a friend's own series too: Check.proofFill).
+local function proofExtraSecs(Pr)
+  local secs = {}
+  for s in tostring(W.cfg.proofExtraSecs or ""):gmatch("%l+") do if WIDE_BY[s] and proofGroup[s] == "building" then secs[#secs + 1] = s; Pr.secOn[s] = true end end
+  return secs
+end
+-- one slice of the cycle: -> true when the cycle ended in it
+local function proofExtra(S, Pr, t, untilC)
+  local X = Pr.x
+  if not X then
+    local list, arr = {}, S.eng.buildingArr
+    for i = 1, #arr do list[#list + 1] = un(arr[i]) end
+    Pr.xcyc = (Pr.xcyc or 0) + 1
+    X = { list = list, i = 1, seen = {}, dup = 0, secs = proofExtraSecs(Pr), c0 = os.clock() }; Pr.x = X
+  end
+  Pr.xrows = Pr.xrows or {}; local xrows = Pr.xrows   -- the cycle's own rows (the "not there" loop below)
+  local secs = X.secs
+  while X.i <= #X.list do
+    local b = X.list[X.i]; X.i = X.i + 1
+    if valid(b) then
+      local base = proofKey(b)
+      if base then
+        local k = base
+        if X.seen[base] then X.dup = X.dup + 1; k = base .. "#" .. X.dup end; X.seen[base] = true
+        for _, s in ipairs(secs) do
+          local P = { dup = 0, keyOf = Pr.keyOf or {}, own = {}, bl = {} }; P[s] = {}
+          local key = s .. "~" .. k
+          local ok = pcall(wideBuilding, P, b, s)
+          local row = ok and P[s][base] or (not ok and "?") or nil
+          if row ~= nil or Pr.hist[key] then
+            if not Pr.hist[key] then
+              local h = { t = {}, v = {}, i = 1, n = 0 }; Pr.hist[key] = h
+              if Pr.xend then h.n = 1; h.t[1] = Pr.xend; h.v[1] = false end
+            end
+            proofPut(Pr, key, row, t); local h = Pr.hist[key]; h.extra = true; h.xc = Pr.xcyc; xrows[key] = h
+          end
+        end
+      end
+    end
+    if os.clock() >= untilC then break end
+  end
+  if X.i <= #X.list then return false end
+  for key, h in pairs(xrows) do
+    if Pr.hist[key] ~= h then xrows[key] = nil
+    elseif h.xc ~= Pr.xcyc and h.n >= h.i and h.v[h.n] ~= false then h.n = h.n + 1; h.t[h.n] = t; h.v[h.n] = false end
+  end
+  Pr.xend = t; Pr.x = nil
+  return true, os.clock() - X.c0
+end
 function Check.proofTick(S)
   local Pr = proofState(); local c0 = os.clock(); local st = Pr.stat
+  if Pr.lastC and c0 - Pr.lastC > 5 then Pr.firstT = nil; Pr.tellC = nil end
+  Pr.lastC = c0
+  if S.role == "host" and Pr.firstT and c0 - (Pr.tellC or -1e9) >= 10 then
+    Pr.tellC = c0; send(string.format("W PROOF %.3f", Pr.firstT))
+  end
+  -- the stock rows first, and never cut short
+  local every = tonumber(W.cfg.proofStockEvery) or 0
+  -- (task 76e) DENSE PASSES: for 1.5 s after the building list changed its length, or after a town action
+  -- (W.proofDense, coop_town.lua: sent or carried out here), the stock pass runs in every tick, so a building that
+  -- came or went is dated within one frame on each copy (session l76b, day 342: "poll limit")
+  local okN, nb = pcall(function() return #S.eng.buildingArr end)
+  if okN and Pr.lastNB and nb ~= Pr.lastNB and W.cfg.proofDense ~= false then Pr.denseUntil = math.max(Pr.denseUntil or 0, c0 + 1.5) end
+  if okN then Pr.lastNB = nb end
+  local dense = Pr.denseUntil ~= nil and c0 < Pr.denseUntil
+  if dense then st.dense = (st.dense or 0) + 1; Pr.dense = (Pr.dense or 0) + 1 end
+  if every > 0 and (dense or c0 - (Pr.stockC or -1e9) >= every) then
+    local ts = Check.clock(S)
+    if ts then
+      proofSecs(Pr)
+      if Pr.stockC and c0 - Pr.stockC > (st.stockGap or 0) then st.stockGap = c0 - Pr.stockC end
+      if Pr.stockC and c0 - Pr.stockC > 0.55 then st.stockLate = (st.stockLate or 0) + 1 end
+      Pr.stockC = c0
+      local ok, e = pcall(proofStock, S, Pr, ts)
+      if not ok then st.err = tostring(e); st.errs = (st.errs or 0) + 1 end
+      local ms = (os.clock() - c0) * 1000
+      st.stockN = (st.stockN or 0) + 1; st.stockMs = (st.stockMs or 0) + ms
+      if ms > (st.stockMax or 0) then st.stockMax = ms end
+    end
+  end
+  -- (lane 83) a slice of the extra building sections' cycle (see proofExtra): after the stock pass, at most
+  -- cfg.proofExtraMs of this tick; a new cycle at most every cfg.proofExtraEvery s, and not before the stock pass ran
+  -- and a round ended
+  local xe = tonumber(W.cfg.proofExtraEvery) or 0
+  if xe > 0 and (W.cfg.proofExtraSecs or "") ~= "" and Pr.stockC and Pr.cyc >= 2
+      and (Pr.x or c0 - (Pr.extraC or -1e9) >= xe - 1e-6) then
+    local tx = Check.clock(S)
+    if tx then
+      local x0 = os.clock()
+      if not Pr.x then
+        proofSecs(Pr)
+        -- cycle starts on a fixed grid; after a cycle longer than the period the next one starts at once
+        if Pr.extraC and x0 - Pr.extraC < 2 * xe then Pr.extraC = Pr.extraC + xe else Pr.extraC = x0 end
+      end
+      local okX, ended, long = pcall(proofExtra, S, Pr, tx, x0 + (tonumber(W.cfg.proofExtraMs) or 16) / 1000)
+      if not okX then st.err = tostring(ended); st.errs = (st.errs or 0) + 1; Pr.x = nil
+      elseif ended then st.extraN = (st.extraN or 0) + 1; if long > (st.extraGap or 0) then st.extraGap = long end end
+      local msx = (os.clock() - x0) * 1000
+      st.extraMs = (st.extraMs or 0) + msx
+      if msx > (st.extraMax or 0) then st.extraMax = msx end
+    end
+  end
+  -- (the mod's ticks themselves: the longest wait between two, and how many over 0.3 s)
+  if Pr.tickC then
+    local gap = c0 - Pr.tickC
+    if gap > (st.tickGap or 0) then st.tickGap = gap end
+    if gap > 0.3 then st.tickLate = (st.tickLate or 0) + 1 end
+  end
+  Pr.tickC = c0
+  c0 = os.clock()
   if not Pr.job then
     if c0 - (Pr.startC or -1e9) < W.cfg.proofEvery then return end
     Pr.cyc = Pr.cyc + 1; Pr.startC = c0; Pr.job = { phase = 1 }
@@ -2060,6 +2507,12 @@ function Check.proofTick(S)
     log("proof parts (ms a second): world %.1f, regions %.1f, buildings %.1f, families %.1f", st.part[1] / (c0 - st.c0), st.part[2] / (c0 - st.c0), st.part[3] / (c0 - st.c0), st.part[4] / (c0 - st.c0))
     log("proof: %d rounds in %.0f s, %d rows, %d reads, %.2f ms a second, worst tick %.1f ms, longest round %.3f s, longest gap between two reads of a row %.3f s, gaps over 0.55 s %d, fields served %d%s",
       st.cycles, c0 - st.c0, st.rows, st.reads, st.ms / (c0 - st.c0), st.maxTick, st.maxCycle or 0, st.maxGap, st.gaps, st.ids, st.err and (", read errors " .. tostring(st.errs) .. " (" .. st.err .. ")") or "")
+    if (st.extraN or 0) > 0 then log("proof extra (%s): %d cycles in %.0f s, %.2f ms a second, longest slice %.1f ms, longest cycle %.3f s", tostring(W.cfg.proofExtraSecs), st.extraN, c0 - st.c0, (st.extraMs or 0) / (c0 - st.c0), st.extraMax or 0, st.extraGap or 0) end
+    log("proof stock: %d passes in %.0f s, %.2f ms a second, longest pass %.1f ms, longest wait between two passes %.3f s, waits over 0.55 s %d; the mod's ticks: longest wait %.3f s, waits over 0.3 s %d",
+      st.stockN or 0, c0 - st.c0, (st.stockMs or 0) / (c0 - st.c0), st.stockMax or 0, st.stockGap or 0, st.stockLate or 0, st.tickGap or 0, st.tickLate or 0)
+    Pr.stockLate = (Pr.stockLate or 0) + (st.stockLate or 0); Pr.tickLate = (Pr.tickLate or 0) + (st.tickLate or 0)
+    if (st.stockGap or 0) > (Pr.stockGap or 0) then Pr.stockGap = st.stockGap end
+    if (st.tickGap or 0) > (Pr.tickGap or 0) then Pr.tickGap = st.tickGap end
     Pr.total = Pr.total or { ms = 0, s = 0, maxTick = 0, maxGap = 0, gaps = 0, cycles = 0, reads = 0, ids = 0, errs = 0 }
     local T = Pr.total
     T.ms = T.ms + st.ms; T.s = T.s + (c0 - st.c0); T.cycles = T.cycles + st.cycles; T.reads = T.reads + st.reads; T.gaps = T.gaps + st.gaps; T.ids = T.ids + st.ids
@@ -2108,19 +2561,159 @@ function Check.proofServe(id, s, k, f, history)
   if n > 0 then Pr.stat.ids = Pr.stat.ids + 1 end
   return n
 end
+-- A stock row read outside the rounds (lane 76, task 76f): the facts module calls this on the host when its pass
+-- has read a building's changed stock, and on a friend when it has written a building's stock. So the kept reads
+-- hold every stock value a friend can show at the moment the host read it, and a friend's change at its own moment:
+-- a round every 0.25 s could miss a value the host held for less than that (session l76k: "poll limit").
+-- (task 76g) A note goes to the fields that are being watched right now as well: the host's as a W OBS line with the
+-- note's own time, a friend's into its own series. Session l76p: a friend showed 5 at +2.220 s, 20 ms before the
+-- host's next read every 0.18 s showed it; the host's note of that value (its own read, earlier) lay in the kept
+-- reads, which are sent only when a watch is opened, so it never reached the friend ("host changed between two reads").
+function W.proofTell(S, s, k, row, t)
+  local D = W.wd; local now = os.clock(); local items = {}
+  for id, w in pairs(D.watches or {}) do
+    if w.s == s and w.k == k and now <= (w.untilT or 0) then
+      local v = proofValue(s, k, w.f, row)
+      if v ~= nil then
+        if S.role == "host" then items[#items + 1] = id .. "=" .. tostring(v) else record(w, "friend", t, v) end
+      end
+    end
+  end
+  if #items > 0 then sendList(string.format("W OBS %.3f ", t), items, ";") end
+end
+-- (lane 88) s: the wide section of the row (default "bs", the stock). The fields module notes "fd" on the host at
+-- every poll that sent a field's change (the counted numbers a friend will show are the host's at that poll; the
+-- rounds every 0.2 s missed values a harvest held for less than that: r27m83 "never had" 194 between the host's
+-- reads 196 and 192), and on a friend when it has written the host's change. A sparse section's row that is
+-- the default is "not there" (false), as the rounds keep it.
+function W.proofNote(b, fromSnap, s)
+  if not W.cfg.proof then return false end
+  s = s or "bs"
+  local S = W.S; local D = W.wd; local Pr = D and D.proof
+  if not (S and Pr and Pr.secOn and Pr.secOn[s] and WIDE_BY[s] and valid(b)) then return false end
+  local t = Check.clock(S); if not t then return false end
+  local base = proofKey(b); if not base then return false end
+  local ba = addr(b)
+  local k = Pr.keyOf and ba and Pr.keyOf[ba] or base            -- the name the last round gave it (two buildings on one spot)
+  local h = Pr.hist[s .. "~" .. k]
+  if h and h.n >= h.i and h.t[h.n] > t then return false end   -- never out of order
+  local P = { dup = 0, keyOf = {}, own = {}, bl = {} }; P[s] = {}
+  if not pcall(wideBuilding, P, b, s) then return false end
+  local row = P[s][base]
+  if row == nil then if WIDE_BY[s].sparse then row = false else return false end end
+  proofPut(Pr, s .. "~" .. k, row, t)
+  local hn = Pr.hist[s .. "~" .. k]; if s == "bs" and (tonumber(W.cfg.proofStockEvery) or 0) > 0 then hn.stock = true; hn.sc = Pr.scyc end
+  if Pr.noted and Pr.noted[s] then hn.noted = true end
+  Pr.stat.notes = (Pr.stat.notes or 0) + 1; Pr.notes = (Pr.notes or 0) + 1
+  W.proofTell(S, s, k, row, t)
+  -- (task 76e) THE STOCK AS SENT. The host's pass sends a building's goods from the native table (coop_snap.lua, read
+  -- at a frame's start, up to 0.1 s before this tick), and the note above reads the live object: a value the host held
+  -- for under that time was sent but never dated (session l76y, day 402: a friend showed good 30 and the pantry
+  -- counter 6 where the host's dated reads went 5, then 7). So the row of that table is dated as well, at the table's
+  -- own moment: its counters, its record count and its goods, in the form of the live row.
+  if fromSnap and s == "bs" and S.role == "host" then
+    local N = rawget(C, "snap")
+    local ok, r = pcall(function() return N and N.building(ba or 0) end)
+    if ok and r and type(r.inv) == "table" and (r.invN or 999) <= 160 and r.nsg and r.nsl and r.nsp and N.tabT then
+      local live = P.bs[base]; local goodsPart = live:match("|([^|]*)$")
+      local goods = "-"
+      if goodsPart ~= "-" then
+        local g = {}; for ty, a in pairs(r.inv) do if a ~= 0 then g[#g + 1] = string.format("%d:%d", ty, a) end end
+        table.sort(g); goods = #g > 0 and table.concat(g, ",") or "0"
+      end
+      local row = wFmt(r.nsg) .. "|" .. wFmt(r.nsl) .. "|" .. wFmt(r.nsp) .. "|" .. tostring(r.invN) .. "|" .. goods
+      local tS = t - math.max(0, os.clock() - N.tabT)
+      local hs = Pr.hist["bs~" .. k]
+      if row ~= live and tS < t and hs and hs.n >= hs.i and tS > hs.t[hs.i] then
+        local j = hs.n
+        while j >= hs.i and hs.t[j] > tS do hs.t[j + 1] = hs.t[j]; hs.v[j + 1] = hs.v[j]; j = j - 1 end
+        hs.t[j + 1] = tS; hs.v[j + 1] = row; hs.n = hs.n + 1
+        Pr.stat.snapNotes = (Pr.stat.snapNotes or 0) + 1; Pr.snapNotes = (Pr.snapNotes or 0) + 1
+        W.proofTell(S, "bs", k, row, tS)
+      end
+    end
+  end
+  return true
+end
+-- (task 76g) A building that is gone, dated at the moment this copy knows it: the facts module calls this on the host
+-- in the tick it tells a pile "gone", and on a friend in the tick it removes the pile. Session l76p, day 349: the
+-- friend removed its pile 0.41 s after the sample on the host's word, the host's next read that found it gone came
+-- at 0.53 s: the proof could not show that the host was first.
+function W.proofGone(key)
+  if not W.cfg.proof then return false end
+  local S = W.S; local D = W.wd; local Pr = D and D.proof
+  if not (S and Pr and Pr.secOn and type(key) == "string") then return false end
+  local t = Check.clock(S); if not t then return false end
+  local n = 0
+  for _, s in ipairs({ "bs", "bl" }) do
+    local h = Pr.secOn[s] and Pr.hist[s .. "~" .. key]
+    if h and h.n >= h.i and h.t[h.n] <= t and h.v[h.n] ~= false then
+      h.n = h.n + 1; h.t[h.n] = t; h.v[h.n] = false; n = n + 1
+      W.proofTell(S, s, key, false, t)
+    end
+  end
+  if n > 0 then Pr.gone = (Pr.gone or 0) + 1 end
+  return n > 0
+end
+-- (lane 90) THE ARMY AS IT IS NOW, dated in the tick a copy's squads changed. The core (coop.lua) calls this on the
+-- host in the tick it announced a new squad (N), said one is gone (G), sent a death (D) or saw a rout begin or end,
+-- and on a friend in the tick it made the host's new squads. Lane 90's logs: a rival's squad the host made and took
+-- away within half a second was never in the host's dated reads (one a round; l7b: the read 0.16 s after the
+-- announcement said 0), so every friend reading of it was "never had". Open watches of an army are told at once
+-- (as W.proofTell does for a row). why: a few words for the log (N and G only; a death is not logged).
+function W.proofQ(why)
+  if not W.cfg.proof then return false end
+  local S = W.S; local D = W.wd; local Pr = D and D.proof
+  if not (S and Pr) then return false end
+  local t = Check.clock(S); if not t then return false end
+  local h = Pr.hist.Q
+  if h and h.n >= h.i and h.t[h.n] > t then return false end   -- never out of order
+  local ok, word = pcall(fpSoldiers, S)
+  local row = (ok and word ~= "ERR") and word or "?"
+  proofPut(Pr, "Q", row, t)
+  h = Pr.hist.Q; if h then h.stock = true; h.sc = Pr.scyc end
+  Pr.qNotes = (Pr.qNotes or 0) + 1
+  local items, now = {}, os.clock()
+  for id, w in pairs(D.watches or {}) do
+    if w.s == "Q" and now <= (w.untilT or 0) then
+      local v = proofValue("Q", w.k, w.f, row)
+      if S.role == "host" then items[#items + 1] = id .. "=" .. tostring(v) else record(w, "friend", t, v) end
+    end
+  end
+  if #items > 0 then sendList(string.format("W OBS %.3f ", t), items, ";") end
+  if why then log("army note at %.3f (%s): %s", t, tostring(why), row == "" and "none" or row) end
+  return true
+end
 function W.proofStat()
   local D = W.wd; local Pr = D and D.proof
   if not Pr then return "proof: off or no round yet" end
   local st, T = Pr.stat, Pr.total or { ms = 0, s = 0, maxTick = 0, maxGap = 0, gaps = 0, cycles = 0, reads = 0, ids = 0, errs = 0 }
   local s = T.s + (os.clock() - st.c0)
-  return string.format("proof %s: %d rounds in %.0f s, %d rows, %d reads, %.2f ms a second, worst tick %.1f ms, longest gap %.3f s, gaps over 0.55 s %d, fields served %d, read errors %d",
+  return string.format("proof %s: %d rounds in %.0f s, %d rows, %d reads, %.2f ms a second, worst tick %.1f ms, longest gap %.3f s, gaps over 0.55 s %d, fields served %d, read errors %d, stock notes %d",
     W.cfg.proof and "on" or "off", T.cycles + st.cycles, s, st.rows, T.reads + st.reads, s > 0 and (T.ms + st.ms) / s or 0, math.max(T.maxTick, st.maxTick), math.max(T.maxGap, st.maxGap),
-    T.gaps + st.gaps, T.ids + st.ids, T.errs + (st.errs or 0))
+    T.gaps + st.gaps, T.ids + st.ids, T.errs + (st.errs or 0), Pr.notes or 0)
+    .. string.format("; stock passes: longest wait %.3f s, waits over 0.55 s %d; ticks: longest wait %.3f s, waits over 0.3 s %d; gone notes %d",
+      math.max(Pr.stockGap or 0, st.stockGap or 0), (Pr.stockLate or 0) + (st.stockLate or 0), math.max(Pr.tickGap or 0, st.tickGap or 0), (Pr.tickLate or 0) + (st.tickLate or 0), Pr.gone or 0)
+    .. string.format("; dense ticks %d, buildings dated as they came %d, as they went %d", Pr.dense or 0, Pr.came or 0, Pr.went or 0)
+end
+-- (task 76e) the stock pass in every tick for <seconds> (see DENSE PASSES at Check.proofTick): coop_town.lua calls it
+-- when a town action is sent or carried out on this copy
+function W.proofDense(seconds)
+  if not W.cfg.proof or W.cfg.proofDense == false then return false end   -- (cfg.proofDense = false: the test's control)
+  local D = W.wd; local Pr = D and D.proof
+  if not Pr then return false end
+  Pr.denseUntil = math.max(Pr.denseUntil or 0, os.clock() + (tonumber(seconds) or 1.5))
+  return true
 end
 function Check.receive(S, from, msg)
   local D = W.wd
   local tag, section = msg[5], msg[6]
-  if msg[4] ~= "OBS" and (not tag or not tag:match("^n?%d+$")) then return end
+  if msg[4] ~= "OBS" and msg[4] ~= "STALL" and msg[4] ~= "PROOF" and (not tag or not tag:match("^n?%d+$")) then return end
+  if S.role == "friend" and from == "host" and msg[4] == "PROOF" then
+    local t = tonumber(tag)
+    if t and t ~= D.hostProofAt then D.hostProofAt = t; log("proof host first read %.3f", t) end
+    return
+  end
   if S.role == "friend" and from == "host" and msg[4] == "PRE" then
     local stamp = tonumber(section)
     if not stamp or (tonumber(tag) and W.day and math.abs(tonumber(tag) - W.day) > 4) then return end
@@ -2163,6 +2756,7 @@ function Check.receive(S, from, msg)
     for id in (msg[6] or ""):gmatch("[^;]+") do
       local s, k, f = descriptor(id)
       if s then
+        if C.traceF then C.trace("world WATCH " .. id) end         -- (test switch dev_trace.txt only)
         watch(s, k, f)
         Check.proofServe(id, s, k, f, history)
         for _, tag in ipairs((WIDE_BY[s] and D.samples.order or D.fpSamples.order) or {}) do
@@ -2174,6 +2768,17 @@ function Check.receive(S, from, msg)
       end
     end
     for t, items in pairs(history) do sendList(string.format("W OBS %.3f ", t), items, ";") end
+  elseif S.role == "friend" and from == "host" and msg[4] == "STALL" then
+    local a, b = tonumber(msg[5]), tonumber(msg[6])
+    if a and b and b > a and b - a < 30 then
+      D.hostStalls = D.hostStalls or {}
+      local n = #D.hostStalls
+      if n == 0 or D.hostStalls[n].b <= a then
+        D.hostStalls[n + 1] = { a = a, b = b }
+        if n >= 400 then table.remove(D.hostStalls, 1) end
+        log("stall host %.3f %.3f frames=%s", a, b, tostring(msg[7] or "?"))
+      end
+    end
   elseif S.role == "friend" and from == "host" and msg[4] == "OBS" then
     local t = tonumber(msg[5])
     for id, v in (msg[6] or ""):gmatch("([^;=]+)=([^;]+)") do
@@ -2194,12 +2799,43 @@ function Check.tick(S)
     end
     D.ask = nil
   end
-  if W.cfg.proof then Check.proofTick(S) end
+  if W.cfg.proof then
+    -- (task 76h) a stall: this tick came over 0.25 s after the one before (see "STALLS" above evidence)
+    local tc = Check.clock(S)
+    local fr
+    if not W.noFrame then
+      local okF, n = pcall(function()
+        local K = S.KSL; if not valid(K) then K = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary"); S.KSL = K end
+        return K:GetFrameCount()
+      end)
+      if okF and type(n) == "number" then fr = n else W.noFrame = true end
+    end
+    if tc and D.tickT and D.tickC then
+      local wait = now - D.tickC
+      -- (the friend's clock is the host's time: a wait is dated only when both clocks agree on its length)
+      -- (and only between two ticks of the core that follow each other: S.ticks)
+      if wait > 0.25 and wait < 30 and math.abs((tc - D.tickT) - wait) < 0.05 and S.ticks and D.stallTick and S.ticks - D.stallTick == 1 then
+        local frames = (fr and D.tickF) and (fr - D.tickF) or nil
+        if frames and frames ~= 1 then
+          log("stall not counted %.3f %.3f frames=%d (more than one frame between two ticks of the mod)", D.tickT, tc, frames)
+        else
+          D.stalls = D.stalls or {}
+          D.stalls[#D.stalls + 1] = { a = D.tickT, b = tc }
+          if #D.stalls > 400 then table.remove(D.stalls, 1) end
+          if S.role == "host" then send(string.format("W STALL %.3f %.3f %s", D.tickT, tc, frames and tostring(frames) or "?")) end
+          log("stall %s %.3f %.3f frames=%s", S.role == "host" and "host" or "here", D.tickT, tc, frames and tostring(frames) or "?")
+        end
+      end
+    end
+    D.tickT = tc; D.tickC = now; D.tickF = fr; D.stallTick = S.ticks   -- (not D.tickN: that is the wide sample's own count of ticks)
+    Check.proofTick(S)
+  end
   if now < (D.checkNext or 0) then return end
   D.checkNext = now + 0.18
   local memo, frames = {}, {}; local t = Check.clock(S)
   for id, w in pairs(D.watches) do
     if now <= w.untilT then
+      if C.traceF then C.trace("world check read " .. id) end      -- (test switch dev_trace.txt only)
       local ok, v = pcall(read, S, w.s, w.k, w.f, memo)
       v = (ok and v ~= nil) and tostring(v) or "?"
       local stamp = Check.clock(S)
@@ -2324,16 +2960,26 @@ local function wideTick(S)
       if not ok then widePostFailed(J, done) end
       if not ok or done then table.remove(D.posts, 1); break end
     end
-  elseif D.run then
+  end
+  -- (lane 76, task 76g) When a game day is short in ticks the next sample is read in the same ticks in which the last
+  -- one is still sent or compared, and a tick may take what the last sample cost, spread over four tenths of a day
+  -- (at most 12 ms). Session l76p, speed 8: a sample of 143 ms at 2 ms a tick needed more ticks than a day had (30),
+  -- and waited behind the comparison of the day before: the samples of days 405 and 407 were left out.
+  local short = D.tpd and D.tpd < 240
+  if D.run and (short or not J) then
+    local t1 = os.clock()
+    local limit = 0.002
+    if short and D.wideLastMs and D.tpd > 0 then limit = math.min(0.012, math.max(0.002, D.wideLastMs / 1000 / (D.tpd * 0.4))) end
     local st = D.run; local work = 0; st.ticks = st.ticks + 1; local fin = false
-    while work < (st.rate or W.cfg.wideWork) do
+    while work < (st.rate or W.cfg.wideWork) or (limit > 0.002 and os.clock() - t1 < limit) do
       local w = wideStep(S, st)
       if w == nil then fin = true; break end
       work = work + w
-      if os.clock() - t0 >= 0.002 then break end         -- second guard: never much more than 2 ms in one tick
+      if os.clock() - t1 >= limit then break end         -- second guard: never much more than 2 ms in one tick (a short day: see above)
     end
-    st.ms = st.ms + (os.clock() - t0) * 1000
+    st.ms = st.ms + (os.clock() - t1) * 1000
     if fin then
+      D.wideLastMs = st.ms
       D.run = nil
       local ok, e = pcall(wideFinish, st); if not ok then bump("w_err"); log("wide %s failed: %s", tostring(st.tag), tostring(e)) end
     end
@@ -2558,6 +3204,41 @@ local function settle(k, r, last, key, v, full, items)
   local c = os.clock()
   if not p then P[key] = { v = v, t = c, t0 = c, f = W.frameN or 0, r = r }
   elseif p.v ~= v then p.v = v; p.t = c; p.f = W.frameN or 0; p.r = r end   -- the first change's time (t0) stays
+end
+-- (lane 76, task 76e round 3) THE REGION TOTALS' FAST LOOK, host, exact mode. The totals were looked at by the region
+-- pass every 0.25 s (a job, cut into steps), then held cfg.confirm s; l7i and l7l: the host's change to its send took
+-- 0.33 to 0.40 s at the median, up to 1.12 s. Now the native region table (coop_snap.lua, read ten times a second)
+-- names the regions whose totals changed, and their changed goods enter the same wait (settle) in that tick; the wait
+-- itself (a value held 0.3 s goes out, lane 51) is not changed. Only regions the pass has sent once (W.sent.reg).
+function W.hostFastTotals(S)
+  local N = rawget(C, "snap"); if not (N and N.takeChangedRegions and N.tabs) then return end
+  local ch = N.takeChangedRegions(); if not ch then return end
+  local T = N.tabs[1]; if not T then return end
+  W.regByAddr = W.regByAddr or {}
+  local n = 0
+  for a in pairs(ch) do
+    local rec = T.by[a]
+    local r = W.regByAddr[a]
+    if not (r and valid(r) and addr(r) == a) then
+      r = nil
+      local arr = S.eng.regions
+      for i = 1, #arr do local x = un(arr[i]); if valid(x) and addr(x) == a then r = x; break end end
+      W.regByAddr[a] = r
+    end
+    if rec and r and type(rec.tot) == "table" and (rec.totN or 0) <= 160 then
+      local okK, k = pcall(W.rkey, r)
+      local last = okK and k and W.sent.reg[k]
+      if last then
+        local seen = {}
+        for g, v in pairs(rec.tot) do seen[g] = true; settle(k, r, last, g, v, false, nil) end
+        for key, was in pairs(last) do
+          if type(key) == "number" and not seen[key] and was ~= 0 then settle(k, r, last, key, 0, false, nil) end
+        end
+        n = n + 1
+      end
+    end
+  end
+  if n > 0 then bump("w_fastTotals", n) end
 end
 local function confirmTick(clock)
   local cfg = W.cfg
@@ -2876,6 +3557,7 @@ local function hostTick(S, clock)
       end
     end
   end
+  if Xf and Xf.sentX == true and W.cfg.fastTotals ~= false then try("fastTotals", W.hostFastTotals, S) end   -- (lane 76, task 76e round 3)
   try("confirm", confirmTick, clock)                -- (lane 51) region totals that held long enough go out
   if (W.on.stock or W.on.silver or W.on.wealth or W.on.lordExtra) and clock - W.t.stock >= every then
     local key = clock - W.t.key >= cfg.keyEvery
@@ -3003,6 +3685,15 @@ local function friendRegionJob(st)
           end
         end
       end
+      -- (lane 82c) the rival's livestock order wait, at EVERY look, not only when a line named it: sessions l82c and
+      -- l82d, day 293, rival zwei: host 15, friend 14 for over 3 s. Each copy's own day routine counts it down; this
+      -- copy's came first, and the host's line (sent on change only) had nothing new to say until its own day came.
+      -- So the host's last value is held here: a count-down of this copy's own is put back to the host's at once, the
+      -- host's own count-down arrives as a line and is written.
+      if rival and R.nl then
+        local okN, v = pcall(function() return r.nextLivestockOrderIn end)
+        if okN and v ~= R.nl and act(string.format("livestock wait %s %d", k, R.nl), function() r.nextLivestockOrderIn = R.nl end) then bump("w_rivalLiveWait") end
+      end
       if rival and R.decDirty then                   -- lane 39: the rival's own decisions, as the host's (when a line named one)
         R.decDirty = false
         for key, tn in pairs({ lt = "land", tt = "tithe" }) do
@@ -3012,10 +3703,7 @@ local function friendRegionJob(st)
             if okT and v ~= want and act(string.format("%s tax %s %d", tn, k, want), function() r:changeTaxRate(FName(tn), want) end) then bump("w_rivalTax") end
           end
         end
-        if R.nl then                                     -- lane 42: the rival's livestock order wait (a plain value)
-          local okN, v = pcall(function() return r.nextLivestockOrderIn end)
-          if okN and v ~= R.nl and act(string.format("livestock wait %s %d", k, R.nl), function() r.nextLivestockOrderIn = R.nl end) then bump("w_rivalLiveWait") end
-        end
+        -- (lane 42's livestock order wait: above, at every look, lane 82c)
         for g, want in pairs(R.q or {}) do
           local okQ, v = pcall(function() return r:getTradeRouteLevel(g) end)
           if okQ and v ~= want and act(string.format("route %s good %d %d", k, g, want), function() r:setTradeRouteLevelForGood(g, want) end) then bump("w_rivalRoute") end
@@ -3353,6 +4041,7 @@ end
 
 local function friendFpDone(day, P)
   W.fp.mine[day] = P
+  W.lastOwnDay = math.max(W.lastOwnDay or -1, tonumber(day) or -1)   -- (lane 83: settlePendingWhat)
   tryCompare(W.S, day)
 end
 
@@ -3422,6 +4111,23 @@ function W.apply(S, w)
       elseif key:sub(1, 1) == "r" and tonumber(key:sub(2)) then R.gr = R.gr or {}; R.gr[tonumber(key:sub(2))] = tonumber(v); R.gv = (R.gv or 0) + 1 else local g = tonumber(key); if g then R.g[g] = tonumber(v); R.gv = (R.gv or 0) + 1 end end   -- (R.gv: lane 45)
     end
     F.dirty = true
+    -- (lane 76, task 76e round 3) exact mode with TOTALS: the host's totals are written in the tick their line came
+    -- (the region job comes at most every 0.25 s and is cut into steps: l7l's send to the friend's change took up to
+    -- 0.88 s, r27int's 3.11 s fault came in a slow minute). The job still compares and writes as before.
+    if W.cfg.fastTotals ~= false and W.on.stock and exactStock() and not rawget(C, "hold") then
+      local Pt = rawget(C, "patch")
+      if Pt and Pt.tOn and Pt.totalsSet and next(R.g) ~= nil then
+        local r = W.regionByKey(k)
+        if r and (mine(r.ownerPawn) or (W.on.rivals and rivalTown(r))) then
+          local ok = Pt.totalsSet(r, R.g, R.full == true)
+          if ok then R.tracked = Pt.tGen; if R.full then R.allDone = Pt.tGen end; bump("w_totalsFast") end
+          if R.gr and next(R.gr) ~= nil then
+            local okR = Pt.totalsSet(r, R.gr, R.full == true, true)
+            if okR then R.trackedR = Pt.tGen; if R.full then R.allDoneR = Pt.tGen end end
+          end
+        end
+      end
+    end
   elseif sub == "H" then                                   -- lane 31: the region panel's numbers (W.friendHold writes them)
     local k, pay = w[5], w[6]
     if k and pay then F.hold[k] = pay; F.holdDirty = true end
@@ -3618,6 +4324,9 @@ local function tick(S, clock)
   fresh(S)
   W.me = addr(S.p1)
   if not W.me then return end
+  -- (lane 76, task 76e) a friend's family marks set back to the host's at this copy's own day change BEFORE this
+  -- module reads anything in this tick (coop_facts.lua F.famDayNow; the facts module's own tick may come after)
+  if S.role == "friend" then local Fm = rawget(C, "facts"); if Fm and Fm.famDayNow then pcall(Fm.famDayNow, S) end end
   if S.role == "host" then hostTick(S, clock) elseif S.role == "friend" then friendTick(S, clock) end
   if S.role == "friend" and W.fpLater then pcall(W.fpLaterStep, S) end      -- (lane 71)
   runJobs(W.cfg.budgetMs / 1000)
@@ -3631,7 +4340,7 @@ end
 
 local function onMessage(S, from, kind, w, line)
   if kind ~= "W" then return false end
-  if w[4] == "PRE" or w[4] == "WATCH" or w[4] == "OBS" or w[4] == "FPASK" or w[4] == "FPROWS" then
+  if w[4] == "PRE" or w[4] == "WATCH" or w[4] == "OBS" or w[4] == "FPASK" or w[4] == "FPROWS" or w[4] == "STALL" or w[4] == "PROOF" then
     if W.on.wide and not C.stale(from, w) and not rawget(C, "hold") then fresh(S); Check.receive(S, from, w) end
     return true
   end
@@ -3756,6 +4465,22 @@ function W.settlePending()
     for _ in pairs(pending) do n = n + 1 end
   end
   return n
+end
+-- (lane 83, the lead's rule of 2026-11-20) what is pending, by kind: "<n> host:<day>,... | lastDay <d> others <n>".
+-- The session check counts as a note (not a fault) items that are only the HOST's sample and fingerprint of a day this
+-- copy has not sampled itself yet (its own last day below that day): a day change right before the check's last pause.
+function W.settlePendingWhat()
+  local D = W.wd
+  if not D then return "-1" end
+  local hostDays, others = {}, #D.batches + #D.posts + (D.run and 1 or 0)
+  for _, pending in ipairs({ D.details, D.inb, D.mine, W.fp.mine, W.fpLater or {} }) do for _ in pairs(pending) do others = others + 1 end end
+  for t in pairs(D.host) do hostDays[#hostDays + 1] = "w" .. tostring(t) end
+  for d in pairs(W.fp.host) do hostDays[#hostDays + 1] = "f" .. tostring(d) end
+  table.sort(hostDays)
+  local mine = -1
+  for t in pairs(D.mine) do local x = tonumber(t); if x and x > mine then mine = x end end
+  for d in pairs(W.fp.mine) do local x = tonumber(d); if x and x > mine then mine = x end end
+  return string.format("%d host:%s | lastDay %d others %d", W.settlePending(), #hostDays > 0 and table.concat(hostDays, ",") or "-", W.lastOwnDay or mine, others)
 end
 function W.wideDetail(tag)
   local L
